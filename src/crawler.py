@@ -1,11 +1,17 @@
 # V1 crawler placeholder. Implementation is intentionally excluded in STEP 1.
 
-import re
 from datetime import datetime
 from urllib.parse import quote_plus
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+
+from src.parser import (
+    detect_new_open_mobile,
+    extract_review_count_mobile,
+    normalize_phone,
+    normalize_place_url_mobile,
+)
 
 
 # 2026-06-04: 모바일 웹 리스트 화면 기준 selector 후보입니다.
@@ -103,29 +109,13 @@ def _find_cards(page):
     return page.locator("body > *")
 
 
-def _normalize_place_url(url: str) -> str:
-    if not url:
-        return ""
-    if url.startswith("http"):
-        return url
-    if url.startswith("/"):
-        return f"https://m.map.naver.com{url}"
-    return url
-
-
-def _normalize_phone(phone_text: str, phone_href: str) -> str:
-    if phone_href.startswith("tel:"):
-        return phone_href.replace("tel:", "").strip()
-    return phone_text.strip()
-
-
 def _detect_new_open_badge(card) -> str:
     """2026-06-04: 리스트 카드에 표시된 '새로오픈' 텍스트만 기준으로 판단합니다."""
     try:
         text = card.inner_text(timeout=1000)
     except Exception:
         return ""
-    return "O" if "새로오픈" in text else ""
+    return detect_new_open_mobile(text)
 
 
 def _extract_review_count(card) -> str:
@@ -135,16 +125,7 @@ def _extract_review_count(card) -> str:
     except Exception:
         return ""
 
-    patterns = [
-        r"방문자리뷰\s*([\d,]+)",
-        r"블로그리뷰\s*([\d,]+)",
-        r"리뷰\s*([\d,]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
-    return ""
+    return extract_review_count_mobile(text)
 
 
 def crawl_places(
@@ -198,10 +179,10 @@ def crawl_places(
                     address = safe_text(card, SELECTORS["address"])
                     phone_text = safe_text(card, SELECTORS["phone"])
                     phone_href = safe_attr(card, SELECTORS["phone"], "href")
-                    place_url = _normalize_place_url(
+                    place_url = normalize_place_url_mobile(
                         safe_attr(card, SELECTORS["url"], "href")
                     )
-                    phone = _normalize_phone(phone_text, phone_href)
+                    phone = normalize_phone(phone_text, phone_href)
                     new_open = _detect_new_open_badge(card)
                     review_count = _extract_review_count(card)
                     # 2026-06-04: 업종은 명확한 selector 결과만 사용하고 추론하지 않습니다.

@@ -1,5 +1,7 @@
 # V1 parser placeholder. Implementation is intentionally excluded in STEP 1.
 
+import re
+
 
 BASIC_COLUMNS = [
     "업체명",
@@ -33,6 +35,143 @@ def clean_address(address: str) -> str:
     if cleaned.startswith("주소보기"):
         cleaned = cleaned[len("주소보기") :]
     return normalize_text(cleaned)
+
+
+# 2026-06-05: crawler 공통 문자열 파싱/정제 함수입니다.
+def normalize_place_url_mobile(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("http"):
+        return url
+    if url.startswith("/"):
+        return f"https://m.map.naver.com{url}"
+    return ""
+
+
+def normalize_phone(phone_text: str, phone_href: str) -> str:
+    if phone_href.startswith("tel:"):
+        return phone_href.replace("tel:", "").strip()
+    return phone_text.strip()
+
+
+def detect_new_open_mobile(text: str) -> str:
+    return "O" if "새로오픈" in text else ""
+
+
+def detect_new_open_pc(text: str) -> str:
+    return "O" if "새로오픈" in text or "신규오픈" in text else ""
+
+
+def extract_review_count_mobile(text: str) -> str:
+    patterns = [
+        r"방문자리뷰\s*([\d,]+)",
+        r"블로그리뷰\s*([\d,]+)",
+        r"리뷰\s*([\d,]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def extract_review_count_pc(text: str) -> str:
+    normalized = " ".join(text.split())
+    patterns = [
+        r"리뷰\s*([0-9,]+)",
+        r"방문자리뷰\s*([0-9,]+)",
+        r"블로그리뷰\s*([0-9,]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return re.sub(r"\D", "", match.group(1))
+    return ""
+
+
+def extract_address_from_pc_text(text: str) -> str:
+    address_pattern = re.compile(
+        r"(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)"
+        r"\s+[가-힣]+(?:시|군|구)\s+[가-힣0-9]+(?:동|읍|면)"
+    )
+
+    for line in text.splitlines():
+        candidate = " ".join(line.split())
+        if not candidate:
+            continue
+        match = address_pattern.search(candidate)
+        if match:
+            return match.group(0)
+    return ""
+
+
+PC_EXCLUDED_NAME_KEYWORDS = [
+    "주간 인기 많은 메뉴",
+    "connect+ 혜택",
+    "더보기",
+    "저장",
+    "광고",
+    "리뷰",
+    "혜택",
+    "새로오픈",
+    "신규오픈",
+    "방문자리뷰",
+    "블로그리뷰",
+]
+
+
+def is_valid_pc_place_name(name: str) -> bool:
+    if not name:
+        return False
+    if name == "#":
+        return False
+    if any(keyword in name for keyword in PC_EXCLUDED_NAME_KEYWORDS):
+        return False
+    if "*" in name:
+        return False
+    if len(name) > 40:
+        return False
+    return True
+
+
+def split_pc_name_category(name: str, category: str) -> tuple[str, str]:
+    category_suffixes = [
+        "카페,디저트",
+    ]
+    if category:
+        return name, category
+    for suffix in category_suffixes:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)].strip(), suffix
+    return name, category
+
+
+def is_primary_pc_name_anchor(name: str, card_text: str) -> bool:
+    lines = [" ".join(line.split()) for line in card_text.splitlines() if line.strip()]
+    for line in lines[:3]:
+        if name in line:
+            return True
+    return False
+
+
+def guess_pc_category_from_text(text: str, name: str) -> str:
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    for line in lines[:5]:
+        if name and line.startswith(name):
+            candidate = line.replace(name, "", 1).strip()
+            if 0 < len(candidate) <= 20 and not re.search(
+                r"\d|리뷰|저장|공유|광고", candidate
+            ):
+                return candidate
+    for index, line in enumerate(lines[:6]):
+        if line == name and index + 1 < len(lines):
+            candidate = lines[index + 1]
+            if 0 < len(candidate) <= 20 and not re.search(
+                r"\d|리뷰|저장|공유|광고", candidate
+            ):
+                return candidate
+    return ""
 
 
 def _get_columns(mode: str) -> list[str]:

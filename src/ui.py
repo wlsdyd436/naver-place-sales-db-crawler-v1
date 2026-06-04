@@ -1,3 +1,4 @@
+# 2026-06-05: 배포 전 안정화를 위해 타임스탬프 저장 경로를 적용합니다.
 import contextlib
 import os
 import threading
@@ -191,9 +192,9 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.after(0, lambda: self.run_button.configure(state=state))
 
     def make_timestamped_output_path(self, output_path: str, mode: str) -> str:
-        # 2026-06-04: 열린 Excel 파일과의 덮어쓰기 충돌을 막기 위해 매번 새 파일명으로 저장합니다.
+        # 2026-06-05: 열린 Excel 파일과의 덮어쓰기 충돌을 막기 위해 분 단위 타임스탬프 파일명으로 저장합니다.
         path = Path(output_path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         default_stem = (
             "naver_place_premium_db" if mode == "premium" else "naver_place_basic_db"
         )
@@ -271,7 +272,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         try:
             output_path = self.make_timestamped_output_path(output_path, mode)
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            self.log(f"[ui] 실제 저장 파일={output_path}")
+            self.log(f"[ui] 저장 경로={output_path}")
 
             if mode == "premium":
                 self.set_status("1/3: 기본 데이터(전화번호) 수집 중...")

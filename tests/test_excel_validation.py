@@ -6,8 +6,9 @@ import pandas as pd
 from openpyxl import load_workbook
 
 
-# 2026-06-04: 상업용 납품 Excel 무결성 검증 대상 파일입니다.
-EXCEL_PATH = Path("output/naver_place_merged_db.xlsx")
+# 2026-06-05: V1.2 최종 납품 Excel 3시트 무결성 검증 스크립트입니다.
+DEFAULT_EXCEL_PATTERN = "naver_place_merged_db*.xlsx"
+OUTPUT_DIR = Path("output")
 
 REQUIRED_SHEETS = ["통합_결과", "원본_모바일", "원본_PC"]
 
@@ -30,11 +31,13 @@ EXPECTED_COLUMNS = {
         "플레이스 URL",
         "수집일",
     ],
+    # 2026-06-05: 현재 exporter.py는 원본_PC에 주소를 포함해 저장합니다.
     "원본_PC": [
         "업체명",
         "업종",
         "새로오픈여부",
         "리뷰수",
+        "주소",
         "수집일",
     ],
 }
@@ -62,7 +65,6 @@ class ValidationReporter:
         final = "FAIL" if self.fail_count else "PASS"
         print("====================")
         print("검증 요약")
-        print(f"총 검사 개수: {self.pass_count + self.fail_count}")
         print(f"PASS: {self.pass_count}")
         print(f"FAIL: {self.fail_count}")
         print(f"WARN: {self.warn_count}")
@@ -70,11 +72,26 @@ class ValidationReporter:
         print("====================")
 
 
+def find_target_excel() -> Path:
+    if len(sys.argv) >= 2:
+        return Path(sys.argv[1])
+
+    candidates = sorted(
+        OUTPUT_DIR.glob(DEFAULT_EXCEL_PATTERN),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else OUTPUT_DIR / "naver_place_merged_db.xlsx"
+
+
 def is_blank(value) -> bool:
     if value is None:
         return True
-    if pd.isna(value):
-        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
     return str(value).strip() == ""
 
 
@@ -85,7 +102,7 @@ def normalize_cell(value) -> str:
 
 
 def read_excel_sheets(path: Path) -> tuple[list[str], dict[str, pd.DataFrame]]:
-    # 2026-06-04: pandas 우선, 실패 시 openpyxl로 fallback합니다.
+    # 2026-06-05: pandas 우선, 실패 시 openpyxl로 fallback합니다.
     try:
         excel_file = pd.ExcelFile(path)
         frames = {
@@ -112,7 +129,7 @@ def validate_sheet_names(reporter: ValidationReporter, sheet_names: list[str]) -
     if missing:
         reporter.fail(f"필수 시트 누락: {missing}")
     else:
-        reporter.pass_("시트 3개 확인")
+        reporter.pass_("필수 시트 확인")
 
     extra = [sheet for sheet in sheet_names if sheet not in REQUIRED_SHEETS]
     if extra:
@@ -140,6 +157,10 @@ def validate_required_values(
 ) -> None:
     failed = False
     for column in ["업체명", "수집일"]:
+        if column not in frame.columns:
+            reporter.fail(f"{sheet_name} 필수 컬럼 없음: {column}")
+            failed = True
+            continue
         for index, value in frame[column].items():
             if is_blank(value):
                 reporter.fail(f"{sheet_name} 필수값 누락 - {index + 2}행 {column}")
@@ -165,8 +186,7 @@ def validate_review_count(reporter: ValidationReporter, frame: pd.DataFrame) -> 
         text = normalize_cell(value)
         if not text:
             continue
-        numeric = text.replace(",", "")
-        if not numeric.isdigit():
+        if not text.replace(",", "").isdigit():
             reporter.fail(f"리뷰수 형식 오류 - {index + 2}행 값: {text}")
             failed = True
     if not failed:
@@ -198,30 +218,28 @@ def validate_row_count(
         )
 
 
-def validate_source_names(
-    reporter: ValidationReporter, frame: pd.DataFrame, sheet_name: str
+def validate_empty_data_warning(
+    reporter: ValidationReporter, frames: dict[str, pd.DataFrame]
 ) -> None:
-    failed = False
-    for index, value in frame["업체명"].items():
-        if is_blank(value):
-            reporter.fail(f"{sheet_name} 업체명 누락 - {index + 2}행")
-            failed = True
-    if not failed:
-        reporter.pass_(f"{sheet_name} 업체명 확인")
+    for sheet_name in REQUIRED_SHEETS:
+        frame = frames.get(sheet_name)
+        if frame is not None and frame.empty:
+            reporter.warn(f"{sheet_name} 데이터 0건")
 
 
 def main() -> int:
     reporter = ValidationReporter()
+    excel_path = find_target_excel()
 
-    if EXCEL_PATH.exists():
-        reporter.pass_("엑셀 파일 존재 확인")
+    if excel_path.exists():
+        reporter.pass_(f"엑셀 파일 존재 확인: {excel_path}")
     else:
-        reporter.fail(f"엑셀 파일 없음: {EXCEL_PATH}")
+        reporter.fail(f"엑셀 파일 없음: {excel_path}")
         reporter.summary()
         return 1
 
     try:
-        sheet_names, frames = read_excel_sheets(EXCEL_PATH)
+        sheet_names, frames = read_excel_sheets(excel_path)
         reporter.pass_("엑셀 파일 읽기 확인")
     except Exception as exc:
         reporter.fail(f"엑셀 파일 읽기 실패: {exc}")
@@ -230,6 +248,7 @@ def main() -> int:
 
     validate_sheet_names(reporter, sheet_names)
     validate_columns(reporter, frames)
+    validate_empty_data_warning(reporter, frames)
 
     if all(sheet in frames for sheet in REQUIRED_SHEETS):
         merged_frame = frames["통합_결과"]
@@ -237,12 +256,12 @@ def main() -> int:
         pc_frame = frames["원본_PC"]
 
         validate_required_values(reporter, merged_frame, "통합_결과")
+        validate_required_values(reporter, mobile_frame, "원본_모바일")
+        validate_required_values(reporter, pc_frame, "원본_PC")
         validate_new_open(reporter, merged_frame)
         validate_review_count(reporter, merged_frame)
         validate_phone(reporter, merged_frame)
         validate_row_count(reporter, merged_frame, mobile_frame)
-        validate_source_names(reporter, mobile_frame, "원본_모바일")
-        validate_source_names(reporter, pc_frame, "원본_PC")
 
     reporter.summary()
     return 1 if reporter.fail_count else 0
