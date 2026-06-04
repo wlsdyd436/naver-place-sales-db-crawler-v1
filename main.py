@@ -3,21 +3,24 @@ from src.exporter import export_places_to_excel
 from src.parser import parse_places
 
 
+# 2026-06-04: V1 MVP 실행 설정값입니다.
+KEYWORD = "대전 치킨"
+LIMIT = 10
+OUTPUT_PATH = "output/naver_place_sales_db.xlsx"
+
+
 def main() -> None:
-    # 2026-06-04: V1 MVP 기본 실행값입니다.
-    keyword = "대전 카페"
-    limit = 10
+    print(f"[main] keyword={KEYWORD}")
+    print(f"[main] limit={LIMIT}")
+    print(f"[main] output path={OUTPUT_PATH}")
 
-    print(f"[main] keyword={keyword}")
-    print(f"[main] limit={limit}")
-
-    raw_places = crawl_places(keyword, limit)
+    raw_places = crawl_places(KEYWORD, LIMIT)
     print(f"[main] raw count={len(raw_places)}")
 
     parsed_places = parse_places(raw_places)
     print(f"[main] parsed count={len(parsed_places)}")
 
-    output_path = export_places_to_excel(parsed_places)
+    output_path = export_places_to_excel(parsed_places, OUTPUT_PATH)
     print(f"[main] saved={output_path}")
 
 
