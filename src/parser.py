@@ -1,13 +1,21 @@
 # V1 parser placeholder. Implementation is intentionally excluded in STEP 1.
 
 
-# 2026-06-04: V1 Excel 저장 전 정리 단계에서 사용할 컬럼 순서입니다.
-COLUMNS = [
+BASIC_COLUMNS = [
     "업체명",
     "업종",
     "주소",
     "대표전화",
     "플레이스 URL",
+    "수집일",
+]
+
+PREMIUM_COLUMNS = [
+    "업체명",
+    "업종",
+    "새로오픈여부",
+    "리뷰수",
+    "주소",
     "수집일",
 ]
 
@@ -27,10 +35,16 @@ def clean_address(address: str) -> str:
     return normalize_text(cleaned)
 
 
-def parse_places(raw_places: list[dict]) -> list[dict]:
-    """2026-06-04: crawler 결과를 컬럼 순서 고정, 주소 정리, 중복 제거합니다."""
+def _get_columns(mode: str) -> list[str]:
+    # 2026-06-04: Basic/Premium 모드별 Excel 컬럼 순서입니다.
+    return PREMIUM_COLUMNS if mode == "premium" else BASIC_COLUMNS
+
+
+def parse_places(raw_places: list[dict], mode: str = "basic") -> list[dict]:
+    """2026-06-04: 모드별 컬럼 순서로 crawler 결과를 정리하고 중복 제거합니다."""
     parsed_places = []
     seen = set()
+    columns = _get_columns(mode)
 
     for raw_place in raw_places:
         place = {
@@ -39,6 +53,8 @@ def parse_places(raw_places: list[dict]) -> list[dict]:
             "주소": clean_address(raw_place.get("주소")),
             "대표전화": normalize_text(raw_place.get("대표전화")),
             "플레이스 URL": normalize_text(raw_place.get("플레이스 URL")),
+            "새로오픈여부": normalize_text(raw_place.get("새로오픈여부")),
+            "리뷰수": normalize_text(raw_place.get("리뷰수")),
             "수집일": normalize_text(raw_place.get("수집일")),
         }
 
@@ -50,7 +66,7 @@ def parse_places(raw_places: list[dict]) -> list[dict]:
             continue
 
         seen.add(dedupe_key)
-        parsed_places.append({column: place[column] for column in COLUMNS})
+        parsed_places.append({column: place[column] for column in columns})
 
     return parsed_places
 
@@ -60,7 +76,9 @@ if __name__ == "__main__":
     sample_data = [
         {
             "업체명": "테스트 카페",
+            "새로오픈여부": "O",
             "업종": "카페,디저트",
+            "리뷰수": "123",
             "주소": "주소보기 대전 서구 둔산로 1",
             "대표전화": "042-123-4567",
             "플레이스 URL": "https://m.map.naver.com/place/1",
@@ -68,7 +86,9 @@ if __name__ == "__main__":
         },
         {
             "업체명": "테스트 카페",
+            "새로오픈여부": "O",
             "업종": "카페,디저트",
+            "리뷰수": "123",
             "주소": " 대전   서구   둔산로 1 ",
             "대표전화": "042-123-4567",
             "플레이스 URL": "https://m.map.naver.com/place/1",
@@ -76,11 +96,14 @@ if __name__ == "__main__":
         },
         {
             "업체명": "",
+            "새로오픈여부": "",
             "업종": "식료품제조",
+            "리뷰수": "",
             "주소": "주소보기 대전 유성구 대학로 1",
             "대표전화": "042-000-0000",
             "플레이스 URL": "https://m.map.naver.com/place/2",
             "수집일": "2026-06-04",
         },
     ]
-    print(parse_places(sample_data))
+    print(parse_places(sample_data, mode="basic"))
+    print(parse_places(sample_data, mode="premium"))

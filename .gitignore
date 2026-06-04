@@ -1,8 +1,11 @@
 .venv/
+dist/
+build/
+*.spec
 __pycache__/
 *.pyc
 .env
-output/
-logs/
+output/*.xlsx
+logs/*.log
 .pytest_cache/
 .vscode/

@@ -1,5 +1,6 @@
 # V1 crawler placeholder. Implementation is intentionally excluded in STEP 1.
 
+import re
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -118,13 +119,44 @@ def _normalize_phone(phone_text: str, phone_href: str) -> str:
     return phone_text.strip()
 
 
-def crawl_places(keyword: str, limit: int = 10) -> list[dict]:
+def _detect_new_open_badge(card) -> str:
+    """2026-06-04: 리스트 카드에 표시된 '새로오픈' 텍스트만 기준으로 판단합니다."""
+    try:
+        text = card.inner_text(timeout=1000)
+    except Exception:
+        return ""
+    return "O" if "새로오픈" in text else ""
+
+
+def _extract_review_count(card) -> str:
+    """2026-06-04: 리스트 카드에 노출된 리뷰 관련 텍스트만 보수적으로 추출합니다."""
+    try:
+        text = " ".join(card.inner_text(timeout=1000).split())
+    except Exception:
+        return ""
+
+    patterns = [
+        r"방문자리뷰\s*([\d,]+)",
+        r"블로그리뷰\s*([\d,]+)",
+        r"리뷰\s*([\d,]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def crawl_places(
+    keyword: str, limit: int = 10, new_open_only: bool = False
+) -> list[dict]:
     """2026-06-04: m.map.naver.com 리스트 화면에서 장소 후보를 최소 수집합니다."""
     results = []
     collected_at = datetime.now().strftime("%Y-%m-%d")
     search_url = f"https://m.map.naver.com/search.naver?query={quote_plus(keyword)}"
 
     print(f"[crawler] start keyword={keyword}, limit={limit}")
+    print(f"[crawler] new_open_only={new_open_only}")
     print(f"[crawler] url={search_url}")
 
     try:
@@ -147,8 +179,12 @@ def crawl_places(keyword: str, limit: int = 10) -> list[dict]:
                 print("[crawler] page load timeout, continue with current DOM")
 
             cards = _find_cards(page)
-            card_count = min(cards.count(), max(limit * 3, limit))
+            # 2026-06-04: 새로오픈 필터 ON이면 limit 도달을 위해 더 많은 카드 후보를 확인합니다.
+            scan_limit = max(limit * 10, 50) if new_open_only else max(limit * 3, limit)
+            card_count = min(cards.count(), scan_limit)
             print(f"[crawler] candidate cards={card_count}")
+            if new_open_only:
+                print(f"[crawler] scan cards={scan_limit}")
 
             seen = set()
             for index in range(card_count):
@@ -166,9 +202,14 @@ def crawl_places(keyword: str, limit: int = 10) -> list[dict]:
                         safe_attr(card, SELECTORS["url"], "href")
                     )
                     phone = _normalize_phone(phone_text, phone_href)
+                    new_open = _detect_new_open_badge(card)
+                    review_count = _extract_review_count(card)
                     # 2026-06-04: 업종은 명확한 selector 결과만 사용하고 추론하지 않습니다.
 
                     if not name:
+                        continue
+
+                    if new_open_only and new_open != "O":
                         continue
 
                     dedupe_key = (name, address, phone)
@@ -179,7 +220,9 @@ def crawl_places(keyword: str, limit: int = 10) -> list[dict]:
                     results.append(
                         {
                             "업체명": name,
+                            "새로오픈여부": new_open,
                             "업종": category,
+                            "리뷰수": review_count,
                             "주소": address,
                             "대표전화": phone,
                             "플레이스 URL": place_url,
@@ -187,6 +230,10 @@ def crawl_places(keyword: str, limit: int = 10) -> list[dict]:
                         }
                     )
                     print(f"[crawler] collected {len(results)}: {name}")
+                    if new_open_only:
+                        print(
+                            f"[crawler] new open collected {len(results)}/{limit}"
+                        )
                 except Exception as exc:
                     print(f"[crawler] card parse failed index={index}: {exc}")
                     continue

@@ -1,15 +1,16 @@
-# 네이버 플레이스 영업 DB 수집기 V1
+# 네이버 플레이스 영업 DB 수집기 V1.2
 
 지역 기반 소상공인 영업을 하는 광고대행사, POS/키오스크 영업자, 식자재 유통업체를 위한 **영업 DB 엑셀 수집 도구**입니다.
 
-V1은 PC 네이버 지도 iframe 구조가 아니라 **모바일 웹 `m.map.naver.com` 검색 결과 리스트**를 기준으로 합니다. 상세 페이지에 들어가지 않고 리스트 화면에서 바로 확인 가능한 공개 사업장 정보만 수집하는 방향입니다.
+현재 V1.2는 GUI 실행 진입점인 `app.py`를 기준으로 동작합니다. Basic Mode는 모바일 웹 기반 빠른 수집, Premium Mode는 모바일 기본 데이터와 PC 리스트 기반 리뷰수/신규오픈 정보를 안전하게 병합하는 방식입니다.
 
 ---
 
-## 1. V1 핵심 방향
+## 1. V1.2 핵심 방향
 
-- 모바일 웹 `m.map.naver.com` 기반
-- iframe 없는 단일 DOM 구조 활용
+- GUI 기반 실행 (`app.py`)
+- Basic Mode: 모바일 웹 `m.map.naver.com` 기반 빠른 영업 DB 수집
+- Premium Mode: Basic 결과에 PC 리스트 기반 리뷰수/신규오픈 여부 보강
 - 검색 결과 리스트 화면 중심 수집
 - 상세 페이지 클릭/진입 제외
 - 무리한 우회보다 최소 수집과 안정성 우선
@@ -21,13 +22,13 @@ V1 기준 검색 흐름:
 https://m.map.naver.com/search.naver?query={지역+업종}
 ```
 
-PC 네이버 지도 `map.naver.com/v5/search`, `searchIframe`, `entryIframe` 기반 접근은 V1 대상이 아닙니다.
+Premium Mode는 PC 네이버 지도 `searchIframe`의 리스트 화면만 사용하며, 상세 페이지 `entryIframe`에는 진입하지 않습니다.
 
 ---
 
-## 2. V1 수집 필드
+## 2. 수집 필드
 
-수집 대상:
+Basic Mode 수집 대상:
 
 - 업체명
 - 업종
@@ -36,9 +37,19 @@ PC 네이버 지도 `map.naver.com/v5/search`, `searchIframe`, `entryIframe` 기
 - 플레이스 URL
 - 수집일
 
-V1 제외 항목:
+Premium Mode 통합 결과:
 
-- 리뷰 수
+- 업체명
+- 업종
+- 새로오픈여부
+- 리뷰수
+- 주소
+- 대표전화
+- 플레이스 URL
+- 수집일
+
+제외 항목:
+
 - 영업시간
 - 평점
 - 상세 페이지 내부 정보
@@ -52,13 +63,14 @@ V1 제외 항목:
 
 수집 결과는 Excel 파일로 저장합니다.
 
-실제 저장 경로:
+실제 저장 경로 예시:
 
 ```text
-output/naver_place_sales_db.xlsx
+output/naver_place_basic_db_YYYYMMDD_HHMMSS.xlsx
+output/naver_place_premium_db_YYYYMMDD_HHMMSS.xlsx
 ```
 
-V1 실제 출력 컬럼 (총 6개):
+Basic 출력 컬럼:
 
 | 컬럼명 | 설명 |
 |---|---|
@@ -69,7 +81,7 @@ V1 실제 출력 컬럼 (총 6개):
 | 플레이스 URL | `m.place.naver.com/place/{id}/home` 형식 |
 | 수집일 | 수집 실행일 (YYYY-MM-DD) |
 
-> **주의**: 영업상태, 연락담당자, 최근연락일, 메모 컬럼은 V1 범위 외입니다. Excel에서 직접 추가하여 사용하세요.
+Premium 출력은 `통합_결과`, `원본_모바일`, `원본_PC` 3개 시트로 저장됩니다.
 
 ---
 
@@ -83,17 +95,29 @@ naver-place-sales-db-crawler-v1/
 ├── implementation_plan.md
 ├── requirements.txt
 ├── .env.example
-├── main.py
+├── app.py
+├── build.bat
+├── docs/
+│   ├── 경쟁 상품 조사.txt
+│   ├── 고객 문제 정의.txt
+│   └── 판매 가능성 검증 (ROI 분석).txt
 ├── src/
 │   ├── crawler.py
 │   ├── parser.py
-│   └── exporter.py
+│   ├── exporter.py
+│   ├── merger.py
+│   ├── pc_crawler.py
+│   └── ui.py
+├── tests/
+│   └── test_excel_validation.py
+├── input/
+├── logs/
 └── output/
 ```
 
 ---
 
-## 5. 실행 방법 (V1 MVP 완료)
+## 5. 실행 방법
 
 ### 환경 설정
 
@@ -111,20 +135,16 @@ playwright install chromium
 
 ### 실행
 
-`main.py` 상단의 설정값을 수정한 후 실행합니다.
-
-```python
-# main.py 상단 설정값
-KEYWORD = "대전 카페"   # 검색 키워드 (지역 + 업종)
-LIMIT = 10              # 수집 목표 건수
-OUTPUT_PATH = "output/naver_place_sales_db.xlsx"  # 저장 경로
-```
+GUI 진입점은 `app.py`입니다.
 
 ```powershell
-python main.py
+python app.py
 ```
 
-실행 결과는 `output/naver_place_sales_db.xlsx` 파일로 저장됩니다.
+실행 후 UI에서 지역, 업종, 수집 개수, 수집 모드를 선택합니다.
+
+- Basic Mode: 빠른 전화영업 DB 수집
+- Premium Mode: 리뷰수·신규오픈 여부 보강
 
 ### 실제 테스트 완료 키워드
 
