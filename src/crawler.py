@@ -129,7 +129,11 @@ def _extract_review_count(card) -> str:
 
 
 def crawl_places(
-    keyword: str, limit: int = 10, new_open_only: bool = False
+    keyword: str,
+    limit: int = 10,
+    new_open_only: bool = False,
+    stop_event=None,
+    pause_event=None,
 ) -> list[dict]:
     """2026-06-04: m.map.naver.com 리스트 화면에서 장소 후보를 최소 수집합니다."""
     results = []
@@ -169,6 +173,18 @@ def crawl_places(
 
             seen = set()
             for index in range(card_count):
+                if stop_event is not None and stop_event.is_set():
+                    print("[crawler] stop event detected, aborting mobile crawl")
+                    break
+                if pause_event is not None and pause_event.is_set():
+                    print("[crawler] pause event detected, blocking...")
+                    while pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            break
+                        page.wait_for_timeout(500)
+                    if stop_event is not None and stop_event.is_set():
+                        print("[crawler] stop event detected, aborting mobile crawl")
+                        break
                 if len(results) >= limit:
                     break
 

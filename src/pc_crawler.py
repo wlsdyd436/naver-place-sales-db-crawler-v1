@@ -148,7 +148,7 @@ def _get_card_from_anchor(anchor):
     return anchor
 
 
-def _light_scroll_cards(page, anchors, max_scrolls: int = 8) -> None:
+def _light_scroll_cards(page, anchors, max_scrolls: int = 8, stop_event=None, pause_event=None) -> None:
     """2026-06-05: 후보 카드 수 증가가 멈추면 중단하는 제한 스크롤입니다."""
     no_new_cards_count = 0
     previous_count = 0
@@ -159,6 +159,18 @@ def _light_scroll_cards(page, anchors, max_scrolls: int = 8) -> None:
         previous_count = 0
 
     for index in range(max_scrolls):
+        if stop_event is not None and stop_event.is_set():
+            print("[pc_crawler] stop event detected, aborting pc crawl")
+            break
+        if pause_event is not None and pause_event.is_set():
+            print("[pc_crawler] pause event detected, blocking...")
+            while pause_event.is_set():
+                if stop_event is not None and stop_event.is_set():
+                    break
+                page.wait_for_timeout(500)
+            if stop_event is not None and stop_event.is_set():
+                print("[pc_crawler] stop event detected, aborting pc crawl")
+                break
         try:
             last_li = anchors.locator("xpath=ancestor::li[1]").last
             if last_li.count() > 0:
@@ -203,7 +215,11 @@ def _extract_name_from_anchor(anchor) -> str:
 
 
 def crawl_places_pc(
-    keyword: str, limit: int = 10, new_open_only: bool = False
+    keyword: str,
+    limit: int = 10,
+    new_open_only: bool = False,
+    stop_event=None,
+    pause_event=None,
 ) -> list[dict]:
     """2026-06-04: PC searchIframe 리스트에서 새로오픈 업체 발굴용 정보를 수집합니다."""
     results = []
@@ -240,13 +256,25 @@ def crawl_places_pc(
                 return []
 
             anchors = _find_place_anchors(search_frame)
-            _light_scroll_cards(page, anchors, max_scrolls=8)
+            _light_scroll_cards(page, anchors, max_scrolls=8, stop_event=stop_event, pause_event=pause_event)
             anchor_count = anchors.count()
             print(f"[pc_crawler] candidate anchors={anchor_count}")
 
             seen = set()
             debug_count = 0
             for index in range(anchor_count):
+                if stop_event is not None and stop_event.is_set():
+                    print("[pc_crawler] stop event detected, aborting pc crawl")
+                    break
+                if pause_event is not None and pause_event.is_set():
+                    print("[pc_crawler] pause event detected, blocking...")
+                    while pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            break
+                        page.wait_for_timeout(500)
+                    if stop_event is not None and stop_event.is_set():
+                        print("[pc_crawler] stop event detected, aborting pc crawl")
+                        break
                 try:
                     anchor = anchors.nth(index)
                     card = _get_card_from_anchor(anchor)
