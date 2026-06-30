@@ -1,7 +1,9 @@
 # 2026-06-25: V2.0 CustomTkinter UI. 기존 크롤링/파싱/엑셀 저장 파이프라인은 유지합니다.
 import contextlib
 import os
+import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox
@@ -69,6 +71,14 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.last_output_path = ""
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
+        self.completed_queries = 0
+        self.total_pure_time = 0.0
+        self.current_query_start_time = None
+        self.current_query_pause_time_at_start = 0.0
+        self.total_pause_time = 0.0
+        self.current_pause_start = None
+        self.eta_after_id = None
+        self.total_queries = 0
 
         self._build_ui()
         self._render_district_checkboxes()
@@ -296,20 +306,101 @@ class SalesDbCrawlerApp(ctk.CTk):
         else:
             self.output_path_var.set("output/naver_place_basic_db.xlsx")
 
+    def _reset_eta_state(self, total_queries: int):
+        self._cancel_eta_timer()
+        self.completed_queries = 0
+        self.total_pure_time = 0.0
+        self.current_query_start_time = None
+        self.current_query_pause_time_at_start = 0.0
+        self.total_pause_time = 0.0
+        self.current_pause_start = None
+        self.total_queries = total_queries
+
+    def _cancel_eta_timer(self):
+        if not self.eta_after_id:
+            return
+        try:
+            self.after_cancel(self.eta_after_id)
+        except Exception:
+            pass
+        self.eta_after_id = None
+
+    def _get_total_pause_time_now(self) -> float:
+        if self.pause_event.is_set() and self.current_pause_start is not None:
+            return self.total_pause_time + (time.time() - self.current_pause_start)
+        return self.total_pause_time
+
+    def _record_query_complete(self, query_start_time: float, pause_time_at_start: float):
+        pure_time = time.time() - query_start_time - (self._get_total_pause_time_now() - pause_time_at_start)
+        self.completed_queries += 1
+        self.total_pure_time += max(0.0, pure_time)
+        self.current_query_start_time = None
+        self.current_query_pause_time_at_start = 0.0
+
+    def _format_eta_seconds(self, seconds: float) -> str:
+        remaining_seconds = max(0, int(round(seconds)))
+        minutes, seconds = divmod(remaining_seconds, 60)
+        if minutes > 0:
+            return f"{minutes}분 {seconds}초"
+        return f"{seconds}초"
+
+    def _update_eta_loop(self):
+        if self.stop_event.is_set():
+            self.eta_var.set("예상 남은 시간: 중단됨")
+            self.eta_after_id = None
+            return
+
+        if self.total_queries and self.completed_queries >= self.total_queries:
+            self.eta_var.set("예상 남은 시간: 완료")
+            self.eta_after_id = None
+            return
+
+        current_query_elapsed = 0.0
+        if self.current_query_start_time is not None:
+            current_query_elapsed = time.time() - self.current_query_start_time
+            current_query_elapsed -= self._get_total_pause_time_now() - self.current_query_pause_time_at_start
+            current_query_elapsed = max(0.0, current_query_elapsed)
+
+        remaining_queries = max(0, self.total_queries - self.completed_queries)
+        limit = int(self.limit_var.get().strip())
+        prior_time = limit * 3.5 if self.mode_var.get() == "premium" else limit * 1.5
+        avg_time = (prior_time + self.total_pure_time) / (1 + self.completed_queries)
+
+        remaining_time = (avg_time * remaining_queries) - current_query_elapsed
+        if remaining_time <= 0:
+            self.eta_var.set("예상 남은 시간: 마무리 중...")
+        else:
+            self.eta_var.set(f"예상 남은 시간: {self._format_eta_seconds(remaining_time)}")
+
+        self.eta_after_id = self.after(1000, self._update_eta_loop)
+
+    def _start_eta_loop(self):
+        self._cancel_eta_timer()
+        self.eta_after_id = self.after(1000, self._update_eta_loop)
+
     def pause_crawl(self):
         if self.pause_event.is_set():
+            if self.current_pause_start is not None:
+                self.total_pause_time += time.time() - self.current_pause_start
+                self.current_pause_start = None
             self.pause_event.clear()
             self.btn_pause.configure(text="일시정지")
             self.log("[ui] 수집을 재개합니다.")
         else:
+            self.current_pause_start = time.time()
             self.pause_event.set()
             self.btn_pause.configure(text="계속(Resume)")
             self.log("[ui] 일시정지됨. 계속 버튼을 눌러 재개하세요.")
 
     def stop_crawl(self):
+        if self.pause_event.is_set() and self.current_pause_start is not None:
+            self.total_pause_time += time.time() - self.current_pause_start
+            self.current_pause_start = None
         self.pause_event.clear()
         self.btn_pause.configure(text="일시정지")
         self.stop_event.set()
+        self.eta_var.set("예상 남은 시간: 중단됨")
+        self._cancel_eta_timer()
         self.log("[ui] 중지 요청: 현재 진행 중인 수집이 끝난 후 중단됩니다.")
         self.set_status("중지 요청됨")
 
@@ -327,11 +418,27 @@ class SalesDbCrawlerApp(ctk.CTk):
             for keyword in keywords
         ]
 
+    def _filter_by_review_count(self, places, min_val, max_val):
+        filtered_places = []
+        for row in places or []:
+            review_text = str((row or {}).get("리뷰수", "")).strip()
+            review_digits = re.sub(r"[^\d]", "", review_text)
+            review_count = int(review_digits) if review_digits else 0
+            if min_val is not None and review_count < min_val:
+                continue
+            if max_val is not None and review_count > max_val:
+                continue
+            filtered_places.append(row)
+        return filtered_places
+
     def start_crawl(self):
         regions = self._get_selected_regions()
         keywords = [keyword.strip() for keyword in self.keywords if keyword.strip()]
         output_path = self.output_path_var.get().strip()
         mode = self.mode_var.get()
+        new_open_only = self.new_open_only_var.get()
+        review_min_raw = self.review_min_var.get().strip()
+        review_max_raw = self.review_max_var.get().strip()
 
         if not regions:
             self.log("[ui] 실패: 지역을 선택하세요")
@@ -346,12 +453,19 @@ class SalesDbCrawlerApp(ctk.CTk):
         except ValueError:
             self.log("[ui] 실패: 수집 개수는 양수여야 합니다")
             return
+        try:
+            review_min = int(review_min_raw) if review_min_raw else None
+            review_max = int(review_max_raw) if review_max_raw else None
+        except ValueError:
+            self.log("[ui] 실패: 리뷰수는 숫자만 입력해야 합니다.")
+            return
         if not output_path:
             self.log("[ui] 실패: 저장 경로가 비어 있습니다")
             return
 
         query_queue = self._build_query_queue(regions, keywords)
         first_job = query_queue[0]
+        self._reset_eta_state(len(query_queue))
         self.pause_event.clear()
         self.btn_pause.configure(text="일시정지")
         self.stop_event.clear()
@@ -360,6 +474,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.progress_bar.set(0)
         self.progress_percent_var.set(f"0/{len(query_queue)}")
         self.eta_var.set("예상 남은 시간: 계산 중...")
+        self._start_eta_loop()
         self.last_output_path = output_path
 
         self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
@@ -374,7 +489,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         threading.Thread(
             target=self._run_queue_pipeline,
-            args=(query_queue, limit, output_path, mode),
+            args=(query_queue, limit, output_path, mode, new_open_only, review_min, review_max),
             daemon=True,
         ).start()
 
@@ -383,18 +498,18 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.after(0, lambda: self.progress_bar.set(progress))
         self.after(0, self.progress_percent_var.set, f"{completed}/{total}")
 
-    def _collect_basic_query(self, query: str, limit: int) -> tuple[list[dict], list[dict], list[dict]]:
+    def _collect_basic_query(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
         with contextlib.redirect_stdout(LogWriter(self.log)):
-            raw_places = crawl_places(query, limit, stop_event=self.stop_event, pause_event=self.pause_event)
+            raw_places = crawl_places(query, limit, new_open_only=new_open_only, stop_event=self.stop_event, pause_event=self.pause_event)
         self.log(f"[ui] raw count={len(raw_places)}")
         parsed_places = parse_places(raw_places, mode="basic")
         self.log(f"[ui] parsed count={len(parsed_places)}")
         return parsed_places, parsed_places, []
 
-    def _collect_premium_query(self, query: str, limit: int) -> tuple[list[dict], list[dict], list[dict]]:
+    def _collect_premium_query(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
         self.log("[ui] Premium Mode: 기본 데이터(전화번호) 수집 중...")
         with contextlib.redirect_stdout(LogWriter(self.log)):
-            mobile_raw = crawl_places(query, limit, stop_event=self.stop_event, pause_event=self.pause_event)
+            mobile_raw = crawl_places(query, limit, new_open_only=new_open_only, stop_event=self.stop_event, pause_event=self.pause_event)
         mobile_data = parse_places(mobile_raw, mode="basic")
         self.log(f"[ui] mobile count={len(mobile_data)}")
         if self.stop_event.is_set():
@@ -403,7 +518,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         self.log("[ui] Premium Mode: 고급 데이터(리뷰수) 수집 중...")
         with contextlib.redirect_stdout(LogWriter(self.log)):
-            pc_raw = crawl_places_pc(query, limit, new_open_only=False, stop_event=self.stop_event, pause_event=self.pause_event)
+            pc_raw = crawl_places_pc(query, limit, new_open_only=new_open_only, stop_event=self.stop_event, pause_event=self.pause_event)
         pc_data = parse_places(pc_raw, mode="premium")
         self.log(f"[ui] pc count={len(pc_data)}")
 
@@ -411,7 +526,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log(f"[ui] merged count={len(merged_data)}")
         return merged_data, mobile_data, pc_data
 
-    def _run_queue_pipeline(self, query_queue: list[dict], limit: int, output_path: str, mode: str):
+    def _run_queue_pipeline(self, query_queue: list[dict], limit: int, output_path: str, mode: str, new_open_only=False, review_min=None, review_max=None):
         all_merged_data = []
         all_mobile_data = []
         all_pc_data = []
@@ -436,15 +551,23 @@ class SalesDbCrawlerApp(ctk.CTk):
                 self.set_status(f"{region}\n{keyword}\n수집 중\n({index}/{total})")
                 self.log(f"[{index}/{total}] {region} / {keyword} 수집 시작")
                 self.log(f"[ui] 검색어={query}")
+                self.current_query_start_time = time.time()
+                query_pause_time_at_start = self._get_total_pause_time_now()
+                self.current_query_pause_time_at_start = query_pause_time_at_start
 
                 if mode == "premium":
-                    merged_data, mobile_data, pc_data = self._collect_premium_query(query, limit)
+                    merged_data, mobile_data, pc_data = self._collect_premium_query(query, limit, new_open_only=new_open_only)
                 else:
-                    merged_data, mobile_data, pc_data = self._collect_basic_query(query, limit)
+                    merged_data, mobile_data, pc_data = self._collect_basic_query(query, limit, new_open_only=new_open_only)
 
                 merged_rows = list(merged_data or [])
                 mobile_rows = list(mobile_data or [])
                 pc_rows = list(pc_data or [])
+
+                if mode == "premium" and (review_min is not None or review_max is not None):
+                    before_count = len(merged_rows)
+                    merged_rows = self._filter_by_review_count(merged_rows, review_min, review_max)
+                    self.log(f"[ui] 리뷰수 필터 적용: {before_count}건 -> {len(merged_rows)}건 남음")
 
                 if mode == "premium":
                     all_merged_data.extend(merged_rows or mobile_rows or pc_rows)
@@ -454,6 +577,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                     basic_rows = merged_rows or mobile_rows
                     all_merged_data.extend(basic_rows)
                     all_mobile_data.extend(mobile_rows or basic_rows)
+                self._record_query_complete(self.current_query_start_time, query_pause_time_at_start)
                 self._set_queue_progress(index, total)
                 self.log(f"[{index}/{total}] {region} / {keyword} 수집 완료")
                 if self.stop_event.is_set():
@@ -492,6 +616,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 self.after(0, lambda: self.progress_bar.set(1))
                 self.after(0, self.progress_percent_var.set, f"{total}/{total}")
                 self.after(0, self.eta_var.set, "예상 남은 시간: 완료")
+                self.after(0, self._cancel_eta_timer)
                 self.set_status("수집 완료")
                 self.show_info("완료", "전체 Queue 수집 및 저장이 완료되었습니다.")
             self.after(0, self.open_output_folder)
@@ -504,6 +629,9 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.log(f"[ui] 실패: {exc}")
             self.set_status("실패")
         finally:
+            if self.stop_event.is_set():
+                self.after(0, self.eta_var.set, "예상 남은 시간: 중단됨")
+                self.after(0, self._cancel_eta_timer)
             self.set_running(False)
 
     def _run_pipeline(self, keyword: str, limit: int, output_path: str, mode: str):

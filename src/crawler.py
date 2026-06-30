@@ -63,6 +63,8 @@ SELECTORS = {
     ],
 }
 
+MORE_BUTTON_TEXT = "\ub354\ubcf4\uae30"
+
 
 def safe_text(card, selector_candidates) -> str:
     """2026-06-04: selector 실패 시 빈 문자열을 반환합니다."""
@@ -172,7 +174,14 @@ def crawl_places(
                 print(f"[crawler] scan cards={scan_limit}")
 
             seen = set()
-            for index in range(card_count):
+            skip_empty_name = 0
+            skip_duplicate = 0
+            skip_not_new = 0
+            skip_unknown = 0
+            candidate_count = 0
+            parsed_index = 0
+            last_progress_printed = 0
+            while len(results) < limit:
                 if stop_event is not None and stop_event.is_set():
                     print("[crawler] stop event detected, aborting mobile crawl")
                     break
@@ -185,61 +194,134 @@ def crawl_places(
                     if stop_event is not None and stop_event.is_set():
                         print("[crawler] stop event detected, aborting mobile crawl")
                         break
-                if len(results) >= limit:
-                    break
 
-                try:
-                    card = cards.nth(index)
-                    name = safe_text(card, SELECTORS["name"])
-                    category = safe_text(card, SELECTORS["category"])
-                    address = safe_text(card, SELECTORS["address"])
-                    phone_text = safe_text(card, SELECTORS["phone"])
-                    phone_href = safe_attr(card, SELECTORS["phone"], "href")
-                    place_url = normalize_place_url_mobile(
-                        safe_attr(card, SELECTORS["url"], "href")
-                    )
-                    phone = normalize_phone(phone_text, phone_href)
-                    new_open = _detect_new_open_badge(card)
-                    review_count = _extract_review_count(card)
-                    # 2026-06-04: 업종은 명확한 selector 결과만 사용하고 추론하지 않습니다.
+                card_count = min(cards.count(), scan_limit)
+                candidate_count = card_count
+                if parsed_index >= card_count:
+                    previous_count = card_count
+                    if stop_event is not None and stop_event.is_set():
+                        print("[crawler] stop event detected, aborting mobile crawl")
+                        break
+                    if pause_event is not None and pause_event.is_set():
+                        print("[crawler] pause event detected, blocking...")
+                        while pause_event.is_set():
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            page.wait_for_timeout(500)
+                        if stop_event is not None and stop_event.is_set():
+                            print("[crawler] stop event detected, aborting mobile crawl")
+                            break
 
-                    if not name:
-                        continue
+                    try:
+                        if previous_count > 0:
+                            cards.nth(previous_count - 1).scroll_into_view_if_needed(timeout=2000)
 
-                    if new_open_only and new_open != "O":
-                        continue
+                        more_button = page.locator(
+                            f"button:has-text('{MORE_BUTTON_TEXT}'), a:has-text('{MORE_BUTTON_TEXT}')"
+                        ).first
+                        if more_button.count() > 0 and more_button.is_visible(timeout=1000):
+                            more_button.click(timeout=2000)
 
-                    dedupe_key = (name, address, phone)
-                    if dedupe_key in seen:
-                        continue
-                    seen.add(dedupe_key)
+                        page.wait_for_timeout(1500)
+                    except Exception as exc:
+                        print(f"[crawler] load more skipped: {exc}")
 
-                    results.append(
-                        {
-                            "업체명": name,
-                            "새로오픈여부": new_open,
-                            "업종": category,
-                            "리뷰수": review_count,
-                            "주소": address,
-                            "대표전화": phone,
-                            "플레이스 URL": place_url,
-                            "수집일": collected_at,
-                        }
-                    )
-                    print(f"[crawler] collected {len(results)}: {name}")
-                    if new_open_only:
-                        print(
-                            f"[crawler] new open collected {len(results)}/{limit}"
-                        )
-                except Exception as exc:
-                    print(f"[crawler] card parse failed index={index}: {exc}")
+                    if stop_event is not None and stop_event.is_set():
+                        print("[crawler] stop event detected, aborting mobile crawl")
+                        break
+
+                    card_count = min(cards.count(), scan_limit)
+                    print(f"[crawler] cards before={previous_count}, after={card_count}")
+                    if card_count == previous_count:
+                        break
                     continue
+
+                for index in range(parsed_index, card_count):
+                    if stop_event is not None and stop_event.is_set():
+                        print("[crawler] stop event detected, aborting mobile crawl")
+                        break
+                    if pause_event is not None and pause_event.is_set():
+                        print("[crawler] pause event detected, blocking...")
+                        while pause_event.is_set():
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            page.wait_for_timeout(500)
+                        if stop_event is not None and stop_event.is_set():
+                            print("[crawler] stop event detected, aborting mobile crawl")
+                            break
+                    if len(results) >= limit:
+                        break
+
+                    try:
+                        card = cards.nth(index)
+                        try:
+                            card_text = " ".join(card.inner_text(timeout=1000).split())
+                        except Exception:
+                            card_text = ""
+                        name = safe_text(card, SELECTORS["name"])
+                        category = safe_text(card, SELECTORS["category"])
+                        address = safe_text(card, SELECTORS["address"])
+                        phone_text = safe_text(card, SELECTORS["phone"])
+                        phone_href = safe_attr(card, SELECTORS["phone"], "href")
+                        place_url = normalize_place_url_mobile(
+                            safe_attr(card, SELECTORS["url"], "href")
+                        )
+                        phone = normalize_phone(phone_text, phone_href)
+                        new_open = _detect_new_open_badge(card)
+                        review_count = _extract_review_count(card)
+                        # Keep category values from explicit selectors only.
+
+                        print(f"[crawler_empty_sample] index={index} text={card_text[:200]}")
+                        if not name:
+                            skip_empty_name += 1
+                            continue
+
+                        if new_open_only and new_open != "O":
+                            skip_not_new += 1
+                            continue
+
+                        dedupe_key = (name, address, phone)
+                        if dedupe_key in seen:
+                            skip_duplicate += 1
+                            continue
+                        seen.add(dedupe_key)
+
+                        results.append(
+                            {
+                                "업체명": name,
+                                "새로오픈여부": new_open,
+                                "업종": category,
+                                "리뷰수": review_count,
+                                "주소": address,
+                                "대표전화": phone,
+                                "플레이스 URL": place_url,
+                                "수집일": collected_at,
+                            }
+                        )
+                        if len(results) % 10 == 0 or len(results) == limit:
+                            print(f"[crawler] collecting... {len(results)}/{limit}")
+                            last_progress_printed = len(results)
+                    except Exception as exc:
+                        print(f"[crawler] card parse failed index={index}: {exc}")
+                        skip_unknown += 1
+                        continue
+
+                parsed_index = card_count
+
 
             context.close()
             browser.close()
     except Exception as exc:
         print(f"[crawler] failed safely: {exc}")
         return []
+    finally:
+        print(
+            f"[crawler_skip] candidate={card_count} saved={len(results)} "
+            f"empty_name={skip_empty_name} duplicate={skip_duplicate} "
+            f"not_new={skip_not_new} unknown={skip_unknown}"
+        )
 
-    print(f"[crawler] done count={len(results)}")
+    if last_progress_printed != len(results) and len(results) > 0:
+        print(f"[crawler] collecting... {len(results)}/{limit}")
+    print(f"[crawler] completed {len(results)}/{limit}")
     return results

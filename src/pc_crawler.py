@@ -1,6 +1,6 @@
 # 2026-06-05: 배포 전 안정화를 위해 PC Premium 스크롤 수집 범위를 최적화합니다.
 from datetime import datetime
-import random
+import time
 from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -20,6 +20,13 @@ from src.parser import (
 
 # 2026-06-04: PC Premium Mode 디버그용 카드 텍스트 출력 여부입니다.
 DEBUG_CARD_TEXT = False
+
+
+def _safe_print(message: str) -> None:
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        print(message.encode("cp949", errors="replace").decode("cp949"))
 
 
 # 2026-06-04: PC 네이버 지도 searchIframe 내부 업체명 anchor 후보 selector입니다.
@@ -127,9 +134,59 @@ def _find_place_anchors(frame):
                 print(f"[pc_crawler] anchor selector matched: {selector} ({count})")
                 return links
         except Exception as exc:
-            print(f"[pc_crawler] anchor selector failed: {selector} ({exc})")
+            _safe_print(f"[pc_crawler] anchor selector failed: {selector} ({exc})")
             continue
     return frame.locator("a")
+
+
+def _find_pc_cards(frame):
+    try:
+        cards = frame.locator("li:has(a[href*='/place/'])")
+        count = cards.count()
+        if count > 0:
+            print(f"[pc_crawler] card selector matched: li:has(a[href*='/place/']) ({count})")
+            return cards
+    except Exception as exc:
+        _safe_print(f"[pc_crawler] card selector failed: li:has(a[href*='/place/']) ({exc})")
+
+    anchors = _find_place_anchors(frame)
+    for selector in [
+        "xpath=ancestor::li[1]",
+        "xpath=ancestor::div[@role='listitem'][1]",
+        "xpath=ancestor::div[1]",
+    ]:
+        try:
+            fallback_cards = anchors.locator(selector)
+            count = fallback_cards.count()
+            if count > 0:
+                print(f"[pc_crawler] fallback card selector matched: {selector} ({count})")
+                return fallback_cards
+        except Exception as exc:
+            _safe_print(f"[pc_crawler] fallback card selector failed: {selector} ({exc})")
+
+    return anchors
+
+
+def _is_pc_captcha_detected(page, frame=None) -> bool:
+    selectors = [
+        "#wtm-captcha-root",
+        "text=보안",
+        "text=사람",
+        "text=자동",
+    ]
+    targets = [page]
+    if frame is not None:
+        targets.append(frame)
+
+    for target in targets:
+        for selector in selectors:
+            try:
+                element = target.locator(selector).first
+                if element.count() > 0 and element.is_visible(timeout=300):
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _get_card_from_anchor(anchor):
@@ -148,7 +205,13 @@ def _get_card_from_anchor(anchor):
     return anchor
 
 
-def _light_scroll_cards(page, anchors, max_scrolls: int = 8, stop_event=None, pause_event=None) -> None:
+def _light_scroll_cards(
+    page,
+    anchors,
+    max_scrolls: int = 8,
+    stop_event=None,
+    pause_event=None,
+) -> None:
     """2026-06-05: 후보 카드 수 증가가 멈추면 중단하는 제한 스크롤입니다."""
     no_new_cards_count = 0
     previous_count = 0
@@ -172,13 +235,11 @@ def _light_scroll_cards(page, anchors, max_scrolls: int = 8, stop_event=None, pa
                 print("[pc_crawler] stop event detected, aborting pc crawl")
                 break
         try:
-            last_li = anchors.locator("xpath=ancestor::li[1]").last
-            if last_li.count() > 0:
-                last_li.scroll_into_view_if_needed(timeout=2000)
-            else:
-                anchors.last.scroll_into_view_if_needed(timeout=2000)
+            for _ in range(4):
+                page.mouse.wheel(0, 350)
+                page.wait_for_timeout(120)
             print(f"[pc_crawler] scroll {index + 1}/{max_scrolls}")
-            page.wait_for_timeout(random.randint(800, 1500))
+            page.wait_for_timeout(500)
 
             current_count = anchors.count()
             print(f"[pc_crawler] cards before={previous_count}, after={current_count}")
@@ -193,7 +254,7 @@ def _light_scroll_cards(page, anchors, max_scrolls: int = 8, stop_event=None, pa
 
             previous_count = current_count
         except Exception as exc:
-            print(f"[pc_crawler] scroll skipped {index + 1}")
+            _safe_print(f"[pc_crawler] scroll skipped {index + 1}: {exc}")
             break
 
 
@@ -214,6 +275,23 @@ def _extract_name_from_anchor(anchor) -> str:
     return name
 
 
+def _extract_name_from_card(card) -> str:
+    for selector in [
+        "a[href*='/place/']",
+        "a[href*='place.naver.com']",
+        "a",
+    ]:
+        try:
+            anchor = card.locator(selector).first
+            if anchor.count() > 0:
+                name = _extract_name_from_anchor(anchor)
+                if name:
+                    return name
+        except Exception:
+            continue
+    return _extract_name_from_anchor(card)
+
+
 def crawl_places_pc(
     keyword: str,
     limit: int = 10,
@@ -225,6 +303,14 @@ def crawl_places_pc(
     results = []
     collected_at = datetime.now().strftime("%Y-%m-%d")
     search_url = f"https://map.naver.com/v5/search/{quote(keyword)}"
+    scan_limit = max(limit * 10, 50) if new_open_only else limit
+    calculated_scrolls = max(2, (scan_limit // 10) + 1)
+    t_scroll = 0.0
+    t_get_card = 0.0
+    t_inner_text = 0.0
+    t_extract = 0.0
+    anchor_count = 0
+    card_count = 0
 
     print(f"[pc_crawler] start keyword={keyword}, limit={limit}")
     print(f"[pc_crawler] new_open_only={new_open_only}")
@@ -255,14 +341,13 @@ def crawl_places_pc(
                 browser.close()
                 return []
 
-            anchors = _find_place_anchors(search_frame)
-            _light_scroll_cards(page, anchors, max_scrolls=8, stop_event=stop_event, pause_event=pause_event)
-            anchor_count = anchors.count()
-            print(f"[pc_crawler] candidate anchors={anchor_count}")
-
             seen = set()
             debug_count = 0
-            for index in range(anchor_count):
+            last_progress_printed = 0
+            current_page = 1
+            max_pages = 15
+
+            while len(results) < limit and current_page <= max_pages:
                 if stop_event is not None and stop_event.is_set():
                     print("[pc_crawler] stop event detected, aborting pc crawl")
                     break
@@ -275,69 +360,195 @@ def crawl_places_pc(
                     if stop_event is not None and stop_event.is_set():
                         print("[pc_crawler] stop event detected, aborting pc crawl")
                         break
-                try:
-                    anchor = anchors.nth(index)
-                    card = _get_card_from_anchor(anchor)
-                    card_text = _safe_inner_text(card)
-                    name = _extract_name_from_anchor(anchor)
 
-                    if not is_valid_pc_place_name(name):
+                if _is_pc_captcha_detected(page, search_frame):
+                    print("[pc_crawler] captcha detected, returning collected data safely")
+                    break
+
+                print(f"[pc_crawler] collect page={current_page}")
+                cards = _find_pc_cards(search_frame)
+                scroll_start = time.time()
+                _light_scroll_cards(
+                    page,
+                    cards,
+                    max_scrolls=calculated_scrolls,
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                )
+                t_scroll += time.time() - scroll_start
+                if _is_pc_captcha_detected(page, search_frame):
+                    print("[pc_crawler] captcha detected, returning collected data safely")
+                    break
+                card_count = cards.count()
+                anchor_count += card_count
+                print(f"[pc_crawler] candidate cards={card_count}")
+
+                for index in range(card_count):
+                    if stop_event is not None and stop_event.is_set():
+                        print("[pc_crawler] stop event detected, aborting pc crawl")
+                        break
+                    if len(results) >= limit:
+                        break
+                    if pause_event is not None and pause_event.is_set():
+                        print("[pc_crawler] pause event detected, blocking...")
+                        while pause_event.is_set():
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            page.wait_for_timeout(500)
+                        if stop_event is not None and stop_event.is_set():
+                            print("[pc_crawler] stop event detected, aborting pc crawl")
+                            break
+                    try:
+                        t_get_card_start = time.time()
+                        card = cards.nth(index)
+                        t_get_card += time.time() - t_get_card_start
+
+                        t_inner_text_start = time.time()
+                        card_text = _safe_inner_text(card)
+                        t_inner_text += time.time() - t_inner_text_start
+
+                        t_extract_start = time.time()
+                        name = _extract_name_from_card(card)
+
+                        if not is_valid_pc_place_name(name):
+                            t_extract += time.time() - t_extract_start
+                            continue
+                        if "리뷰" not in card_text:
+                            t_extract += time.time() - t_extract_start
+                            continue
+                        if not is_primary_pc_name_anchor(name, card_text):
+                            t_extract += time.time() - t_extract_start
+                            continue
+
+                        new_open = detect_new_open_pc(card_text)
+                        if new_open_only and new_open != "O":
+                            t_extract += time.time() - t_extract_start
+                            continue
+
+                        if DEBUG_CARD_TEXT and debug_count < 3:
+                            print(f"[pc_crawler] card {debug_count} text:")
+                            print(card_text[:500])
+                            debug_count += 1
+
+                        category = _safe_text(card, FIELD_SELECTORS["category"])
+                        name, category = split_pc_name_category(name, category)
+                        if not is_valid_pc_place_name(name):
+                            t_extract += time.time() - t_extract_start
+                            continue
+
+                        if not category:
+                            category = guess_pc_category_from_text(card_text, name)
+
+                        address = extract_address_from_pc_text(card_text)
+                        phone_text = _safe_text(card, FIELD_SELECTORS["phone"])
+                        phone_href = _safe_attr(card, FIELD_SELECTORS["phone"], "href")
+                        phone = normalize_phone(phone_text, phone_href)
+                        review_count = extract_review_count_pc(card_text)
+
+                        if name in seen:
+                            t_extract += time.time() - t_extract_start
+                            continue
+                        seen.add(name)
+
+                        results.append(
+                            {
+                                "업체명": name,
+                                "업종": category,
+                                "새로오픈여부": new_open,
+                                "리뷰수": review_count,
+                                "주소": address,
+                                "대표전화": phone,
+                                "수집일": collected_at,
+                            }
+                        )
+                        if len(results) % 10 == 0 or len(results) == limit:
+                            print(f"[pc_crawler] collecting... {len(results)}/{limit}")
+                            last_progress_printed = len(results)
+                        t_extract += time.time() - t_extract_start
+                    except Exception as exc:
+                        _safe_print(f"[pc_crawler] card parse failed index={index}: {exc}")
                         continue
-                    if "리뷰" not in card_text:
+
+                if len(results) >= limit:
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    print("[pc_crawler] stop event detected, aborting pc crawl")
+                    break
+                if current_page >= max_pages:
+                    break
+
+                if pause_event is not None and pause_event.is_set():
+                    print("[pc_crawler] pause event detected, blocking...")
+                    while pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            break
+                        page.wait_for_timeout(500)
+                    if stop_event is not None and stop_event.is_set():
+                        print("[pc_crawler] stop event detected, aborting pc crawl")
+                        break
+
+                if _is_pc_captcha_detected(page, search_frame):
+                    print("[pc_crawler] captcha detected, returning collected data safely")
+                    break
+
+                next_page = current_page + 1
+                next_clicked = False
+                for selector in [
+                    f'a:text-is("{next_page}")',
+                    f'button:text-is("{next_page}")',
+                    f'a:has-text("{next_page}")',
+                    f'button:has-text("{next_page}")',
+                ]:
+                    try:
+                        next_button = search_frame.locator(selector).first
+                        if next_button.count() > 0 and next_button.is_visible(timeout=1000):
+                            next_button.click(timeout=3000)
+                            next_clicked = True
+                            break
+                    except Exception as exc:
+                        _safe_print(f"[pc_crawler] next page selector failed: {selector} ({exc})")
                         continue
-                    if not is_primary_pc_name_anchor(name, card_text):
-                        continue
 
-                    new_open = detect_new_open_pc(card_text)
-                    if new_open_only and new_open != "O":
-                        continue
+                if not next_clicked:
+                    print(f"[pc_crawler] next page not found: {next_page}")
+                    break
 
-                    if DEBUG_CARD_TEXT and debug_count < 3:
-                        print(f"[pc_crawler] card {debug_count} text:")
-                        print(card_text[:500])
-                        debug_count += 1
+                page.wait_for_timeout(2000)
+                if _is_pc_captcha_detected(page, search_frame):
+                    print("[pc_crawler] captcha detected, returning collected data safely")
+                    break
+                current_page += 1
 
-                    category = _safe_text(card, FIELD_SELECTORS["category"])
-                    name, category = split_pc_name_category(name, category)
-                    if not is_valid_pc_place_name(name):
-                        continue
-
-                    if not category:
-                        category = guess_pc_category_from_text(card_text, name)
-
-                    address = extract_address_from_pc_text(card_text)
-                    phone_text = _safe_text(card, FIELD_SELECTORS["phone"])
-                    phone_href = _safe_attr(card, FIELD_SELECTORS["phone"], "href")
-                    phone = normalize_phone(phone_text, phone_href)
-                    review_count = extract_review_count_pc(card_text)
-
-                    if name in seen:
-                        continue
-                    seen.add(name)
-
-                    results.append(
-                        {
-                            "업체명": name,
-                            "업종": category,
-                            "새로오픈여부": new_open,
-                            "리뷰수": review_count,
-                            "주소": address,
-                            "대표전화": phone,
-                            "수집일": collected_at,
-                        }
-                    )
-                    print(f"[pc_crawler] collected {len(results)}: {name}")
-                except Exception as exc:
-                    print(f"[pc_crawler] card parse failed index={index}: {exc}")
-                    continue
+                if stop_event is not None and stop_event.is_set():
+                    print("[pc_crawler] stop event detected, aborting pc crawl")
+                    break
+                if pause_event is not None and pause_event.is_set():
+                    print("[pc_crawler] pause event detected, blocking...")
+                    while pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            break
+                        page.wait_for_timeout(500)
+                    if stop_event is not None and stop_event.is_set():
+                        print("[pc_crawler] stop event detected, aborting pc crawl")
+                        break
 
             context.close()
             browser.close()
     except Exception as exc:
-        print(f"[pc_crawler] failed safely: {exc}")
+        _safe_print(f"[pc_crawler] failed safely: {exc}")
         return []
+    finally:
+        print(
+            f"[Profiler] Target: {keyword} | Anchors: {anchor_count} | Saved: {len(results)}"
+        )
+        print(
+            f"[Profiler] Scroll: {t_scroll:.2f}s | GetCard: {t_get_card:.2f}s | "
+            f"InnerText: {t_inner_text:.2f}s | Extract: {t_extract:.2f}s"
+        )
 
-    print(f"[pc_crawler] done count={len(results)}")
+    if last_progress_printed != len(results) and len(results) > 0:
+        print(f"[pc_crawler] collecting... {len(results)}/{limit}")
+    print(f"[pc_crawler] completed {len(results)}/{limit}")
     return results
 
 
