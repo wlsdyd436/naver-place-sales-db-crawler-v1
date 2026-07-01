@@ -271,7 +271,6 @@ def crawl_places(
                         review_count = _extract_review_count(card)
                         # Keep category values from explicit selectors only.
 
-                        print(f"[crawler_empty_sample] index={index} text={card_text[:200]}")
                         if not name:
                             skip_empty_name += 1
                             continue
