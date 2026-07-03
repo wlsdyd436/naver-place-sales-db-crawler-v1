@@ -218,3 +218,71 @@ Premium Mode 통합 결과 필드:
 - 시간 경과 후 동일 조건(`강동구 카페 limit=100`)으로 재진단하여, 오늘 관찰이 상시 재현되는 문제인지 오늘의 반복 테스트로 인한 일시적 악화인지 구분.
 - `pc_safety`/`safety_manager` 설계 시 "예외 메시지 기반 캡차 분류" 방식을 1순위 후보로 검토.
 - 이 기록은 첫 정식 출시 후보를 위한 PC 단일 엔진 전환 설계의 안전 종료 정책 설계에 입력값으로 사용.
+
+
+# 2026-07-03 PC 단일 엔진 Stage 2 신규 모듈 구현 기록
+
+## 완료
+- src/pc/browser_session.py 신규 생성
+- src/pc/list_scraper.py 신규 생성
+- tests/test_pc_browser_session.py 신규 생성
+- tests/test_pc_list_scraper.py 신규 생성
+
+## 구현 방향
+- 기존 pc_crawler.py는 수정하지 않고 spec 참조로만 사용
+- Stage 1 pipeline 계약에 맞는 collector 구조 구현
+- 진단 캡처 1차 책임은 browser_session/list_scraper 계층에 둠
+- pipeline은 부분 보존 및 fallback 역할 유지
+- 공식 collector는 exc.page를 붙이지 않고 diagnostics_captured=True 마커만 사용
+
+## 검증
+- test_pc_browser_session.py PASS 12 / FAIL 0
+- test_pc_list_scraper.py PASS 19 / FAIL 0
+- pc_crawler.py, ui.py, exporter.py, parser.py, crawler.py 및 Stage 1 파일 무변경 확인
+
+## 다음 작업
+- 통제된 count parity 검증
+- page=3 이상 진입 검증
+- CAPTCHA 발생 시 반복 live test 금지
+- entryIframe 상세 진입은 후속 단계로 보류
+
+
+# 2026-07-03 PC 단일 엔진 Stage 2 신규 리스트 경로 통제 검증 기록
+
+## 배경
+- Stage 2에서 browser_session.py와 list_scraper.py 신규 독립 모듈 구현 완료.
+- 기존 실행 경로(pc_crawler.py/ui.py/exporter.py/parser.py/crawler.py)는 수정하지 않음.
+- 신규 경로가 실제 네이버 지도 PC 리스트에서 page=3까지 진입 가능한지 1회 통제 검증.
+
+## 실행 조건
+- 엔진: 신규 엔진만
+- keyword: 서울특별시 강동구 카페
+- limit: 30
+- visible: True
+- capture_artifacts: True
+- live test: 1회만 실행
+- 기존 엔진 재실행 없음
+- 반복 테스트 없음
+
+## 결과
+- new_count: 30 / 30
+- max_page_seen: 3
+- CAPTCHA 언급: 0
+- wtm-captcha-root 언급: 0
+- Timeout 언급: 0
+- diagnostics_captured: False
+- elapsed: 약 20.48초
+- 예외 없음
+- 부분 보존 로직 발동 없음
+
+## 판단
+- 신규 list_scraper + browser_session + pipeline 조합은 정상 성공 경로에서 page=3까지 진입 가능함.
+- 이전 2026-07-01 CAPTCHA/page=3 실패는 상시 재현 문제가 아니라 특정 세션/요청 누적 조건에서 발생했을 가능성이 있음.
+- CAPTCHA 실패 경로는 이번 live test에서 발생하지 않았으므로 실제 live 환경에서는 미검증이며, 현재는 test_pc_list_scraper.py의 mock 기반 계약 검증 상태로 유지.
+- 반복 live test는 차단 누적 리스크가 있으므로 중단.
+
+## 다음 작업
+- 추가 live test는 즉시 반복하지 않음.
+- 다음 설계 단계에서 entryIframe 상세 진입/대표전화 수집 구조를 검토.
+- 기존 ui.py/Excel/Queue 연결은 후속 단계까지 보류.
+- CAPTCHA 발생 시에는 session/list_scraper 계층에서 diagnostics를 1차 캡처하는 계약 유지.
