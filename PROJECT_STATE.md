@@ -286,3 +286,18 @@ Premium Mode 통합 결과 필드:
 - 다음 설계 단계에서 entryIframe 상세 진입/대표전화 수집 구조를 검토.
 - 기존 ui.py/Excel/Queue 연결은 후속 단계까지 보류.
 - CAPTCHA 발생 시에는 session/list_scraper 계층에서 diagnostics를 1차 캡처하는 계약 유지.
+
+# 2026-07-03 PC 단일 엔진 Stage 3A 상세 수집 모듈 구현 기록
+
+- src/pc/detail_scraper.py 신규 생성
+- browser_session.py에 find_entry_frame 추가
+- list_scraper.py에 place_id / 플레이스 URL 가산 필드 추가
+- build_full_collector() 신규 추가
+- list_scraper.build_collector()는 Stage 2 list-only 의미 유지
+- pipeline.py 수정 없음
+- 단건 상세 실패는 skip
+- 연속 상세 실패는 diagnostics 캡처 후 안전 종료
+- tests/test_pc_detail_scraper.py PASS 11
+- test_pc_list_scraper.py PASS 21
+- test_pc_browser_session.py PASS 15
+- test_pc_pipeline.py PASS 8

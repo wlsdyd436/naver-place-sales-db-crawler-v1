@@ -122,6 +122,40 @@ class BrowserSession:
         print("[browser_session] searchIframe not found")
         return None
 
+    def find_entry_frame(self):
+        """entryIframe(상세 패널)을 우선 찾고, 실패 시 frames fallback을 사용합니다.
+
+        find_search_frame과 동일한 패턴이며, Stage 3 상세 수집(detail_scraper.py)에서
+        업체 상세(대표전화/전체주소) 추출을 위해 사용합니다. 이 메서드는 프레임을
+        찾기만 하고 클릭/네비게이션/대기는 호출자(detail_scraper)가 담당합니다.
+        """
+        page = self.page
+        try:
+            frame = page.frame(name="entryIframe")
+            if frame:
+                print("[browser_session] entryIframe found")
+                return frame
+        except Exception:
+            pass
+
+        try:
+            frame_locator = page.frame_locator("#entryIframe")
+            frame_locator.locator("body").first.wait_for(timeout=5000)
+            frame = page.frame(name="entryIframe")
+            if frame:
+                print("[browser_session] entryIframe found")
+                return frame
+        except Exception:
+            pass
+
+        for frame in page.frames:
+            frame_id = f"{frame.name} {frame.url}".lower()
+            if "entry" in frame_id:
+                print("[browser_session] entryIframe found")
+                return frame
+
+        return None
+
     def probe_captcha_dom_present(self, frame=None) -> bool:
         """CAPTCHA DOM 존재 여부 probe. 진단 신호(로그/참고용)로만 사용하고, 이 결과로
         안전 종료/재시도 등 제어 흐름을 바꾸지 않습니다. 주 판정은 항상

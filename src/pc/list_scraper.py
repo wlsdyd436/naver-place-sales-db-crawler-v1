@@ -8,6 +8,7 @@
 # -> 예외에 diagnostics_captured=True 마커만 부착 -> exc.page는 붙이지 않고 그대로
 # re-raise 합니다. pipeline.py는 exc.page가 없으면 자체 캡처를 하지 않으므로
 # (getattr(exc, "page", None) 확인), 이 계약을 지키는 한 중복 캡처는 발생하지 않습니다.
+import re
 from datetime import datetime
 from urllib.parse import quote
 
@@ -232,6 +233,40 @@ def _extract_name_from_card(card) -> str:
     return _extract_name_from_anchor(card)
 
 
+def _extract_place_href(card) -> str:
+    """카드 내 업체 anchor의 href를 추출합니다. 실패 시 빈 문자열을 반환합니다."""
+    for selector in CARD_SELECTORS:
+        try:
+            anchor = card.locator(selector).first
+            if anchor.count() == 0:
+                continue
+            href = anchor.get_attribute("href", timeout=1000)
+            if href:
+                return href.strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_place_id(href: str) -> str:
+    """anchor href(/place/{id}, /restaurant/{id} 등)에서 place id(숫자)를 추출합니다."""
+    if not href:
+        return ""
+    match = re.search(r"/(\d{5,})", href)
+    return match.group(1) if match else ""
+
+
+def _normalize_pc_place_url(href: str) -> str:
+    """anchor href를 절대 URL 형태의 플레이스 URL로 정규화합니다."""
+    if not href:
+        return ""
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return f"https://map.naver.com{href}"
+    return ""
+
+
 def _build_row(card, collected_at: str, new_open_only: bool, seen: set):
     """카드 하나에서 행 데이터를 만듭니다. 유효하지 않으면 None을 반환합니다.
 
@@ -272,6 +307,11 @@ def _build_row(card, collected_at: str, new_open_only: bool, seen: set):
             return None
         seen.add(name)
 
+        # Stage 3A 가산 필드: 상세 진입 없이 리스트 anchor href에서 확보.
+        href = _extract_place_href(card)
+        place_id = _parse_place_id(href)
+        place_url = _normalize_pc_place_url(href)
+
         return {
             "업체명": name,
             "업종": category,
@@ -279,6 +319,8 @@ def _build_row(card, collected_at: str, new_open_only: bool, seen: set):
             "리뷰수": review_count,
             "주소": address,
             "대표전화": phone,
+            "플레이스 URL": place_url,
+            "place_id": place_id,
             "수집일": collected_at,
         }
     except Exception as exc:

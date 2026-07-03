@@ -18,6 +18,8 @@ from src.pc.list_scraper import (
     _click_next_page,
     _find_pc_cards,
     _light_scroll_cards,
+    _normalize_pc_place_url,
+    _parse_place_id,
     _wait_while_paused,
     build_collector,
     scrape_list,
@@ -342,6 +344,20 @@ def _make_card_with_name(card_text: str, name: str) -> FakeLocator:
     )
 
 
+def _make_card_with_href(card_text: str, name: str, href: str) -> FakeLocator:
+    name_locator = FakeLocator(count_value=1, text=name)
+    anchor_locator = FakeLocator(
+        count_value=1,
+        attr_map={"href": href},
+        sub_locators={"span.place_bluelink": name_locator},
+    )
+    return FakeLocator(
+        count_value=1,
+        text=card_text,
+        sub_locators={"a[href*='/place/']": anchor_locator},
+    )
+
+
 def check_build_row_success(reporter: ValidationReporter) -> None:
     card_text = "테스트카페 카페,디저트\n리뷰 128\n서울 강남구 역삼동 123-4"
     card = _make_card_with_name(card_text, "테스트카페")
@@ -354,12 +370,46 @@ def check_build_row_success(reporter: ValidationReporter) -> None:
         "리뷰수": "128",
         "주소": "서울 강남구 역삼동",
         "대표전화": "",
+        "플레이스 URL": "",
+        "place_id": "",
         "수집일": "2026-07-03",
     }
     if row == expected:
-        reporter.pass_("정상 카드 -> 업체명/업종/리뷰수/주소/대표전화/수집일 dict 생성")
+        reporter.pass_("정상 카드 -> 업체명/업종/리뷰수/주소/대표전화/플레이스 URL/place_id/수집일 dict 생성")
     else:
         reporter.fail(f"row dict 결과가 예상과 다름: {row}")
+
+
+def check_build_row_captures_place_id_and_url(reporter: ValidationReporter) -> None:
+    card_text = "테스트카페 카페,디저트\n리뷰 128\n서울 강남구 역삼동 123-4"
+    card = _make_card_with_href(card_text, "테스트카페", "/place/1234567/home")
+    row = _build_row(card, "2026-07-03", new_open_only=False, seen=set())
+
+    if (
+        row is not None
+        and row.get("place_id") == "1234567"
+        and row.get("플레이스 URL") == "https://map.naver.com/place/1234567/home"
+    ):
+        reporter.pass_("anchor href에서 place_id/플레이스 URL 가산 필드 확보(상세 진입 없이)")
+    else:
+        reporter.fail(f"place_id/플레이스 URL 가산 필드 결과가 예상과 다름: {row}")
+
+
+def check_parse_place_id_and_url_helpers(reporter: ValidationReporter) -> None:
+    checks = {
+        "place_id from /restaurant/": _parse_place_id("/restaurant/987654/home") == "987654",
+        "place_id 없음 -> 빈 문자열": _parse_place_id("/foo/bar") == "",
+        "절대 URL 유지": _normalize_pc_place_url("https://pcmap.place.naver.com/restaurant/1")
+        == "https://pcmap.place.naver.com/restaurant/1",
+        "루트상대 -> 도메인 prefix": _normalize_pc_place_url("/place/1")
+        == "https://map.naver.com/place/1",
+        "빈 href -> 빈 문자열": _normalize_pc_place_url("") == "",
+    }
+    if all(checks.values()):
+        reporter.pass_("_parse_place_id / _normalize_pc_place_url 헬퍼 동작 검증")
+    else:
+        failed = [name for name, ok in checks.items() if not ok]
+        reporter.fail(f"place_id/URL 헬퍼 검증 실패 항목: {failed}")
 
 
 def check_build_row_skips_when_no_review_keyword(reporter: ValidationReporter) -> None:
@@ -612,6 +662,8 @@ def main() -> int:
     check_click_next_page_swallows_visibility_check_and_tries_next(reporter)
 
     check_build_row_success(reporter)
+    check_build_row_captures_place_id_and_url(reporter)
+    check_parse_place_id_and_url_helpers(reporter)
     check_build_row_skips_when_no_review_keyword(reporter)
     check_build_row_skips_duplicate_name(reporter)
 

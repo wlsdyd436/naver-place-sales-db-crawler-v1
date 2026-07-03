@@ -197,6 +197,38 @@ def check_find_search_frame_not_found(reporter: ValidationReporter) -> None:
         reporter.fail(f"None이 아닌 값을 반환함: {frame}")
 
 
+def check_find_entry_frame_by_name(reporter: ValidationReporter) -> None:
+    named_frame = FakeFrame(name="entryIframe", url="https://map.naver.com/entry/place/1234567")
+    page = FakePage(named_frame=named_frame)
+    session = _make_session(DiagnosticConfig.safe_default(), page)
+    frame = session.find_entry_frame()
+    if frame is named_frame:
+        reporter.pass_("page.frame(name='entryIframe')로 상세 프레임 즉시 탐색 성공")
+    else:
+        reporter.fail(f"entryIframe named frame 탐색 실패: {frame}")
+
+
+def check_find_entry_frame_fallback_to_frames_list(reporter: ValidationReporter) -> None:
+    fallback_frame = FakeFrame(name="", url="https://map.naver.com/entry/place/1234567")
+    page = FakePage(named_frame=None, frame_locator_fails=True, frames=[fallback_frame])
+    session = _make_session(DiagnosticConfig.safe_default(), page)
+    frame = session.find_entry_frame()
+    if frame is fallback_frame:
+        reporter.pass_("named/frame_locator 실패 시 page.frames의 'entry' 프레임 fallback 탐색")
+    else:
+        reporter.fail(f"entryIframe frames fallback 탐색 실패: {frame}")
+
+
+def check_find_entry_frame_not_found(reporter: ValidationReporter) -> None:
+    page = FakePage(named_frame=None, frame_locator_fails=True, frames=[])
+    session = _make_session(DiagnosticConfig.safe_default(), page)
+    frame = session.find_entry_frame()
+    if frame is None:
+        reporter.pass_("entryIframe을 찾을 수 없으면 None 반환(예외 없음)")
+    else:
+        reporter.fail(f"None이 아닌 값을 반환함: {frame}")
+
+
 def check_probe_captcha_dom_present_true(reporter: ValidationReporter) -> None:
     page = FakePage(locator_map={"#wtm-captcha-root": FakeLocator(count_value=1, visible=True)})
     session = _make_session(DiagnosticConfig.safe_default(), page)
@@ -283,6 +315,9 @@ def main() -> int:
     check_find_search_frame_by_name(reporter)
     check_find_search_frame_fallback_to_frames_list(reporter)
     check_find_search_frame_not_found(reporter)
+    check_find_entry_frame_by_name(reporter)
+    check_find_entry_frame_fallback_to_frames_list(reporter)
+    check_find_entry_frame_not_found(reporter)
     check_probe_captcha_dom_present_true(reporter)
     check_probe_captcha_dom_present_false(reporter)
     check_keep_open_if_configured_waits_when_enabled(reporter)
