@@ -575,3 +575,49 @@ Premium Mode 통합 결과 필드:
 - legacy premium fallback 유지 방식 정리
 - 온라인 채널 존재 필터 배선 여부 검토
 - 첫 출시 후보 체크리스트 준비
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3E UI Cleanup / 출시 문서 정렬 기록
+
+## 배경
+- Stage 3D에서 UI premium 경로 → 새 PC full engine → Excel 생성 end-to-end smoke가 성공함.
+- 이후 실제 동작과 README/UI 문구/법적 안내/출시 체크리스트의 불일치를 정리하기 위해 Stage 3E를 진행함.
+
+## 완료
+- README.md를 현재 동작 기준으로 전면 갱신
+- Premium 구 설명을 새 상세 수집 흐름으로 정정
+- 상세 수집은 PC 단일 엔진 기반이며 카드 클릭 → entryIframe 상세 진입 → 주소/전화/플레이스 URL/SNS 수집 구조임을 반영
+- 통합_결과 11컬럼 스키마 반영
+- 홈페이지/인스타/블로그 컬럼 설명 추가
+- place_id는 내부 필드이며 Excel 비노출임을 명시
+- 원본_모바일 / 원본_PC 시트는 레거시 3시트 구조 유지용이며, 새 상세 수집 경로에서는 축소 미러 성격이 있을 수 있음을 문서화
+- src/ui.py 라디오/체크박스 텍스트만 수정
+  - Basic → 빠른 수집(모바일)
+  - Premium → 상세 수집(PC·전화·SNS)
+  - 온라인 채널 체크박스 → 온라인 채널(블로그/인스타 등) 존재 (준비 중)
+- 라디오 value, mode_var, on_mode_change, 수집 분기, 저장 로직은 변경하지 않음
+- LEGAL_NOTICE.md에 2026-07-06 기준 상세 진입/SNS 공개정보 수집 관련 보완 섹션 추가
+- RELEASE_CHECKLIST.md 신규 생성
+- 온라인 채널 필터 배선은 하지 않음. Stage 3F 후보로 분리함.
+
+## 테스트
+- test_ui_pc_full_wiring: PASS 3 / FAIL 0
+- test_exporter_schema: PASS 7 / FAIL 0
+- test_export_adapter: PASS 2 / FAIL 0
+- test_pc_detail_scraper: PASS 23 / FAIL 0
+- test_pc_list_scraper: PASS 21 / FAIL 0
+- test_pc_browser_session: PASS 15 / FAIL 0
+- test_pc_pipeline: PASS 8 / FAIL 0
+
+## 판단
+- Stage 3E는 런타임 동작 변경 없이 문서/문구 정렬만 완료함.
+- README의 기존 구 설명과 실제 동작 불일치를 해소함.
+- UI 문구가 현재 실제 동작과 더 일치하게 됨.
+- 출시 후보 문서 기반이 마련됨.
+
+## 다음 작업 후보
+- Stage 3F 온라인 채널 필터 배선 여부 판단
+- 또는 첫 출시 후보 점검 / 패키징 / 사용자 실행 테스트 준비
+- 시트명/시트 구조 변경은 아직 보류
+- basic 경로 제거/통합도 보류
+- legacy premium fallback 제거도 보류
