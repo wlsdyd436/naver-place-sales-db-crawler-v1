@@ -729,3 +729,56 @@ Premium Mode 통합 결과 필드:
 - requirements.txt의 playwright==1.60.0과 번들 리비전 1223 정합성은 실제 구동으로 간접 확인됨.
 - EXE 빌드 전 브라우저 번들 리스크가 1차 해소됨.
 - Tier 2 EXE end-to-end smoke가 다음 출시 게이트로 남음.
+
+
+# 2026-07-07 Tier 2 EXE end-to-end smoke 성공 기록
+
+## 실행 조건
+- dist/NaverPlaceSalesDBCollector.exe 실행
+- 실제 GUI 실행
+- 수집 모드: 상세 수집(PC·전화·SNS)
+- 지역: 서울특별시 강동구
+- 키워드: 카페
+- 수집 개수: 1
+- 실행 횟수: 1회
+- 정보 탭 클릭 없음
+- CAPTCHA 우회/회피 없음
+
+## 결과
+- EXE 실행 성공
+- GUI 표시 성공
+- Excel 파일 생성 성공
+- 생성 파일: naver_place_premium_db_20260707_0238.xlsx
+- 통합_결과 시트 존재
+- 통합_결과 11컬럼 일치
+- place_id Excel 헤더 비노출
+- 원본_모바일 시트 존재
+- 원본_PC 시트 존재
+- Excel 오류값 없음
+
+## 통합_결과 1행
+- 업체명: 오베르캄프 본점
+- 업종: 베이커리
+- 새로오픈여부: 공란
+- 리뷰수: 2471
+- 주소: 서울 강동구 성내로14길 48 1층
+- 대표전화: 0507-1387-4967
+- 플레이스 URL: https://pcmap.place.naver.com/restaurant/1171815551/home
+- 수집일: 2026-07-07
+- 홈페이지: 공란
+- 인스타: https://www.instagram.com/oberkampf.kr
+- 블로그: 공란
+
+## 판단
+- 현재 커밋 기준으로 빌드된 EXE가 실제 GUI 실행부터 Excel 생성까지 성공함.
+- Stage 3B~3F의 핵심 변경 사항이 패키징된 EXE에서도 정상 동작함.
+- Tier 1 번들 chromium smoke와 Tier 2 EXE end-to-end smoke가 모두 성공함.
+- 첫 출시 후보의 핵심 실행 게이트를 통과함.
+
+## 남은 보류 항목
+- 온라인 채널 필터 배선
+- 시트명/시트 구조 정리
+- basic 경로 숨김 또는 단일 수집 UX 정리
+- 다건 상세 수집 안정성 테스트
+- 패키징 용량 최적화
+- 영업용 소개자료/가격안/사용법 정리

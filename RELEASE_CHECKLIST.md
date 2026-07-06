@@ -97,6 +97,7 @@
   - `PLAYWRIGHT_BROWSERS_PATH=dist/ms-playwright` 설정 후 상세 수집 `limit=1`(keyword: 서울특별시 강동구 카페) 실행
   - 목적: EXE 빌드 없이 번들 chromium이 실제 구동되고 place_id/플레이스 URL/전화가 수집되는지 조기 확인
   - 결과: rows=1, place_id/플레이스 URL/주소/대표전화/인스타 수집 성공, CAPTCHA/Timeout 없음, 예외 없음 (PROJECT_STATE.md 2026-07-07 기록 참조)
-- [ ] **Tier 2 — 패키징 EXE end-to-end (빌드 후, 1회)**
+- [x] **Tier 2 — 패키징 EXE end-to-end (빌드 후, 1회)** — 2026-07-07 완료
   - `build.bat`로 빌드 → `dist/NaverPlaceSalesDBCollector.exe` 실행 → 상세 수집 `limit=1` → `output/*.xlsx` 통합_결과 11컬럼 생성 확인, place_id 비노출, CAPTCHA/예외 없음
   - 목적: 배포 산출물(EXE + ms-playwright)로 실제 end-to-end 동작을 출시 게이트로 확인
+  - 결과: EXE 실행/GUI 표시/Excel 생성 모두 성공, 통합_결과 11컬럼·place_id 비노출 확인, 생성 파일 `naver_place_premium_db_20260707_0238.xlsx` (PROJECT_STATE.md 2026-07-07 Tier 2 기록 참조)
