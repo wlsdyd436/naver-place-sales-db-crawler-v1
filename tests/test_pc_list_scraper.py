@@ -618,11 +618,11 @@ def check_check_stop_true_when_set(reporter: ValidationReporter) -> None:
 
 
 def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
-    # 2026-07-06 Stage 3C: exporter.py는 통합_결과 스키마 확장으로 정당하게 수정되므로
-    # 이 list 가드에서 제외한다(exporter 스키마는 test_exporter_schema.py가 별도 검증).
+    # 2026-07-06 Stage 3C: exporter.py는 통합_결과 스키마 확장으로 정당하게 수정되어 제외.
+    # 2026-07-06 Stage 3D: ui.py는 premium 분기의 PC full engine 연결로 정당하게 수정되어 제외
+    # (ui 연결은 test_ui_pc_full_wiring.py가 별도 검증).
     protected_files = [
         "src/pc_crawler.py",
-        "src/ui.py",
         "src/parser.py",
         "src/crawler.py",
         "src/pc/config.py",
@@ -640,7 +640,7 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         )
         output = result.stdout.strip()
         if result.returncode == 0 and output == "":
-            reporter.pass_("금지 파일 8개 모두 git 변경 없음(git status --porcelain 결과 없음)")
+            reporter.pass_("금지 파일 7개 모두 git 변경 없음(git status --porcelain 결과 없음)")
         else:
             reporter.fail(
                 f"금지 파일 변경 감지 또는 git 명령 실패: returncode={result.returncode}, output={output!r}"

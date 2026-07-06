@@ -15,6 +15,9 @@ from src.exporter import export_places_to_excel
 from src.merger import safe_merge_places
 from src.parser import parse_places
 from src.pc_crawler import crawl_places_pc
+from src.pc.config import DiagnosticConfig
+from src.pc.detail_scraper import build_full_collector
+from src.pc.pipeline import collect_pc_full
 
 
 REGION_DATA = {
@@ -363,7 +366,9 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         remaining_queries = max(0, self.total_queries - self.completed_queries)
         limit = int(self.limit_var.get().strip())
-        prior_time = limit * 3.5 if self.mode_var.get() == "premium" else limit * 1.5
+        # 2026-07-06 Stage 3D: premium이 PC full engine(카드별 entryIframe 클릭/wait)으로
+        # 전환되어 항목당 소요가 늘어, 첫 쿼리 추정 계수를 3.5 -> 5.0으로 상향(이후 실측 자기보정).
+        prior_time = limit * 5.0 if self.mode_var.get() == "premium" else limit * 1.5
         avg_time = (prior_time + self.total_pure_time) / (1 + self.completed_queries)
 
         remaining_time = (avg_time * remaining_queries) - current_query_elapsed
@@ -507,6 +512,30 @@ class SalesDbCrawlerApp(ctk.CTk):
         return parsed_places, parsed_places, []
 
     def _collect_premium_query(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
+        # 2026-07-06 Stage 3D: premium 분기를 새 PC full engine(collect_pc_full)에 연결.
+        # 카드 index 클릭 -> entryIframe에서 전화/주소/플레이스 URL/SNS를 한 번에 수집하며,
+        # row는 이미 최종 컬럼 형태이므로 parse_places/merger를 우회한다(우회 이유: 신규
+        # 필드 홈페이지/인스타/블로그 보존, place_id는 row에 남기고 Excel 비노출).
+        # 반환은 (rows, [], rows)로, 기존 _run_queue_pipeline 누적/저장 로직을 수정하지 않는다.
+        # 기존 모바일+PC 병합 로직은 _collect_premium_query_legacy로 보존(fallback/롤백용).
+        self.log("[ui] Premium Mode(PC full engine): 상세 데이터 수집 중...")
+        cfg = DiagnosticConfig.from_env()
+        collector = build_full_collector(cfg)
+        with contextlib.redirect_stdout(LogWriter(self.log)):
+            rows = collect_pc_full(
+                query,
+                limit,
+                new_open_only=new_open_only,
+                stop_event=self.stop_event,
+                pause_event=self.pause_event,
+                diagnostic_config=cfg,
+                collector=collector,
+            )
+        self.log(f"[ui] pc full count={len(rows)}")
+        return rows, [], rows
+
+    def _collect_premium_query_legacy(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
+        # Stage 3C까지의 모바일+PC 병합 premium 로직(fallback/롤백용, 현재 호출부 없음).
         self.log("[ui] Premium Mode: 기본 데이터(전화번호) 수집 중...")
         with contextlib.redirect_stdout(LogWriter(self.log)):
             mobile_raw = crawl_places(query, limit, new_open_only=new_open_only, stop_event=self.stop_event, pause_event=self.pause_event)
