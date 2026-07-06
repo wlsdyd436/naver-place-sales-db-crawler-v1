@@ -196,6 +196,34 @@ python app.py
 - **빠른 수집(모바일)**: 빠른 전화영업 DB 수집 (모바일 리스트 기반)
 - **상세 수집(PC·전화·SNS)**: PC 단일 엔진으로 카드 클릭 → 상세 진입하여 대표전화·주소·플레이스 URL·리뷰수·새로오픈여부·홈페이지/SNS 링크 수집
 
+### 배포 EXE 실행 (최종 사용자)
+
+개발 환경 없이 실행 파일(EXE)로 배포/사용하는 경우입니다.
+
+**빌드(배포자):**
+
+```powershell
+# 사전: .venv 활성화 + playwright install chromium 완료 상태에서
+build.bat
+```
+
+- 빌드 후 `dist/` 폴더에 다음이 생성됩니다.
+  - `dist/NaverPlaceSalesDBCollector.exe`
+  - `dist/ms-playwright/` (브라우저 번들)
+- **배포 시 EXE와 `ms-playwright` 폴더를 반드시 같은 폴더에 함께** 두어야 합니다. EXE는 자기 옆의 `ms-playwright`를 브라우저 실행 경로로 사용합니다.
+
+**실행(사용자):**
+
+- `NaverPlaceSalesDBCollector.exe`를 더블클릭하면 GUI가 실행됩니다.
+- 수집 결과 Excel은 **EXE가 실행된 위치 기준 `output/` 폴더**에 저장됩니다.
+- EXE 실행 시에는 진단 모드가 자동으로 비활성화되어(안전 모드), 브라우저는 화면 밖에서 동작하고 진단 산출물은 저장되지 않습니다.
+
+**안내:**
+
+- 최초 실행 시 내부 압축 해제로 수 초~수십 초가 걸릴 수 있습니다.
+- 일부 백신은 PyInstaller onefile EXE를 오탐할 수 있습니다. 필요 시 예외 처리 후 사용하세요.
+- `ms-playwright` 폴더가 EXE 옆에 없으면 브라우저를 찾지 못해 실행되지 않습니다.
+
 ### 주의사항
 
 - 업종 추출은 불안정할 수 있으며, 빈 값으로 출력될 수 있습니다 (오탐 방지 정책).

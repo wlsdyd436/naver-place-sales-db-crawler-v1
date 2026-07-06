@@ -2,7 +2,7 @@
 
 본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
 
-최종 갱신: 2026-07-06 (Stage 3E)
+최종 갱신: 2026-07-06 (Stage 3F)
 
 ---
 
@@ -70,9 +70,32 @@
 
 ## 8. 출시 전 남은 보류 항목
 
-- [-] 온라인 채널 존재 필터 실배선 (Stage 3F)
+- [-] 온라인 채널 존재 필터 실배선 (후속 단계)
 - [-] 원본_모바일/원본_PC 시트명·구조 정리 또는 단일 시트화
 - [-] basic 경로의 상세 엔진 통합 여부 판단
 - [-] legacy 수집 엔진 제거
 - [-] 버전 표기(README H1) 갱신 여부 결정
 - [-] 다건/다지역 대량 live 검증
+
+## 9. 패키징 / 빌드 체크
+
+- [x] PyInstaller 빌드 스크립트 존재 (`build.bat`, `--onefile --windowed --collect-all customtkinter`)
+- [x] `app.py`가 `src.ui` import 전에 `PLAYWRIGHT_BROWSERS_PATH`를 설정 (frozen 시 EXE 옆 `ms-playwright` 우선)
+- [x] chromium 번들 포함 확인 (`dist/ms-playwright/chromium-*`, `chromium_headless_shell-*`)
+- [x] frozen(EXE) 환경에서 `DiagnosticConfig.from_env()`가 강제 안전 모드 (test_pc_config `check_frozen_forces_safe_mode`로 검증)
+- [x] README에 EXE 배포/실행 절 추가(EXE + ms-playwright 동일 폴더 배치, output 위치, AV 오탐/최초 실행 지연 안내)
+- [x] `.env.example`를 현재 `PCCRAWLER_*` 진단 env 기준으로 최신화(frozen 시 무시됨을 명시)
+- [ ] 빌드 머신 `playwright` 버전이 requirements(1.60.0)와 일치하고 번들 chromium 리비전과 정합
+- [-] 브라우저 번들 chromium 한정 축소(용량 최적화) — 후속 패키징 최적화 단계
+- [-] build.bat / `.spec` 빌드 방식 일원화 — 후속 단계
+
+## 10. 출시 smoke 계획 (Tier 1 / Tier 2)
+
+두 smoke 모두 **각 1회, 별도 승인 후 실행**한다(반복 live 금지). 실행 결과는 성공 시 별도 기록을 남긴다.
+
+- [ ] **Tier 1 — 번들 chromium 실행 확인 (빌드 불필요, 1회)**
+  - `PLAYWRIGHT_BROWSERS_PATH=dist/ms-playwright` 설정 후 상세 수집 `limit=1`(keyword: 서울특별시 강동구 카페) 실행
+  - 목적: EXE 빌드 없이 번들 chromium이 실제 구동되고 place_id/플레이스 URL/전화가 수집되는지 조기 확인
+- [ ] **Tier 2 — 패키징 EXE end-to-end (빌드 후, 1회)**
+  - `build.bat`로 빌드 → `dist/NaverPlaceSalesDBCollector.exe` 실행 → 상세 수집 `limit=1` → `output/*.xlsx` 통합_결과 11컬럼 생성 확인, place_id 비노출, CAPTCHA/예외 없음
+  - 목적: 배포 산출물(EXE + ms-playwright)로 실제 end-to-end 동작을 출시 게이트로 확인
