@@ -416,3 +416,53 @@ Premium Mode 통합 결과 필드:
 - Stage 3C Export Schema / Excel 출력 연결 여부 검토
 - 홈페이지/인스타/블로그를 Excel 컬럼에 포함할지 별도 판단
 - ui.py 연결 전에는 기존 Excel 컬럼 보존과 상품 구성 기준을 먼저 확정
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3C Export Schema 구현 기록
+
+## 배경
+- Stage 3B에서 PC full collector가 place_id, 플레이스 URL, 주소, 대표전화, 인스타 링크 수집에 성공함.
+- Stage 3B.1에서 주소 정제 보정까지 완료함.
+- 다음 단계로 새 PC full row를 기존 Excel 출력 스키마에 연결하기 위한 export schema 확장을 진행함.
+
+## 완료
+- src/exporter.py의 MERGED_COLUMNS에 홈페이지, 인스타, 블로그 3개 컬럼 append
+- 기존 통합_결과 8개 컬럼 이름/순서/위치 보존
+- MOBILE_COLUMNS / PC_COLUMNS 불변
+- src/pc/export_adapter.py 신규 생성
+- 새 PC full row를 parse_places를 거치지 않고 통합_결과로 직접 투영하는 얇은 어댑터 추가
+- place_id는 row 내부 유지, Excel 비노출로 확정
+- ui.py 연결은 하지 않음
+- pc_crawler.py / parser.py / merger.py 무변경
+
+## 최종 통합_결과 컬럼
+1. 업체명
+2. 업종
+3. 새로오픈여부
+4. 리뷰수
+5. 주소
+6. 대표전화
+7. 플레이스 URL
+8. 수집일
+9. 홈페이지
+10. 인스타
+11. 블로그
+
+## 테스트
+- tests/test_exporter_schema.py: PASS 7 / FAIL 0
+- tests/test_export_adapter.py: PASS 2 / FAIL 0
+- tests/test_pc_detail_scraper.py: PASS 23 / FAIL 0
+- tests/test_pc_list_scraper.py: PASS 21 / FAIL 0
+- tests/test_pc_browser_session.py: PASS 15 / FAIL 0
+- tests/test_pc_pipeline.py: PASS 8 / FAIL 0
+
+## 참고
+- tests/test_excel_validation.py는 통합_결과 기대 컬럼을 11개로 동기화함.
+- 기존 output 파일은 과거 8컬럼 산출물이므로, 과거 파일 대상으로 validation을 실행하면 컬럼 불일치가 날 수 있음.
+- 신규 산출물부터 11컬럼 스키마가 기준임.
+
+## 다음 작업
+- Stage 3D UI 연결 설계
+- 새 PC full engine을 기존 Queue / Stop / Pause / Excel 저장 흐름에 어떻게 연결할지 검토
+- 기존 pc_crawler.py는 삭제하지 않고 legacy/fallback으로 유지
+- ui.py 연결 전 ETA, 부분 저장, 실패 처리, 기존 모드 흐름 영향 검토 필요
