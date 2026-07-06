@@ -87,11 +87,12 @@ class FakeHrefs:
 
 
 class FakeValue:
-    """place_blind 라벨의 값 div (텍스트 + 외부 링크)."""
+    """place_blind 라벨의 값 div (텍스트 + 외부 링크 + 주소 전용 span.pz7wy)."""
 
-    def __init__(self, text="", hrefs=None):
+    def __init__(self, text="", hrefs=None, address_span=None):
         self._text = text
         self._hrefs = hrefs or []
+        self._address_span = address_span
 
     @property
     def first(self):
@@ -104,6 +105,10 @@ class FakeValue:
         return self._text
 
     def locator(self, selector):
+        if selector == "span.pz7wy":
+            if self._address_span is not None:
+                return FakeLD(count_value=1, text=self._address_span)
+            return FakeLD(count_value=0)
         return FakeHrefs(self._hrefs)
 
 
@@ -140,7 +145,7 @@ class FakeMissing:
 
 
 class FakeEntryFrame:
-    def __init__(self, place_id, title="", phone="", address="", hrefs=None):
+    def __init__(self, place_id, title="", phone="", address="", address_span=None, hrefs=None):
         self.url = (
             f"https://pcmap.place.naver.com/restaurant/{place_id}/home"
             f"?entry=bmp&timestamp=1&searchText=x"
@@ -150,8 +155,10 @@ class FakeEntryFrame:
             self._map["span.IY7ZX"] = FakeLD(count_value=1, text=title)
         if phone:
             self._map["span.place_blind:has-text('전화번호')"] = FakeLabel(FakeValue(text=phone))
-        if address:
-            self._map["span.place_blind:has-text('주소')"] = FakeLabel(FakeValue(text=address))
+        if address or address_span:
+            self._map["span.place_blind:has-text('주소')"] = FakeLabel(
+                FakeValue(text=address, address_span=address_span)
+            )
         if hrefs:
             self._map["span.place_blind:has-text('홈페이지')"] = FakeLabel(FakeValue(hrefs=hrefs))
 
@@ -362,6 +369,57 @@ def check_extract_entry_address(reporter: ValidationReporter) -> None:
         reporter.pass_("home 탭 '주소' 라벨 값에서 전체주소 추출")
     else:
         reporter.fail(f"주소 추출 결과가 예상과 다름: {_extract_entry_address(frame)!r}")
+
+
+def check_extract_entry_address_prefers_pz7wy_span(reporter: ValidationReporter) -> None:
+    # 값 div 전체 텍스트에는 역/출구/거리 안내가 섞여 있지만, span.pz7wy가 있으면
+    # 그 값만 사용해야 한다(2026-07-06 live smoke 발견 문제 보정).
+    frame = FakeEntryFrame(
+        "1234567",
+        address="서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터",
+        address_span="서울 강동구 성내로14길 48 1층",
+    )
+    result = _extract_entry_address(frame)
+    if result == "서울 강동구 성내로14길 48 1층":
+        reporter.pass_("span.pz7wy 존재 시 그 값만 추출(전체 텍스트의 역/출구/거리 안내 무시)")
+    else:
+        reporter.fail(f"pz7wy 우선 추출 결과가 예상과 다름: {result!r}")
+
+
+def check_extract_entry_address_fallback_strips_noise(reporter: ValidationReporter) -> None:
+    # span.pz7wy가 없을 때만 fallback: 전체 텍스트에서 역/출구/거리 안내를 정제한다.
+    frame = FakeEntryFrame(
+        "1234567",
+        address="서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터",
+    )
+    result = _extract_entry_address(frame)
+    if result == "서울 강동구 성내로14길 48 1층":
+        reporter.pass_("pz7wy 부재 시 fallback 전체 텍스트에서 역/출구/거리 안내 정제")
+    else:
+        reporter.fail(f"fallback 정제 결과가 예상과 다름: {result!r}")
+
+
+def check_extract_entry_address_preserves_number_components(reporter: ValidationReporter) -> None:
+    # 정제 규칙이 번지/층/호수 등 실제 주소 구성 요소(48, 1층, 101호)를 지우면 안 된다.
+    frame = FakeEntryFrame(
+        "1234567",
+        address="서울 강동구 성내로14길 48 1층 101호 8강동구청역 2번 출구에서 866m 미터",
+    )
+    result = _extract_entry_address(frame)
+    if result == "서울 강동구 성내로14길 48 1층 101호":
+        reporter.pass_("정제 후에도 번지/층/호수(48, 1층, 101호)는 보존됨")
+    else:
+        reporter.fail(f"주소 구성 요소 보존 결과가 예상과 다름: {result!r}")
+
+
+def check_extract_entry_address_missing_label_returns_empty(reporter: ValidationReporter) -> None:
+    # '주소' 라벨 자체가 없으면(값 div를 찾지 못하면) 기존과 동일하게 공란을 반환한다.
+    frame = FakeEntryFrame("1234567")  # address/address_span 모두 미지정
+    result = _extract_entry_address(frame)
+    if result == "":
+        reporter.pass_("주소 라벨 부재 시 기존 fallback 동작 유지(공란 반환, 예외 없음)")
+    else:
+        reporter.fail(f"주소 라벨 부재 시 결과가 예상과 다름: {result!r}")
 
 
 def check_extract_entry_sns(reporter: ValidationReporter) -> None:
@@ -830,6 +888,10 @@ def main() -> int:
     check_title_matches(reporter)
     check_extract_entry_phone(reporter)
     check_extract_entry_address(reporter)
+    check_extract_entry_address_prefers_pz7wy_span(reporter)
+    check_extract_entry_address_fallback_strips_noise(reporter)
+    check_extract_entry_address_preserves_number_components(reporter)
+    check_extract_entry_address_missing_label_returns_empty(reporter)
     check_extract_entry_sns(reporter)
 
     check_click_card_by_name(reporter)

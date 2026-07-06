@@ -135,8 +135,44 @@ def _extract_entry_phone(entry_frame) -> str:
     return match.group(0) if match else ""
 
 
+# 주소 값 영역(div.vV_z_)에는 실제 주소(span.pz7wy) 뒤에 인접 지하철역/출구/거리
+# 안내가 같은 영역에 이어 붙는다(2026-07-06 live smoke 확인: "...1층 8강동구청역
+# 2번 출구에서 866m 미터"). span.pz7wy는 안정적 실제 주소 전용 값이므로 우선
+# 사용하고, 부재 시에만 전체 텍스트에서 역/출구/거리 안내를 정제해 사용한다.
+_ADDRESS_NOISE_PATTERNS = [
+    re.compile(r"\d*[가-힣A-Za-z]+역\s*\d+번\s*출구에서\s*\d+[mM](?:\s*미터)?"),
+    re.compile(r"\d+번\s*출구에서\s*\d+[mM](?:\s*미터)?"),
+    re.compile(r"\d+[mM]\s*미터"),
+]
+
+
+def _clean_address_fallback(text: str) -> str:
+    cleaned = text
+    for pattern in _ADDRESS_NOISE_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return " ".join(cleaned.split())
+
+
 def _extract_entry_address(entry_frame) -> str:
-    return _value_text(entry_frame, "주소")
+    value_loc = _value_locator(entry_frame, "주소")
+    if value_loc is None:
+        return ""
+
+    try:
+        address_span = value_loc.locator("span.pz7wy").first
+        if address_span.count() > 0:
+            text = address_span.inner_text(timeout=1000) or ""
+            text = " ".join(text.split())
+            if text:
+                return text
+    except Exception:
+        pass
+
+    try:
+        text = value_loc.inner_text(timeout=1000) or ""
+    except Exception:
+        return ""
+    return _clean_address_fallback(" ".join(text.split()))
 
 
 def _extract_entry_sns(entry_frame):
