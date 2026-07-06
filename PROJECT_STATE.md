@@ -298,6 +298,6 @@ Premium Mode 통합 결과 필드:
 - 단건 상세 실패는 skip
 - 연속 상세 실패는 diagnostics 캡처 후 안전 종료
 - tests/test_pc_detail_scraper.py PASS 11
-- test_pc_list_scraper.py PASS 21
+- test_pc_list_scraper.py PASS 20
 - test_pc_browser_session.py PASS 15
 - test_pc_pipeline.py PASS 8
