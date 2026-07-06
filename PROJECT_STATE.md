@@ -694,3 +694,38 @@ Premium Mode 통합 결과 필드:
   - 상세 수집 limit=1
   - Excel 11컬럼 생성 확인
   - 별도 승인 후 1회만 실행
+
+
+# 2026-07-07 Tier 1 번들 chromium smoke 성공 기록
+
+## 실행 조건
+- PLAYWRIGHT_BROWSERS_PATH=dist/ms-playwright
+- keyword: 서울특별시 강동구 카페
+- limit: 1
+- visible: True
+- capture_artifacts: True
+- collect_pc_full 직접 호출
+- 실행 횟수: 1회
+- 정보 탭 클릭 없음
+- CAPTCHA 우회/회피 없음
+
+## 결과
+- dist/ms-playwright 존재: True
+- chromium 폴더: chromium-1223, chromium_headless_shell-1223
+- PLAYWRIGHT_BROWSERS_PATH 일치: True
+- collect_pc_full 호출 성공: True
+- rows count: 1
+- 업체명: 오베르캄프 본점
+- place_id: 1171815551
+- 플레이스 URL: https://pcmap.place.naver.com/restaurant/1171815551/home
+- 주소: 서울 강동구 성내로14길 48 1층
+- 대표전화: 0507-1387-4967
+- 인스타: https://www.instagram.com/oberkampf.kr
+- CAPTCHA/Timeout 신호: False
+- 예외 발생: 없음
+
+## 판단
+- 번들된 chromium(dist/ms-playwright/chromium-1223)이 실제 Playwright 실행에서 정상 구동됨.
+- requirements.txt의 playwright==1.60.0과 번들 리비전 1223 정합성은 실제 구동으로 간접 확인됨.
+- EXE 빌드 전 브라우저 번들 리스크가 1차 해소됨.
+- Tier 2 EXE end-to-end smoke가 다음 출시 게이트로 남음.
