@@ -621,3 +621,76 @@ Premium Mode 통합 결과 필드:
 - 시트명/시트 구조 변경은 아직 보류
 - basic 경로 제거/통합도 보류
 - legacy premium fallback 제거도 보류
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3F 패키징 문서·설정 위생 기록
+
+## 배경
+- Stage 3D에서 UI premium 경로 end-to-end smoke가 성공함.
+- Stage 3E에서 README / LEGAL_NOTICE / RELEASE_CHECKLIST / UI 문구 정렬을 완료함.
+- Stage 3F에서는 첫 출시 후보 준비를 위해 패키징 실행 문서와 환경 예시를 현재 코드 기준으로 정리함.
+
+## 완료
+- .env.example 최신화
+  - 구식 변수 DEFAULT_REGION / MIN_DELAY / MAX_DELAY / HEADLESS / MAX_PAGES 제거
+  - 현재 코드가 실제로 읽는 PCCRAWLER_* 변수 기준으로 정리
+  - PCCRAWLER_DEBUG
+  - PCCRAWLER_VISIBLE
+  - PCCRAWLER_CAPTURE_ARTIFACTS
+  - PCCRAWLER_KEEP_OPEN_ON_ERROR
+  - PCCRAWLER_VERBOSE
+  - PCCRAWLER_KEEP_OPEN_TIMEOUT_SEC
+  - 기본은 안전 모드이며 frozen(EXE) 환경에서는 env와 무관하게 안전 모드가 적용됨을 명시
+
+- README.md 보완
+  - 배포 EXE 실행 절 추가
+  - build.bat 빌드 안내
+  - EXE와 ms-playwright 폴더를 같은 dist 폴더에 배치해야 함을 명시
+  - output 폴더 저장 위치 안내
+  - EXE 실행 시 DiagnosticConfig 안전 모드 적용 안내
+  - 최초 실행 지연 및 백신 오탐 가능성 안내
+
+- RELEASE_CHECKLIST.md 보완
+  - 패키징/빌드 체크 섹션 추가
+  - Tier 1 번들 chromium smoke 계획 추가
+  - Tier 2 EXE end-to-end smoke 계획 추가
+  - 온라인 채널 필터는 Stage 3F가 아니라 후속 단계로 정정
+
+## 수정하지 않은 것
+- src/ 전체 무변경
+- app.py 무변경
+- build.bat 무변경
+- NaverPlaceSalesDBCollector.spec 무변경
+- 수집 로직 무변경
+- UI 구조 무변경
+- 시트 구조 무변경
+- 온라인 채널 필터 미배선 유지
+- live smoke 미실행
+
+## 테스트
+- test_pc_config: PASS 6 / FAIL 0
+- test_pc_safety: PASS 9 / FAIL 0
+- test_pc_diagnostics: PASS 8 / FAIL 0
+- test_pc_pipeline: PASS 8 / FAIL 0
+- test_pc_browser_session: PASS 15 / FAIL 0
+- test_pc_list_scraper: PASS 21 / FAIL 0
+- test_pc_detail_scraper: PASS 23 / FAIL 0
+- test_exporter_schema: PASS 7 / FAIL 0
+- test_export_adapter: PASS 2 / FAIL 0
+- test_ui_pc_full_wiring: PASS 3 / FAIL 0
+
+## 판단
+- Stage 3F는 런타임 변경 없이 문서·설정 위생만 완료함.
+- 첫 출시 후보 전 패키징 안내와 환경 예시의 불일치를 해소함.
+- build.bat / 브라우저 번들 최적화는 보류함.
+- 현재 번들 구조로 먼저 EXE 실행 가능성을 검증하는 것이 우선임.
+
+## 다음 작업
+- Tier 1 번들 chromium smoke
+  - PLAYWRIGHT_BROWSERS_PATH=dist/ms-playwright 기준으로 번들 chromium이 실제 구동되는지 확인
+  - build 없이 1회만 실행
+- Tier 2 EXE end-to-end smoke
+  - build.bat 실행 후 dist/NaverPlaceSalesDBCollector.exe로 실제 GUI 실행
+  - 상세 수집 limit=1
+  - Excel 11컬럼 생성 확인
+  - 별도 승인 후 1회만 실행
