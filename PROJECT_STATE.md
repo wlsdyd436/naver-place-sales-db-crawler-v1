@@ -382,3 +382,37 @@ Premium Mode 통합 결과 필드:
 - 저장된 home HTML 또는 mock 기반 테스트로 주소에서 역/출구/거리 안내 제거
 - live test 반복 없이 단위 테스트 우선
 - 이후 Stage 3C에서 exporter/ui 컬럼 배선 여부 판단
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3B.1 주소 정제 보정 기록
+
+## 배경
+- Stage 3B 최종 live smoke에서 place_id, 플레이스 URL, 대표전화, 주소, 인스타 수집은 성공함.
+- 다만 주소 값에 역/출구/거리 안내 문구가 함께 붙는 현상이 확인됨.
+- 예: 서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터
+
+## 완료
+- src/pc/detail_scraper.py의 주소 추출 로직 보정
+- tests/test_pc_detail_scraper.py 테스트 보강
+- live test 없이 저장된 DOM 증거와 mock 테스트 기반으로 처리
+
+## 구현 방향
+- 주소 row 내부의 span.pz7wy 값을 우선 사용
+- span.pz7wy가 없을 때만 기존 전체 텍스트 fallback 사용
+- fallback 텍스트에서는 역/출구/거리 안내 문구 제거
+- 번지, 층, 호수 정보는 제거하지 않도록 테스트로 확인
+
+## 정제 예시
+- 기존: 서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터
+- 목표: 서울 강동구 성내로14길 48 1층
+
+## 테스트
+- tests/test_pc_detail_scraper.py: PASS 23 / FAIL 0
+- tests/test_pc_list_scraper.py: PASS 21 / FAIL 0
+- tests/test_pc_browser_session.py: PASS 15 / FAIL 0
+- tests/test_pc_pipeline.py: PASS 8 / FAIL 0
+
+## 다음 작업
+- Stage 3C Export Schema / Excel 출력 연결 여부 검토
+- 홈페이지/인스타/블로그를 Excel 컬럼에 포함할지 별도 판단
+- ui.py 연결 전에는 기존 Excel 컬럼 보존과 상품 구성 기준을 먼저 확정
