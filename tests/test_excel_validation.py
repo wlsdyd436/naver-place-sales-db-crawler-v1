@@ -13,6 +13,8 @@ OUTPUT_DIR = Path("output")
 REQUIRED_SHEETS = ["통합_결과", "원본_모바일", "원본_PC"]
 
 EXPECTED_COLUMNS = {
+    # 2026-07-06 Stage 3C: 통합_결과 단일 스키마 확장. 기존 8개 컬럼은 그대로 두고
+    # 온라인 채널 컬럼(홈페이지/인스타/블로그)을 맨 뒤에 append 함(exporter.MERGED_COLUMNS와 동기화).
     "통합_결과": [
         "업체명",
         "업종",
@@ -22,6 +24,9 @@ EXPECTED_COLUMNS = {
         "대표전화",
         "플레이스 URL",
         "수집일",
+        "홈페이지",
+        "인스타",
+        "블로그",
     ],
     "원본_모바일": [
         "업체명",
