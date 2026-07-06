@@ -160,7 +160,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         self.new_open_checkbox = ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var)
         self.new_open_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
-        self.online_channel_checkbox = ctk.CTkCheckBox(filter_frame, text="온라인 채널(블로그/인스타 등) 존재", variable=self.online_channel_var)
+        self.online_channel_checkbox = ctk.CTkCheckBox(filter_frame, text="온라인 채널(블로그/인스타 등) 존재 (준비 중)", variable=self.online_channel_var)
         self.online_channel_checkbox.grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
         ctk.CTkLabel(filter_frame, text="리뷰 수:").grid(row=2, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
@@ -173,9 +173,9 @@ class SalesDbCrawlerApp(ctk.CTk):
         ctk.CTkLabel(filter_frame, text="수집 모드:").grid(row=3, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
         mode_frame = ctk.CTkFrame(filter_frame, fg_color="transparent")
         mode_frame.grid(row=3, column=1, columnspan=3, sticky="w", padx=(0, 12), pady=(0, 6))
-        self.basic_radio = ctk.CTkRadioButton(mode_frame, text="Basic", variable=self.mode_var, value="basic", command=self.on_mode_change)
+        self.basic_radio = ctk.CTkRadioButton(mode_frame, text="빠른 수집(모바일)", variable=self.mode_var, value="basic", command=self.on_mode_change)
         self.basic_radio.pack(side="left", padx=(0, 12))
-        self.premium_radio = ctk.CTkRadioButton(mode_frame, text="Premium", variable=self.mode_var, value="premium", command=self.on_mode_change)
+        self.premium_radio = ctk.CTkRadioButton(mode_frame, text="상세 수집(PC·전화·SNS)", variable=self.mode_var, value="premium", command=self.on_mode_change)
         self.premium_radio.pack(side="left")
 
         ctk.CTkLabel(filter_frame, text="수집 개수:").grid(row=4, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
