@@ -518,3 +518,60 @@ Premium Mode 통합 결과 필드:
 - 실제 UI 실행 또는 UI 경로를 최대한 모사한 smoke로 Excel 파일 생성 확인
 - 반복 live test 금지
 - 성공 후 Stage 3D 검증 기록 추가
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3D UI end-to-end smoke 기록
+
+## 실행 조건
+- premium 경로 모사
+- keyword: 서울특별시 강동구 카페
+- limit: 1
+- visible: True
+- capture_artifacts: True
+- 실행 횟수: 1회
+- 정보 탭 클릭 없음
+- home 탭만 사용
+- 반복 실행 없음
+
+## 결과
+- _collect_premium_query 호출 성공: True
+- rows count: 1
+- mobile_rows count: 0
+- pc_rows count: 1
+- 업체명: 오베르캄프 본점
+- place_id: 1171815551
+- 플레이스 URL: https://pcmap.place.naver.com/restaurant/1171815551/home
+- 주소: 서울 강동구 성내로14길 48 1층
+- 대표전화: 0507-1387-4967
+- 홈페이지: 공란
+- 인스타: https://www.instagram.com/oberkampf.kr
+- 블로그: 공란
+- Excel 파일 생성: True
+- 통합_결과 시트 존재: True
+- 통합_결과 11컬럼 일치: True
+- place_id Excel 비노출: True
+- 원본_PC 시트 존재: True
+- CAPTCHA/Timeout 신호: False
+- 예외 발생: 없음
+
+## 판단
+- Stage 3D의 핵심 목표인 UI premium 경로 → 새 PC full engine → Excel 생성 흐름이 실제로 성공함.
+- Stage 3B.1 주소 정제 보정도 실제 UI smoke 결과에 반영됨.
+- 통합_결과 11컬럼 스키마가 정상 적용됨.
+- place_id는 내부 필드로 유지되고 Excel에는 노출되지 않음.
+- CAPTCHA/Timeout 없이 완료됨.
+- 반복 live test는 하지 않음.
+
+## 현재 의미
+- 새 PC 단일 엔진이 독립 모듈 상태를 넘어 실제 UI premium 실행 경로에 연결됨.
+- 기존 모바일+PC 병합 방식은 _collect_premium_query_legacy로 보존됨.
+- basic 경로는 기존 모바일 수집 흐름으로 유지됨.
+- 출시 후보에 가까운 end-to-end 흐름이 처음으로 확인됨.
+
+## 다음 작업
+- Stage 3E UI Cleanup / 시트 의미 정리 설계
+- basic/premium 라벨 정리 여부 판단
+- 원본_모바일 / 원본_PC 시트 의미 정리
+- legacy premium fallback 유지 방식 정리
+- 온라인 채널 존재 필터 배선 여부 검토
+- 첫 출시 후보 체크리스트 준비
