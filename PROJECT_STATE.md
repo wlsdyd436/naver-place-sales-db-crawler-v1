@@ -466,3 +466,55 @@ Premium Mode 통합 결과 필드:
 - 새 PC full engine을 기존 Queue / Stop / Pause / Excel 저장 흐름에 어떻게 연결할지 검토
 - 기존 pc_crawler.py는 삭제하지 않고 legacy/fallback으로 유지
 - ui.py 연결 전 ETA, 부분 저장, 실패 처리, 기존 모드 흐름 영향 검토 필요
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3D UI premium 경로 연결 기록
+
+## 배경
+- Stage 3B에서 카드 index 클릭 기반 PC full collector가 실제 smoke에 성공함.
+- Stage 3C에서 통합_결과 Excel 스키마를 11컬럼으로 확장하고 export adapter를 추가함.
+- 다음 단계로 새 PC full engine을 기존 UI premium 실행 경로에 연결함.
+
+## 완료
+- src/ui.py의 _collect_premium_query 본문을 새 PC full engine 호출로 교체
+- DiagnosticConfig.from_env()
+- build_full_collector()
+- collect_pc_full()
+- 기존 premium 모바일+PC 병합 로직은 _collect_premium_query_legacy로 보존
+- _run_queue_pipeline / 누적 / 저장 / export_places_to_excel 호출부는 수정하지 않음
+- basic 분기는 수정하지 않음
+- basic/premium 라디오 및 UI 텍스트는 수정하지 않음
+- premium ETA 계수는 3.5에서 5.0으로 상향
+- 반환 구조는 옵션 A 유지: (rows, [], rows)
+
+## 현재 premium 동작
+- premium 선택 시 새 PC full engine이 실행됨
+- 카드 index 클릭 → entryIframe wait → place_id/주소/대표전화/플레이스 URL/SNS 수집
+- parse_places / merger를 우회함
+- 통합_결과에는 새 PC full row가 들어감
+- 원본_PC에는 rows가 투영됨
+- 원본_모바일은 기존 누적 로직 영향으로 rows 기반 투영 가능성이 있음
+- 시트 역할 정리는 후속 UI cleanup 단계로 보류
+
+## 테스트
+- tests/test_ui_pc_full_wiring.py: PASS 3 / FAIL 0
+- tests/test_exporter_schema.py: PASS 7 / FAIL 0
+- tests/test_export_adapter.py: PASS 2 / FAIL 0
+- tests/test_pc_detail_scraper.py: PASS 23 / FAIL 0
+- tests/test_pc_list_scraper.py: PASS 21 / FAIL 0
+- tests/test_pc_browser_session.py: PASS 15 / FAIL 0
+- tests/test_pc_pipeline.py: PASS 8 / FAIL 0
+
+## 리스크 / 참고
+- 이제 premium 라디오는 내부적으로 새 PC full engine을 실행함.
+- 기존 legacy premium은 _collect_premium_query_legacy로 남아 있어 롤백 가능함.
+- 실제 UI에서 premium 수집 → Excel 저장까지의 end-to-end는 아직 live smoke 미검증.
+- basic 분기는 기존 모바일 수집 그대로 유지됨.
+- 행 수는 구버전 모바일+PC 병합 방식과 달라질 수 있음. 병합 탈락이 줄어드는 것은 의도된 개선임.
+
+## 다음 작업
+- Stage 3D UI end-to-end smoke 준비
+- 조건: premium, limit=1, keyword=서울특별시 강동구 카페, visible=True, capture_artifacts=True
+- 실제 UI 실행 또는 UI 경로를 최대한 모사한 smoke로 Excel 파일 생성 확인
+- 반복 live test 금지
+- 성공 후 Stage 3D 검증 기록 추가
