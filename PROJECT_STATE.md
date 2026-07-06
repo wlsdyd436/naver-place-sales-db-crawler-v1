@@ -301,3 +301,84 @@ Premium Mode 통합 결과 필드:
 - test_pc_list_scraper.py PASS 20
 - test_pc_browser_session.py PASS 15
 - test_pc_pipeline.py PASS 8
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3B 카드 클릭 기반 상세 수집 재설계 기록
+
+## 배경
+- Stage 3A live probe에서 리스트 href 기반 place_id 사전 확보가 실패함.
+- DOM 진단 결과 리스트 카드 anchor href는 "#"이고, 클릭 전 place_id/플레이스 URL이 노출되지 않는 구조로 확인됨.
+- Gemini/Antigravity Browser 실측 결과, 카드 클릭 후 entryIframe URL에서 place_id를 사후 확보하는 방식이 필요함.
+
+## 구현
+- src/pc/detail_scraper.py를 카드 index 클릭 기반 융합 순회 구조로 재설계.
+- build_full_collector()는 list row 생성 후 같은 카드 index를 클릭하여 entryIframe을 대기하고 상세 값을 병합.
+- place_id와 플레이스 URL은 entryIframe 실제 URL에서 확보.
+- 정보 탭은 보안 확인 발생 가능성이 있어 Stage 3B에서는 폐기하고 home 탭만 사용.
+- 전화/주소/홈페이지/SNS는 home 탭의 place_blind 라벨 기반 구조에서 추출.
+- 홈페이지/인스타/블로그는 row dict에는 수집하지만 exporter/ui 배선은 Stage 3C로 보류.
+
+## 테스트
+- tests/test_pc_detail_scraper.py: PASS 19 / FAIL 0
+- tests/test_pc_list_scraper.py: PASS 21 / FAIL 0
+- tests/test_pc_browser_session.py: PASS 15 / FAIL 0
+- tests/test_pc_pipeline.py: PASS 8 / FAIL 0
+
+## 리스크
+- 정보 탭 클릭 시 보안 확인이 발생했으므로 정보 탭 기반 확장은 보류.
+- 실제 카드 간 이동은 최종 smoke로 별도 확인 필요.
+- home 탭에 외부 링크가 1개만 노출되는 업체가 있을 수 있어 홈페이지/인스타/블로그 전체 분리는 후속 검증 필요.
+
+## 다음 작업
+- 사용자 감독 하에 limit=1~2 최종 live smoke 1회.
+- 성공 시 Stage 3B 검증 기록 추가.
+- 이후 Stage 3C에서 exporter/ui 컬럼 배선 여부 판단.
+
+
+# 2026-07-06 PC 단일 엔진 Stage 3B 최종 live smoke 기록
+
+## 실행 조건
+- keyword: 서울특별시 강동구 카페
+- limit: 1
+- visible: True
+- capture_artifacts: True
+- 실행 횟수: 1회
+- 정보 탭 클릭 없음
+- home 탭만 사용
+- 반복 실행 없음
+
+## 결과
+- full_count: 1
+- 업체명: 오베르캄프 본점
+- place_id: 1171815551
+- 플레이스 URL: https://pcmap.place.naver.com/restaurant/1171815551/home
+- 주소: 서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터
+- 대표전화: 0507-1387-4967
+- 홈페이지: 공란
+- 인스타: https://www.instagram.com/oberkampf.kr
+- 블로그: 공란
+- entryIframe 진입 성공: True
+- title wait 성공: True
+- CAPTCHA/Timeout 신호: False
+- diagnostics_captured: null
+- 예외 발생: 없음
+- 부분 결과 보존: on_partial_save 0회
+
+## 판단
+- Stage 3B의 핵심 구조인 카드 index 클릭 → entryIframe wait → place_id 사후 확보 → 상세 데이터 병합이 실제 환경에서 성공함.
+- place_id, 플레이스 URL, 대표전화, 주소, 인스타 링크 수집이 확인됨.
+- CAPTCHA/Timeout은 발생하지 않음.
+- 정보 탭은 보안 확인 유발 가능성이 있으므로 계속 보류하고 home 탭 중심 전략을 유지함.
+- 반복 live test는 하지 않음.
+
+## 발견된 개선점
+- 주소 값에 길찾기/거리 정보가 이어 붙는 현상 확인.
+- 예: "서울 강동구 성내로14길 48 1층 8강동구청역 2번 출구에서 866m 미터"
+- 이는 주소 라벨 값 div 전체 텍스트를 읽으면서 주소 외 안내 문구가 함께 포함된 것으로 판단됨.
+- 다음 단계에서 주소 정제 또는 주소 selector 세분화가 필요함.
+
+## 다음 작업
+- Stage 3B.1 주소 정제 보정
+- 저장된 home HTML 또는 mock 기반 테스트로 주소에서 역/출구/거리 안내 제거
+- live test 반복 없이 단위 테스트 우선
+- 이후 Stage 3C에서 exporter/ui 컬럼 배선 여부 판단
