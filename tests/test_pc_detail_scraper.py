@@ -1,10 +1,9 @@
 from pathlib import Path
-import re
 import subprocess
 import sys
 
 
-# Stage 3A: src/pc/detail_scraper.py 검증용 standalone 스크립트입니다.
+# Stage 3B: src/pc/detail_scraper.py(카드 index 클릭 기반 상세 수집) 검증용 standalone 스크립트입니다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -13,12 +12,17 @@ from src.pc.config import DiagnosticConfig
 from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT
 from src.pc.pipeline import collect_pc_full
 from src.pc.detail_scraper import (
-    ENTRY_ADDRESS_SELECTORS,
     DetailCollectionAborted,
-    _extract_full_address,
-    _extract_phone,
+    _click_card_by_name,
+    _enrich_card,
+    _extract_entry_address,
+    _extract_entry_phone,
+    _extract_entry_sns,
+    _parse_place_id_from_url,
+    _title_matches,
+    _wait_entry_updated,
     build_full_collector,
-    enrich_with_details,
+    collect_full,
 )
 
 
@@ -52,17 +56,16 @@ class ValidationReporter:
 
 
 # ---------------------------------------------------------------------------
-# Fake Playwright 계층 (실 브라우저 없이 상세 진입 시퀀스 시뮬레이션)
+# Fake Playwright 계층 (실 브라우저 없이 카드 클릭/entryIframe 시퀀스 시뮬레이션)
 # ---------------------------------------------------------------------------
 
 
 class FakeLD:
-    """entryIframe 내부 요소 locator."""
+    """단일 텍스트 locator(title 등)."""
 
-    def __init__(self, count_value=0, text="", attr_map=None):
+    def __init__(self, count_value=0, text=""):
         self._count = count_value
         self._text = text
-        self._attr_map = attr_map or {}
 
     @property
     def first(self):
@@ -74,28 +77,94 @@ class FakeLD:
     def inner_text(self, timeout=None):
         return self._text
 
-    def get_attribute(self, name, timeout=None):
-        return self._attr_map.get(name)
+
+class FakeHrefs:
+    def __init__(self, hrefs):
+        self._hrefs = hrefs
+
+    def evaluate_all(self, expression):
+        return list(self._hrefs)
+
+
+class FakeValue:
+    """place_blind 라벨의 값 div (텍스트 + 외부 링크)."""
+
+    def __init__(self, text="", hrefs=None):
+        self._text = text
+        self._hrefs = hrefs or []
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def inner_text(self, timeout=None):
+        return self._text
+
+    def locator(self, selector):
+        return FakeHrefs(self._hrefs)
+
+
+class FakeLabel:
+    """place_blind 라벨 locator. xpath로 값 div를 반환한다."""
+
+    def __init__(self, value):
+        self._value = value
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def locator(self, selector):
+        return self._value
+
+
+class FakeMissing:
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 0
+
+    def inner_text(self, timeout=None):
+        return ""
+
+    def locator(self, selector):
+        return FakeMissing()
 
 
 class FakeEntryFrame:
-    def __init__(self, place_id, phone_href=None, address=""):
-        self.url = f"https://map.naver.com/entry/place/{place_id}/home"
-        self._lm = {}
-        if phone_href:
-            self._lm["a[href^='tel:']"] = FakeLD(count_value=1, attr_map={"href": phone_href})
+    def __init__(self, place_id, title="", phone="", address="", hrefs=None):
+        self.url = (
+            f"https://pcmap.place.naver.com/restaurant/{place_id}/home"
+            f"?entry=bmp&timestamp=1&searchText=x"
+        )
+        self._map = {}
+        if title:
+            self._map["span.IY7ZX"] = FakeLD(count_value=1, text=title)
+        if phone:
+            self._map["span.place_blind:has-text('전화번호')"] = FakeLabel(FakeValue(text=phone))
         if address:
-            self._lm[ENTRY_ADDRESS_SELECTORS[0]] = FakeLD(count_value=1, text=address)
+            self._map["span.place_blind:has-text('주소')"] = FakeLabel(FakeValue(text=address))
+        if hrefs:
+            self._map["span.place_blind:has-text('홈페이지')"] = FakeLabel(FakeValue(hrefs=hrefs))
 
     def locator(self, selector):
-        return self._lm.get(selector, FakeLD(count_value=0))
+        return self._map.get(selector, FakeMissing())
 
 
 class FakeAnchor:
-    def __init__(self, present, on_click=None, click_error=None):
-        self._present = present
+    def __init__(self, text, on_click=None, click_error=None, present=True):
+        self._text = text
         self._on_click = on_click
         self._click_error = click_error
+        self._present = present
 
     @property
     def first(self):
@@ -104,6 +173,9 @@ class FakeAnchor:
     def count(self):
         return 1 if self._present else 0
 
+    def inner_text(self, timeout=None):
+        return self._text
+
     def click(self, timeout=None):
         if self._click_error is not None:
             raise self._click_error
@@ -111,13 +183,45 @@ class FakeAnchor:
             self._on_click()
 
 
-class DetailScenario:
-    """place_id -> cfg({present, loads, click_error, phone_href, address})를 보관하고
-    클릭에 따라 현재 로드된 entryIframe 상태를 전이한다."""
+class FakeAnchorList:
+    def __init__(self, anchors):
+        self._anchors = anchors
 
-    def __init__(self, places):
+    def filter(self, has_text=None):
+        if has_text is None:
+            return FakeAnchorList(list(self._anchors))
+        return FakeAnchorList([a for a in self._anchors if has_text in a._text])
+
+    @property
+    def first(self):
+        return self._anchors[0] if self._anchors else FakeAnchor("", present=False)
+
+    def count(self):
+        return len(self._anchors)
+
+
+class FakeCard:
+    """searchIframe 카드. 첫 anchor가 업체명 버튼, 나머지는 저장/썸네일 등."""
+
+    def __init__(self, name, place_id, scenario):
+        self.name = name
+        self.place_id = place_id
+        name_anchor = FakeAnchor(name, on_click=lambda: scenario.click(place_id))
+        self._anchors = [name_anchor, FakeAnchor("저장")]
+
+    def locator(self, selector):
+        if selector == "a":
+            return FakeAnchorList(self._anchors)
+        return FakeAnchorList([])
+
+
+class DetailScenario:
+    """place_id -> cfg({loads, click_error, title, phone, address, hrefs})를 보관하고
+    카드 클릭에 따라 현재 로드된 entryIframe 상태를 전이한다."""
+
+    def __init__(self, places, current=None):
         self.places = places
-        self.current_entry_id = None
+        self.current_entry_id = current
 
     def click(self, place_id):
         cfg = self.places.get(place_id, {})
@@ -132,24 +236,10 @@ class DetailScenario:
         cfg = self.places.get(self.current_entry_id, {})
         return FakeEntryFrame(
             self.current_entry_id,
-            phone_href=cfg.get("phone_href"),
+            title=cfg.get("title", ""),
+            phone=cfg.get("phone", ""),
             address=cfg.get("address", ""),
-        )
-
-
-class FakeSearchFrame:
-    def __init__(self, scenario):
-        self.scenario = scenario
-
-    def locator(self, selector):
-        match = re.search(r"(\d+)", selector)
-        place_id = match.group(1) if match else ""
-        cfg = self.scenario.places.get(place_id, {})
-        present = cfg.get("present", True)
-        return FakeAnchor(
-            present,
-            on_click=lambda: self.scenario.click(place_id),
-            click_error=cfg.get("click_error"),
+            hrefs=cfg.get("hrefs"),
         )
 
 
@@ -180,7 +270,7 @@ class FakeSession:
         self.goto_calls.append(url)
 
     def find_search_frame(self):
-        return FakeSearchFrame(self.scenario)
+        return "search-frame"
 
     def find_entry_frame(self):
         return self.scenario.entry_frame()
@@ -214,159 +304,348 @@ def _row(place_id, name):
         "리뷰수": "10",
         "주소": "서울 강동구 (리스트주소)",
         "대표전화": "",
-        "플레이스 URL": f"https://map.naver.com/place/{place_id}/home",
-        "place_id": place_id,
-        "수집일": "2026-07-03",
+        "플레이스 URL": "",
+        "place_id": "",
+        "수집일": "2026-07-06",
     }
 
 
 # ---------------------------------------------------------------------------
-# 1. 추출 유닛
+# 1. 순수 helper
 # ---------------------------------------------------------------------------
 
 
-def check_extract_phone_from_tel_href(reporter: ValidationReporter) -> None:
-    frame = FakeEntryFrame("1234567", phone_href="tel:02-123-4567")
-    phone = _extract_phone(frame)
-    if phone == "02-123-4567":
-        reporter.pass_("entryIframe tel: href에서 대표전화 추출 + normalize_phone 적용")
+def check_parse_place_id_from_url(reporter: ValidationReporter) -> None:
+    cases = {
+        "https://pcmap.place.naver.com/restaurant/1171815551/home?x=1": "1171815551",
+        "https://pcmap.place.naver.com/cafe/123456/home": "123456",
+        "https://pcmap.place.naver.com/hairshop/987654321/information": "987654321",
+        "https://map.naver.com/p/entry/place/555555/home": "555555",
+        "https://pcmap.place.naver.com/restaurant/home": "",
+        "": "",
+    }
+    bad = {url: (_parse_place_id_from_url(url), expected)
+           for url, expected in cases.items()
+           if _parse_place_id_from_url(url) != expected}
+    if not bad:
+        reporter.pass_("entryIframe URL segment/쿼리/비정상에서 place_id 정규식 확보")
     else:
-        reporter.fail(f"대표전화 추출 결과가 예상과 다름: {phone!r}")
+        reporter.fail(f"place_id 파싱 불일치: {bad}")
 
 
-def check_extract_full_address(reporter: ValidationReporter) -> None:
-    frame = FakeEntryFrame("1234567", address="서울 강동구 천호대로 1001")
-    address = _extract_full_address(frame)
-    if address == "서울 강동구 천호대로 1001":
-        reporter.pass_("entryIframe에서 전체주소 추출")
+def check_title_matches(reporter: ValidationReporter) -> None:
+    ok = (
+        _title_matches("오베르캄프 본점", "오베르캄프 본점") is True
+        and _title_matches("오베르캄프 본점", "오베르캄프 본점 베이커리") is True  # 카드명 업종 접미사
+        and _title_matches("오베르캄프 본점", "아티초크라보") is False
+        and _title_matches("", "오베르캄프") is False
+        and _title_matches("오베르캄프", "") is False
+    )
+    if ok:
+        reporter.pass_("title 일치 판정: 동일/부분포함 매칭, 불일치/공란 거부")
     else:
-        reporter.fail(f"전체주소 추출 결과가 예상과 다름: {address!r}")
+        reporter.fail("title 일치 판정 결과가 예상과 다름")
+
+
+def check_extract_entry_phone(reporter: ValidationReporter) -> None:
+    frame = FakeEntryFrame("1234567", phone="0507-1387-4967 안내 복사")
+    empty = FakeEntryFrame("1234567")  # 전화번호 라벨 없음
+    if _extract_entry_phone(frame) == "0507-1387-4967" and _extract_entry_phone(empty) == "":
+        reporter.pass_("home 탭 '전화번호' 라벨 텍스트에서 전화 정규식 추출(tel: href 아님), 부재 시 공란")
+    else:
+        reporter.fail(f"전화 추출 결과가 예상과 다름: {_extract_entry_phone(frame)!r}")
+
+
+def check_extract_entry_address(reporter: ValidationReporter) -> None:
+    frame = FakeEntryFrame("1234567", address="서울 강동구 성내로14길 48 1층")
+    if _extract_entry_address(frame) == "서울 강동구 성내로14길 48 1층":
+        reporter.pass_("home 탭 '주소' 라벨 값에서 전체주소 추출")
+    else:
+        reporter.fail(f"주소 추출 결과가 예상과 다름: {_extract_entry_address(frame)!r}")
+
+
+def check_extract_entry_sns(reporter: ValidationReporter) -> None:
+    insta_only = FakeEntryFrame("1", hrefs=["https://www.instagram.com/oberkampf.kr"])
+    blog_only = FakeEntryFrame("2", hrefs=["https://blog.naver.com/some_cafe"])
+    home_only = FakeEntryFrame("3", hrefs=["https://oberkampf.co.kr"])
+    none_row = FakeEntryFrame("4")  # 홈페이지 라벨 없음
+    with_noise = FakeEntryFrame(
+        "5", hrefs=["https://phinf.pstatic.net/x.jpg", "https://www.instagram.com/abc"]
+    )
+
+    r_insta = _extract_entry_sns(insta_only)
+    r_blog = _extract_entry_sns(blog_only)
+    r_home = _extract_entry_sns(home_only)
+    r_none = _extract_entry_sns(none_row)
+    r_noise = _extract_entry_sns(with_noise)
+
+    ok = (
+        r_insta == ("", "https://www.instagram.com/oberkampf.kr", "")
+        and r_blog == ("", "", "https://blog.naver.com/some_cafe")
+        and r_home == ("https://oberkampf.co.kr", "", "")
+        and r_none == ("", "", "")
+        and r_noise == ("", "https://www.instagram.com/abc", "")  # pstatic 제외
+    )
+    if ok:
+        reporter.pass_("홈페이지 라벨 행 도메인 분류: 인스타/블로그/홈페이지, pstatic 제외, 부재 시 공란")
+    else:
+        reporter.fail(
+            f"SNS 분류 결과가 예상과 다름: insta={r_insta}, blog={r_blog}, "
+            f"home={r_home}, none={r_none}, noise={r_noise}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# 2. enrich_with_details 성공/보존
+# 2. 클릭 / wait
 # ---------------------------------------------------------------------------
 
 
-def check_enrich_success_updates_rows(reporter: ValidationReporter) -> None:
+def check_click_card_by_name(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({"1111111": {"loads": True}})
+    card = FakeCard("A카페베이커리", "1111111", scenario)
+    clicked = _click_card_by_name(card, "A카페")
+
+    # 오클릭 가드: 이름과 무관한 카드(anchor 텍스트가 업체명과 포함관계 아님)
+    empty_card = FakeCard("전혀다른상호", "2222222", scenario)
+    no_name = _click_card_by_name(empty_card, "매칭안됨키워드")
+
+    if clicked is True and scenario.current_entry_id == "1111111" and no_name is False:
+        reporter.pass_("업체명 anchor 클릭 성공(부분포함), 무관 카드는 가드로 클릭 안 함")
+    else:
+        reporter.fail(
+            f"클릭 대상 선정 결과가 예상과 다름: clicked={clicked}, "
+            f"current={scenario.current_entry_id}, no_name={no_name}"
+        )
+
+
+def check_wait_entry_stale_then_update(reporter: ValidationReporter) -> None:
+    # 직전 상세가 남아있는 잔상: previous_place_id와 동일 -> None,
+    # click_error 없이 loads=False면 갱신 안 됨.
+    scenario = DetailScenario({"9999999": {"loads": True, "title": "이전상세"}}, current="9999999")
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    frame, pid, url = _wait_entry_updated(session, "새업체", previous_place_id="9999999", timeout_ms=900)
+    if frame is None and pid == "" and url == "":
+        reporter.pass_("잔상(place_id==previous)일 때 갱신으로 인정하지 않고 skip")
+    else:
+        reporter.fail(f"잔상 처리 결과가 예상과 다름: frame={frame}, pid={pid}, url={url}")
+
+
+def check_wait_entry_title_mismatch(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({"1111111": {"loads": True, "title": "다른상호"}}, current="1111111")
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    frame, pid, url = _wait_entry_updated(session, "원하는업체", previous_place_id=None, timeout_ms=900)
+    if frame is None:
+        reporter.pass_("title 불일치 시 갱신으로 인정하지 않고 skip(오매칭 방지)")
+    else:
+        reporter.fail(f"title 불일치인데 갱신 인정됨: pid={pid}, url={url}")
+
+
+def check_wait_entry_success(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({"1111111": {"loads": True, "title": "오베르캄프 본점"}}, current="1111111")
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    frame, pid, url = _wait_entry_updated(session, "오베르캄프 본점", previous_place_id="8888888", timeout_ms=900)
+    if frame is not None and pid == "1111111" and url == "https://pcmap.place.naver.com/restaurant/1111111/home":
+        reporter.pass_("place_id 변경 + title 일치 시 갱신 인정, URL은 volatile query 제거")
+    else:
+        reporter.fail(f"정상 갱신 결과가 예상과 다름: frame={frame}, pid={pid}, url={url}")
+
+
+# ---------------------------------------------------------------------------
+# 3. _enrich_card 병합 / retry / 보존
+# ---------------------------------------------------------------------------
+
+
+def check_enrich_card_success_merges(reporter: ValidationReporter) -> None:
     scenario = DetailScenario(
         {
-            "1111111": {"loads": True, "phone_href": "tel:02-111-1111", "address": "서울 강동구 A로 1"},
-            "2222222": {"loads": True, "phone_href": "tel:02-222-2222"},
+            "1111111": {
+                "loads": True,
+                "title": "A카페",
+                "phone": "0507-111-1111 복사",
+                "address": "서울 강동구 A로 1",
+                "hrefs": ["https://www.instagram.com/a_cafe"],
+            }
         }
     )
     session = FakeSession(scenario, DiagnosticConfig.safe_default())
-    rows = [_row("1111111", "A카페"), _row("2222222", "B카페")]
+    card = FakeCard("A카페", "1111111", scenario)
+    row = _row("", "A카페")
+    row.setdefault("홈페이지", "")
+    row.setdefault("인스타", "")
+    row.setdefault("블로그", "")
 
-    enrich_with_details(session, session.find_search_frame(), rows)
+    outcome, error, new_prev = _enrich_card(session, card, row, None, retry=1)
 
     ok = (
-        rows[0]["대표전화"] == "02-111-1111"
-        and rows[0]["주소"] == "서울 강동구 A로 1"
-        and rows[1]["대표전화"] == "02-222-2222"
-        and rows[1]["주소"] == "서울 강동구 (리스트주소)"  # 상세 주소 없음 -> 리스트 주소 유지
+        outcome == "ok"
+        and new_prev == "1111111"
+        and row["place_id"] == "1111111"
+        and row["플레이스 URL"] == "https://pcmap.place.naver.com/restaurant/1111111/home"
+        and row["대표전화"] == "0507-111-1111"
+        and row["주소"] == "서울 강동구 A로 1"
+        and row["인스타"] == "https://www.instagram.com/a_cafe"
+        and row["홈페이지"] == ""
+        and row["블로그"] == ""
     )
     if ok:
-        reporter.pass_("상세 성공 -> 대표전화 채움, 상세주소 있으면 갱신/없으면 리스트주소 유지")
+        reporter.pass_("_enrich_card 성공: place_id/URL 사후 확보, 전화/주소/인스타 병합, 새 previous 반환")
     else:
-        reporter.fail(f"enrich 성공 결과가 예상과 다름: {rows}")
+        reporter.fail(f"_enrich_card 성공 병합 결과가 예상과 다름: {row}, new_prev={new_prev}")
 
 
-def check_enrich_skips_row_without_place_id(reporter: ValidationReporter) -> None:
-    scenario = DetailScenario({"1111111": {"loads": True, "phone_href": "tel:02-111-1111"}})
-    session = FakeSession(scenario, DiagnosticConfig.safe_default())
-    no_id_row = _row("", "무ID카페")
-    rows = [no_id_row, _row("1111111", "A카페")]
-
-    enrich_with_details(session, session.find_search_frame(), rows)
-
-    if no_id_row["대표전화"] == "" and rows[1]["대표전화"] == "02-111-1111":
-        reporter.pass_("place_id 없는 행은 상세 skip(공란 유지), 나머지는 정상 보강")
-    else:
-        reporter.fail(f"place_id 없는 행 처리 결과가 예상과 다름: {rows}")
-
-
-def check_enrich_single_failure_skips_without_raise(reporter: ValidationReporter) -> None:
-    # 2222222는 클릭해도 entry가 로드되지 않음(loads=False) -> 단건 실패 -> skip
+def check_enrich_card_keeps_list_fields_on_blank(reporter: ValidationReporter) -> None:
+    # 상세 주소 없음 -> 리스트 주소 유지(다운그레이드 방지)
     scenario = DetailScenario(
-        {
-            "1111111": {"loads": True, "phone_href": "tel:02-111-1111"},
-            "2222222": {"loads": False},
-            "3333333": {"loads": True, "phone_href": "tel:02-333-3333"},
-        }
+        {"1111111": {"loads": True, "title": "A카페", "phone": "0507-111-1111"}}
     )
     session = FakeSession(scenario, DiagnosticConfig.safe_default())
-    rows = [_row("1111111", "A"), _row("2222222", "B"), _row("3333333", "C")]
+    card = FakeCard("A카페", "1111111", scenario)
+    row = _row("", "A카페")
 
-    try:
-        enrich_with_details(session, session.find_search_frame(), rows)
-    except Exception as exc:
-        reporter.fail(f"단건 실패가 예외로 전파됨(임계 미만인데): {type(exc).__name__}: {exc}")
-        return
+    _enrich_card(session, card, row, None, retry=1)
+
+    if row["대표전화"] == "0507-111-1111" and row["주소"] == "서울 강동구 (리스트주소)":
+        reporter.pass_("상세 주소 공란이면 리스트 주소 유지(다운그레이드 안 함)")
+    else:
+        reporter.fail(f"공란 보존 결과가 예상과 다름: {row}")
+
+
+def check_enrich_card_failure_preserves_row(reporter: ValidationReporter) -> None:
+    # 클릭해도 loads=False -> entry 미갱신 -> retry 후 fail. 리스트 필드는 보존.
+    scenario = DetailScenario({"1111111": {"loads": False}})
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    card = FakeCard("A카페", "1111111", scenario)
+    row = _row("", "A카페")
+
+    outcome, error, new_prev = _enrich_card(session, card, row, "7777777", retry=1)
 
     ok = (
-        rows[0]["대표전화"] == "02-111-1111"
-        and rows[1]["대표전화"] == ""  # 단건 실패 -> 공란 유지
-        and rows[2]["대표전화"] == "02-333-3333"  # 실패 후에도 계속 진행
-        and len(rows) == 3  # 행 손실 없음
+        outcome == "fail"
+        and new_prev == "7777777"  # previous 유지
+        and row["업체명"] == "A카페"
+        and row["place_id"] == ""  # 상세 확보 실패 -> 공란
+        and row["주소"] == "서울 강동구 (리스트주소)"
     )
     if ok:
-        reporter.pass_("단건 상세 실패 -> 공란 skip + 예외 없이 계속(행 손실 없음)")
+        reporter.pass_("_enrich_card 실패: 리스트 필드 보존, place_id 공란, previous 유지")
     else:
-        reporter.fail(f"단건 실패 처리 결과가 예상과 다름: {rows}")
+        reporter.fail(f"_enrich_card 실패 보존 결과가 예상과 다름: {row}, outcome={outcome}, new_prev={new_prev}")
 
 
 # ---------------------------------------------------------------------------
-# 3. 연속 실패 임계 escalation
+# 4. collect_full 순회 / escalation
 # ---------------------------------------------------------------------------
 
 
-def check_enrich_consecutive_failures_raise(reporter: ValidationReporter) -> None:
-    places = {str(i) * 7: {"loads": False} for i in range(1, 7)}  # 1111111..6666666 모두 실패
-    scenario = DetailScenario(places)
+class FakeCards:
+    def __init__(self, cards):
+        self._cards = cards
+
+    def count(self):
+        return len(self._cards)
+
+    def nth(self, index):
+        return self._cards[index]
+
+
+def _static_build_row(name):
+    def _fn(card, collected_at, new_open_only, seen):
+        return {
+            "업체명": name,
+            "업종": "카페",
+            "주소": "리스트주소",
+            "대표전화": "",
+            "플레이스 URL": "",
+            "place_id": "",
+            "수집일": collected_at,
+        }
+    return _fn
+
+
+def check_collect_full_success(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({})
     session = FakeSession(scenario, DiagnosticConfig.safe_default())
-    rows = [_row(str(i) * 7, f"F{i}") for i in range(1, 7)]
+    cards = FakeCards([FakeCard("A", "1", scenario), FakeCard("B", "2", scenario)])
 
+    def enrich_ok(session_, card, row, previous, retry):
+        row["place_id"] = card.place_id
+        row["대표전화"] = "0507-000-0000"
+        return "ok", "", card.place_id
+
+    results = []
+    collect_full(
+        session, "search", "kw", 2, False, None, None, results,
+        build_row_fn=lambda card, at, no, seen: {"업체명": card.name, "주소": "리스트주소",
+                                                  "대표전화": "", "플레이스 URL": "", "place_id": ""},
+        enrich_fn=enrich_ok,
+        find_cards_fn=lambda frame: cards,
+        scroll_fn=lambda page, c, **kw: None,
+        next_page_fn=lambda frame, n: False,
+    )
+
+    ok = (
+        len(results) == 2
+        and results[0]["place_id"] == "1"
+        and results[1]["place_id"] == "2"
+        and all("홈페이지" in r for r in results)  # 새 필드 초기화 보장
+    )
+    if ok:
+        reporter.pass_("collect_full 정상: 카드 index 순회로 list+detail 융합, 새 필드 초기화")
+    else:
+        reporter.fail(f"collect_full 정상 순회 결과가 예상과 다름: {results}")
+
+
+def check_collect_full_escalation(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({})
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    cards = FakeCards([FakeCard(f"C{i}", str(i), scenario) for i in range(6)])
+
+    def enrich_fail(session_, card, row, previous, retry):
+        return "fail", "boom", previous
+
+    results = []
     try:
-        enrich_with_details(session, session.find_search_frame(), rows, consecutive_limit=5)
-        reporter.fail("연속 실패가 임계를 넘었는데 DetailCollectionAborted가 발생하지 않음")
-        return
-    except DetailCollectionAborted as exc:
-        # exc.page 미부착 확인(마커는 collector 계층에서 부착되므로 여기선 없음)
-        if not hasattr(exc, "page"):
-            reporter.pass_("연속 실패 임계 초과 -> DetailCollectionAborted raise, exc.page 미부착")
+        collect_full(
+            session, "search", "kw", 30, False, None, None, results,
+            build_row_fn=lambda card, at, no, seen: {"업체명": card.name, "주소": "리스트주소",
+                                                     "대표전화": "", "플레이스 URL": "", "place_id": ""},
+            enrich_fn=enrich_fail,
+            find_cards_fn=lambda frame: cards,
+            scroll_fn=lambda page, c, **kw: None,
+            next_page_fn=lambda frame, n: False,
+            consecutive_limit=5,
+        )
+        reporter.fail("연속 실패가 임계를 넘었는데 DetailCollectionAborted 미발생")
+    except DetailCollectionAborted:
+        # 임계(5)에서 raise, 그때까지 5행은 부분 보존
+        if len(results) == 5 and not hasattr(DetailCollectionAborted, "page"):
+            reporter.pass_("collect_full 연속 실패 임계 초과 -> DetailCollectionAborted, 5행 부분 보존")
         else:
-            reporter.fail("DetailCollectionAborted에 exc.page가 부착됨(계약 위반)")
+            reporter.fail(f"escalation 시 부분 보존 행 수가 예상과 다름: {len(results)}")
     except Exception as exc:
         reporter.fail(f"예상과 다른 예외: {type(exc).__name__}: {exc}")
 
 
-# ---------------------------------------------------------------------------
-# 4. stop / pause
-# ---------------------------------------------------------------------------
-
-
-def check_enrich_stops_on_stop_event(reporter: ValidationReporter) -> None:
-    scenario = DetailScenario(
-        {
-            "1111111": {"loads": True, "phone_href": "tel:02-111-1111"},
-            "2222222": {"loads": True, "phone_href": "tel:02-222-2222"},
-        }
-    )
+def check_collect_full_stops_on_stop_event(reporter: ValidationReporter) -> None:
+    scenario = DetailScenario({})
     session = FakeSession(scenario, DiagnosticConfig.safe_default())
-    rows = [_row("1111111", "A"), _row("2222222", "B")]
+    cards = FakeCards([FakeCard("A", "1", scenario)])
     stop_event = FakeEvent(initial=True)
-
-    enrich_with_details(session, session.find_search_frame(), rows, stop_event=stop_event)
-
-    if rows[0]["대표전화"] == "" and rows[1]["대표전화"] == "":
-        reporter.pass_("stop_event가 set이면 상세 보강을 시작하지 않고 즉시 중단")
+    results = []
+    collect_full(
+        session, "search", "kw", 5, False, stop_event, None, results,
+        find_cards_fn=lambda frame: cards,
+        scroll_fn=lambda page, c, **kw: None,
+        next_page_fn=lambda frame, n: False,
+    )
+    if results == []:
+        reporter.pass_("stop_event가 set이면 순회를 시작하지 않고 즉시 중단")
     else:
-        reporter.fail(f"stop_event 무시하고 상세 보강이 진행됨: {rows}")
+        reporter.fail(f"stop_event 무시하고 순회됨: {results}")
 
 
 # ---------------------------------------------------------------------------
-# 5. build_full_collector + pipeline 조립
+# 5. build_full_collector + pipeline 조립 / 진단 계약
 # ---------------------------------------------------------------------------
 
 
@@ -381,28 +660,25 @@ def _make_session_factory(scenario):
     return factory, created
 
 
-def _fake_list_scrape(rows_to_add):
-    def _fn(session, search_frame, keyword, limit, new_open_only, stop_event, pause_event, results):
-        for row in rows_to_add:
-            results.append(row)
-
-    return _fn
-
-
 def check_full_collector_success_with_pipeline(reporter: ValidationReporter) -> None:
-    scenario = DetailScenario(
-        {
-            "1111111": {"loads": True, "phone_href": "tel:02-111-1111", "address": "서울 강동구 A로 1"},
-            "2222222": {"loads": True, "phone_href": "tel:02-222-2222"},
-        }
-    )
+    scenario = DetailScenario({})
     factory, created = _make_session_factory(scenario)
-    list_fn = _fake_list_scrape([_row("1111111", "A카페"), _row("2222222", "B카페")])
+
+    def fake_collect(session, search_frame, keyword, limit, new_open_only, stop_event, pause_event, results):
+        r1 = _row("1111111", "A카페")
+        r1["place_id"] = "1111111"
+        r1["대표전화"] = "0507-111-1111"
+        r1["플레이스 URL"] = "https://pcmap.place.naver.com/restaurant/1111111/home"
+        r2 = _row("2222222", "B카페")
+        r2["place_id"] = "2222222"
+        r2["대표전화"] = "0507-222-2222"
+        results.append(r1)
+        results.append(r2)
+
     collector = build_full_collector(
         DiagnosticConfig.safe_default(),
         session_factory=factory,
-        list_scrape_fn=list_fn,
-        detail_enrich_fn=enrich_with_details,
+        collect_fn=fake_collect,
     )
 
     partial_calls = []
@@ -415,38 +691,31 @@ def check_full_collector_success_with_pipeline(reporter: ValidationReporter) -> 
 
     ok = (
         len(result) == 2
-        and result[0]["대표전화"] == "02-111-1111"
-        and result[0]["주소"] == "서울 강동구 A로 1"
-        and result[1]["대표전화"] == "02-222-2222"
-        and result[1]["플레이스 URL"] == "https://map.naver.com/place/2222222/home"
+        and result[0]["대표전화"] == "0507-111-1111"
+        and result[1]["place_id"] == "2222222"
         and not partial_calls
         and len(created) == 1
+        and created[0].goto_calls  # goto 호출됨
     )
     if ok:
-        reporter.pass_("build_full_collector + pipeline -> list 수집 후 상세 보강된 전체 결과 반환")
+        reporter.pass_("build_full_collector + pipeline -> 융합 수집 결과 정상 반환")
     else:
-        reporter.fail(f"full collector 정상 조립 결과가 예상과 다름: result={result}, partial={partial_calls}")
+        reporter.fail(f"full collector 조립 결과가 예상과 다름: result={result}, partial={partial_calls}")
 
 
 def check_full_collector_escalation_contract(reporter: ValidationReporter) -> None:
-    # list 단계에서 5행을 쌓고, detail_enrich_fn이 연속 실패로 escalation 예외를 던지도록
-    # 실제 enrich_with_details를 쓰되 모든 place가 로드되지 않게 시나리오 구성.
-    places = {str(i) * 7: {"loads": False} for i in range(1, 7)}
-    scenario = DetailScenario(places)
+    scenario = DetailScenario({})
     factory, created = _make_session_factory(scenario)
-    rows_to_add = [_row(str(i) * 7, f"F{i}") for i in range(1, 7)]
-    list_fn = _fake_list_scrape(rows_to_add)
 
-    def enrich_limit5(session, search_frame, rows, stop_event=None, pause_event=None):
-        return enrich_with_details(
-            session, search_frame, rows, stop_event, pause_event, consecutive_limit=5
-        )
+    def collect_then_abort(session, search_frame, keyword, limit, new_open_only, stop_event, pause_event, results):
+        for i in range(6):
+            results.append(_row(str(i) * 7, f"F{i}"))
+        raise DetailCollectionAborted("연속 실패 escalation")
 
     collector = build_full_collector(
         DiagnosticConfig(capture_artifacts=True),
         session_factory=factory,
-        list_scrape_fn=list_fn,
-        detail_enrich_fn=enrich_limit5,
+        collect_fn=collect_then_abort,
     )
 
     before_dirs = set(DEFAULT_DIAGNOSTICS_ROOT.glob("*")) if DEFAULT_DIAGNOSTICS_ROOT.exists() else set()
@@ -467,28 +736,24 @@ def check_full_collector_escalation_contract(reporter: ValidationReporter) -> No
     checks = {
         "list 행 부분 보존 반환(6행)": len(result) == 6,
         "on_partial_save 1회": len(partial_calls) == 1 and partial_calls[0] == result,
-        "session.capture_diagnostics 1회(중복 없음)": session is not None
-        and len(session.capture_calls) == 1,
+        "session.capture_diagnostics 1회(중복 없음)": session is not None and len(session.capture_calls) == 1,
         "keep_open_if_configured 1회": session is not None and session.keep_open_calls == 1,
         "pipeline 자체 캡처 no-op(파일 미생성)": pipeline_level_dirs == [],
     }
     if all(checks.values()):
-        reporter.pass_(
-            "연속 실패 escalation -> 세션 계층 1차 캡처 1회 + 부분 보존 반환 + pipeline no-op"
-        )
+        reporter.pass_("연속 실패 escalation -> 세션 계층 1차 캡처 1회 + 부분 보존 + pipeline no-op")
     else:
         failed = [name for name, ok in checks.items() if not ok]
         reporter.fail(f"escalation 계약 검증 실패 항목: {failed}")
 
 
 def check_full_collector_marks_exc_without_page(reporter: ValidationReporter) -> None:
-    # detail_enrich_fn이 우리가 들고 있는 예외를 던지게 해서, collector가 exc.page를
-    # 붙이지 않고 diagnostics_captured 마커만 부착하는지 직접 확인.
     scenario = DetailScenario({})
     factory, created = _make_session_factory(scenario)
     held = {"exc": None}
 
-    def raising_enrich(session, search_frame, rows, stop_event=None, pause_event=None):
+    def raising_collect(session, search_frame, keyword, limit, new_open_only, stop_event, pause_event, results):
+        results.append(_row("1111111", "A"))
         exc = DetailCollectionAborted("강제 escalation")
         held["exc"] = exc
         raise exc
@@ -496,8 +761,7 @@ def check_full_collector_marks_exc_without_page(reporter: ValidationReporter) ->
     collector = build_full_collector(
         DiagnosticConfig(capture_artifacts=True),
         session_factory=factory,
-        list_scrape_fn=_fake_list_scrape([_row("1111111", "A")]),
-        detail_enrich_fn=raising_enrich,
+        collect_fn=raising_collect,
     )
 
     result = collect_pc_full(
@@ -509,7 +773,7 @@ def check_full_collector_marks_exc_without_page(reporter: ValidationReporter) ->
 
     exc = held["exc"]
     ok = (
-        result == [_row("1111111", "A")]
+        len(result) == 1
         and exc is not None
         and getattr(exc, "diagnostics_captured", False) is True
         and not hasattr(exc, "page")
@@ -539,6 +803,8 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         "src/pc/safety.py",
         "src/pc/diagnostics.py",
         "src/pc/pipeline.py",
+        "src/pc/browser_session.py",
+        "src/pc/list_scraper.py",
     ]
     try:
         result = subprocess.run(
@@ -550,7 +816,7 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         )
         output = result.stdout.strip()
         if result.returncode == 0 and output == "":
-            reporter.pass_("금지 파일 9개 모두 git 변경 없음")
+            reporter.pass_("금지 파일 11개 모두 git 변경 없음(list_scraper/browser_session 포함)")
         else:
             reporter.fail(f"금지 파일 변경 감지 또는 git 실패: rc={result.returncode}, out={output!r}")
     except Exception as exc:
@@ -560,16 +826,24 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
 def main() -> int:
     reporter = ValidationReporter()
 
-    check_extract_phone_from_tel_href(reporter)
-    check_extract_full_address(reporter)
+    check_parse_place_id_from_url(reporter)
+    check_title_matches(reporter)
+    check_extract_entry_phone(reporter)
+    check_extract_entry_address(reporter)
+    check_extract_entry_sns(reporter)
 
-    check_enrich_success_updates_rows(reporter)
-    check_enrich_skips_row_without_place_id(reporter)
-    check_enrich_single_failure_skips_without_raise(reporter)
+    check_click_card_by_name(reporter)
+    check_wait_entry_stale_then_update(reporter)
+    check_wait_entry_title_mismatch(reporter)
+    check_wait_entry_success(reporter)
 
-    check_enrich_consecutive_failures_raise(reporter)
+    check_enrich_card_success_merges(reporter)
+    check_enrich_card_keeps_list_fields_on_blank(reporter)
+    check_enrich_card_failure_preserves_row(reporter)
 
-    check_enrich_stops_on_stop_event(reporter)
+    check_collect_full_success(reporter)
+    check_collect_full_escalation(reporter)
+    check_collect_full_stops_on_stop_event(reporter)
 
     check_full_collector_success_with_pipeline(reporter)
     check_full_collector_escalation_contract(reporter)
