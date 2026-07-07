@@ -334,6 +334,9 @@ def collect_full(
     collected_at = datetime.now().strftime("%Y-%m-%d")
     scan_limit = max(limit * 10, 50) if new_open_only else limit
     calculated_scrolls = max(2, (scan_limit // 10) + 1)
+    # OPT-A: _build_row에서 무효/중복 카드가 걸러질 수 있으므로 limit 그대로가 아니라
+    # 여유 마진을 더한 목표치까지만 스크롤한다(이미 충분하면 스크롤 자체를 생략).
+    target_count = limit + max(5, limit // 2)
     seen: set = set()
     current_page = 1
     previous_place_id = None
@@ -349,7 +352,8 @@ def collect_full(
         print(f"[detail_scraper] collect page={current_page}")
         cards = find_cards_fn(search_frame)
         scroll_fn(
-            page, cards, max_scrolls=calculated_scrolls, stop_event=stop_event, pause_event=pause_event
+            page, cards, max_scrolls=calculated_scrolls, stop_event=stop_event, pause_event=pause_event,
+            target_count=target_count,
         )
         card_count = cards.count()
         print(f"[detail_scraper] candidate cards={card_count}")

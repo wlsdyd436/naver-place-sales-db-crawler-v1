@@ -274,6 +274,48 @@ def check_light_scroll_cards_stops_on_stop_event(reporter: ValidationReporter) -
         reporter.fail(f"stop_event 무시하고 스크롤이 진행됨: wheel_calls={page.mouse.wheel_calls}")
 
 
+def check_light_scroll_cards_skips_when_target_already_met(reporter: ValidationReporter) -> None:
+    """OPT-A: 이미 target_count 이상이면 스크롤을 아예 생략한다."""
+    page = FakePage()
+    anchors = SequenceCountLocator(counts=[10])
+    _light_scroll_cards(
+        page, anchors, max_scrolls=8, stop_event=None, pause_event=None, target_count=5
+    )
+    if page.mouse.wheel_calls == 0:
+        reporter.pass_("target_count 이미 충족(10>=5) -> 스크롤 0회로 생략")
+    else:
+        reporter.fail(f"target_count 충족했는데 스크롤이 수행됨: wheel_calls={page.mouse.wheel_calls}")
+
+
+def check_light_scroll_cards_stops_early_when_target_reached_mid_loop(reporter: ValidationReporter) -> None:
+    """OPT-A: 스크롤 도중 target_count에 도달하면 max_scrolls를 다 쓰기 전에 조기 종료한다.
+
+    counts는 계속 증가하는 시퀀스라 target_count 게이트가 없으면 no_new_cards 조건이
+    트리거되지 않아 max_scrolls(8)까지 진행(wheel 32회)한다. target_count=6이면
+    2번째 스크롤에서 count=6에 도달해 wheel 8회(2회x4)만에 멈춰야 한다.
+    """
+    page = FakePage()
+    anchors = SequenceCountLocator(counts=[2, 4, 6, 8, 10, 12, 14, 16])
+    _light_scroll_cards(
+        page, anchors, max_scrolls=8, stop_event=None, pause_event=None, target_count=6
+    )
+    if page.mouse.wheel_calls == 8:
+        reporter.pass_("target_count(6) 도달 시 max_scrolls(8) 전에 조기 종료(wheel 8회=2회x4)")
+    else:
+        reporter.fail(f"target_count 조기 종료가 예상과 다름: wheel_calls={page.mouse.wheel_calls}")
+
+
+def check_light_scroll_cards_target_count_none_unchanged(reporter: ValidationReporter) -> None:
+    """OPT-A: target_count=None(기본값)이면 기존 2회 무성장 중단 동작이 그대로 유지된다."""
+    page = FakePage()
+    anchors = SequenceCountLocator(counts=[5, 8, 8, 8])
+    _light_scroll_cards(page, anchors, max_scrolls=8, stop_event=None, pause_event=None, target_count=None)
+    if page.mouse.wheel_calls == 12:
+        reporter.pass_("target_count=None -> 기존 2회 무성장 중단 동작 불변(wheel 12회)")
+    else:
+        reporter.fail(f"target_count=None인데 기존 동작이 바뀜: wheel_calls={page.mouse.wheel_calls}")
+
+
 # ---------------------------------------------------------------------------
 # 3. 페이지네이션 4셀렉터
 # ---------------------------------------------------------------------------
@@ -657,6 +699,9 @@ def main() -> int:
 
     check_light_scroll_cards_stops_after_two_no_growth(reporter)
     check_light_scroll_cards_stops_on_stop_event(reporter)
+    check_light_scroll_cards_skips_when_target_already_met(reporter)
+    check_light_scroll_cards_stops_early_when_target_reached_mid_loop(reporter)
+    check_light_scroll_cards_target_count_none_unchanged(reporter)
 
     check_click_next_page_uses_last_matching_selector(reporter)
     check_click_next_page_propagates_click_failure(reporter)

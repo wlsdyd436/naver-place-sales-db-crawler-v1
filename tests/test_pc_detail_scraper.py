@@ -684,6 +684,50 @@ def check_collect_full_escalation(reporter: ValidationReporter) -> None:
         reporter.fail(f"예상과 다른 예외: {type(exc).__name__}: {exc}")
 
 
+def check_collect_full_passes_target_count_to_scroll_fn(reporter: ValidationReporter) -> None:
+    """OPT-A: collect_full이 scroll_fn에 target_count(=limit + max(5, limit//2))를 전달하고,
+    정상 순회/부분 보존 동작은 그대로 유지된다."""
+    scenario = DetailScenario({})
+    session = FakeSession(scenario, DiagnosticConfig.safe_default())
+    cards = FakeCards([FakeCard("A", "1", scenario), FakeCard("B", "2", scenario)])
+    captured_scroll_kwargs = []
+
+    def enrich_ok(session_, card, row, previous, retry):
+        row["place_id"] = card.place_id
+        return "ok", "", card.place_id
+
+    def capturing_scroll_fn(page, c, **kw):
+        captured_scroll_kwargs.append(kw)
+
+    results = []
+    collect_full(
+        session, "search", "kw", 2, False, None, None, results,
+        build_row_fn=lambda card, at, no, seen: {"업체명": card.name, "주소": "리스트주소",
+                                                  "대표전화": "", "플레이스 URL": "", "place_id": ""},
+        enrich_fn=enrich_ok,
+        find_cards_fn=lambda frame: cards,
+        scroll_fn=capturing_scroll_fn,
+        next_page_fn=lambda frame, n: False,
+    )
+
+    expected_target = 2 + max(5, 2 // 2)  # limit=2 -> 2 + 5 = 7
+    ok = (
+        len(results) == 2
+        and results[0]["place_id"] == "1"
+        and len(captured_scroll_kwargs) == 1
+        and captured_scroll_kwargs[0].get("target_count") == expected_target
+    )
+    if ok:
+        reporter.pass_(
+            f"collect_full이 scroll_fn에 target_count={expected_target} 전달, 정상 순회 유지"
+        )
+    else:
+        reporter.fail(
+            f"target_count 전달 또는 정상 순회 결과가 예상과 다름: results={results}, "
+            f"captured={captured_scroll_kwargs}"
+        )
+
+
 def check_collect_full_stops_on_stop_event(reporter: ValidationReporter) -> None:
     scenario = DetailScenario({})
     session = FakeSession(scenario, DiagnosticConfig.safe_default())
@@ -853,7 +897,10 @@ def check_full_collector_marks_exc_without_page(reporter: ValidationReporter) ->
 def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
     # 2026-07-06 Stage 3C: exporter.py는 통합_결과 스키마 확장으로 정당하게 수정되어 제외.
     # 2026-07-06 Stage 3D: ui.py는 premium 분기의 PC full engine 연결로 정당하게 수정되어 제외
-    # (ui 연결은 test_ui_pc_full_wiring.py가 별도 검증). 나머지 파일은 계속 수정 금지 대상.
+    # (ui 연결은 test_ui_pc_full_wiring.py가 별도 검증).
+    # 2026-07-07 Stage OPT-A: list_scraper.py는 _light_scroll_cards의 target_count 게이트
+    # 추가로 정당하게 수정되어 제외(해당 동작은 이 파일의 scroll 테스트가 검증).
+    # 나머지 파일은 계속 수정 금지 대상.
     protected_files = [
         "src/pc_crawler.py",
         "src/parser.py",
@@ -863,7 +910,6 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         "src/pc/diagnostics.py",
         "src/pc/pipeline.py",
         "src/pc/browser_session.py",
-        "src/pc/list_scraper.py",
     ]
     try:
         result = subprocess.run(
@@ -875,7 +921,7 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         )
         output = result.stdout.strip()
         if result.returncode == 0 and output == "":
-            reporter.pass_("금지 파일 9개 모두 git 변경 없음(list_scraper/browser_session 포함)")
+            reporter.pass_("금지 파일 8개 모두 git 변경 없음(browser_session 포함)")
         else:
             reporter.fail(f"금지 파일 변경 감지 또는 git 실패: rc={result.returncode}, out={output!r}")
     except Exception as exc:
@@ -906,6 +952,7 @@ def main() -> int:
 
     check_collect_full_success(reporter)
     check_collect_full_escalation(reporter)
+    check_collect_full_passes_target_count_to_scroll_fn(reporter)
     check_collect_full_stops_on_stop_event(reporter)
 
     check_full_collector_success_with_pipeline(reporter)

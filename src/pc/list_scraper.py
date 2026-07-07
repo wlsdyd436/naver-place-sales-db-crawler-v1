@@ -161,8 +161,14 @@ def _light_scroll_cards(
     max_scrolls: int = 8,
     stop_event=None,
     pause_event=None,
+    target_count=None,
 ) -> None:
-    """pc_crawler.py 동작 보존: 후보 카드 수 증가가 2회 연속 멈추면 중단하는 제한 스크롤."""
+    """pc_crawler.py 동작 보존: 후보 카드 수 증가가 2회 연속 멈추면 중단하는 제한 스크롤.
+
+    target_count(선택, OPT-A): 이미 anchors.count()가 target_count 이상이면 스크롤을
+    아예 생략하고, 스크롤 도중 도달해도 즉시 중단한다. None이면(기본값) 이 게이트는
+    비활성화되어 기존 동작과 동일하다.
+    """
     no_new_cards_count = 0
     previous_count = 0
 
@@ -170,6 +176,10 @@ def _light_scroll_cards(
         previous_count = anchors.count()
     except Exception:
         previous_count = 0
+
+    if target_count is not None and previous_count >= target_count:
+        print(f"[list_scraper] target_count({target_count}) already satisfied, skip scroll")
+        return
 
     for index in range(max_scrolls):
         if _check_stop(stop_event):
@@ -185,6 +195,11 @@ def _light_scroll_cards(
 
             current_count = anchors.count()
             print(f"[list_scraper] cards before={previous_count}, after={current_count}")
+
+            if target_count is not None and current_count >= target_count:
+                print(f"[list_scraper] target_count({target_count}) reached, stop scroll")
+                break
+
             if current_count <= previous_count:
                 no_new_cards_count += 1
             else:

@@ -782,3 +782,64 @@ Premium Mode 통합 결과 필드:
 - 다건 상세 수집 안정성 테스트
 - 패키징 용량 최적화
 - 영업용 소개자료/가격안/사용법 정리
+
+
+# 2026-07-07 Stage OPT-A 리스트 스크롤 충분성 gate 구현
+
+## 목적
+- PERF-2(limit=3) 측정에서 총 wall 13.141초 중 카드 처리 합계(약 3.5초)를 제외한
+  약 9.6초가 카드 외 오버헤드로 확인됨.
+- 이 중 저위험으로 줄일 수 있는 후보로, 리스트 카드가 이미 충분히 로드된 경우에도
+  무조건 수행되던 리스트 스크롤을 제거함.
+- searchIframe settle(5초), entryIframe wait 등 안정성과 직결된 대기는 이번 범위에서
+  건드리지 않음.
+
+## 변경 파일
+- src/pc/list_scraper.py
+- src/pc/detail_scraper.py
+- tests/test_pc_list_scraper.py
+- tests/test_pc_detail_scraper.py
+
+## 구현 내용
+- `_light_scroll_cards`에 선택 파라미터 `target_count=None` 추가.
+  - `target_count=None`(기본값): 기존 동작 그대로 유지.
+  - `target_count`가 정수이고 진입 시점에 이미 `anchors.count() >= target_count`이면
+    스크롤을 아예 생략.
+  - 스크롤 도중 `anchors.count() >= target_count`에 도달하면 `max_scrolls`를 다
+    쓰기 전에 조기 종료.
+- `collect_full`에서 `target_count = limit + max(5, limit // 2)` 공식으로 계산해
+  `scroll_fn` 호출 시 전달.
+  - `_build_row`에서 무효/중복 카드가 걸러질 수 있는 상황을 고려한 안전 마진.
+- `scrape_list`(레거시 list-only 경로)는 변경하지 않음.
+
+## 건드리지 않은 것
+- searchIframe goto settle(5000ms)
+- entryIframe wait / title·URL 판정 로직(`_wait_entry_updated`)
+- 페이지 전환 후 wait_for_timeout(2000ms)
+- Excel 스키마/시트 구조
+- UI 구조/문구
+- CAPTCHA 관련 로직(우회 시도 없음, 변경 없음)
+- src/pc/browser_session.py, src/pc/pipeline.py, src/pc/config.py, src/exporter.py,
+  src/ui.py, app.py, build.bat, spec
+
+## 테스트 결과
+- test_pc_list_scraper: PASS 24 / FAIL 0 (신규 3종 포함: target_count 충족 시 스크롤
+  생략, 도중 도달 시 조기 종료, target_count=None 시 기존 동작 불변)
+- test_pc_detail_scraper: PASS 24 / FAIL 0 (신규 1종 포함: collect_full이 scroll_fn에
+  target_count 전달 확인 + 정상 순회/부분 보존 유지)
+- test_pc_browser_session: PASS 15 / FAIL 0
+- test_pc_pipeline: PASS 8 / FAIL 0
+- test_exporter_schema: PASS 7 / FAIL 0
+- test_export_adapter: PASS 2 / FAIL 0
+- test_ui_pc_full_wiring: PASS 3 / FAIL 0
+- 회귀 0건.
+
+## 판단
+- 코드 레벨에서 회귀 없이 소량 실행 시 불필요한 스크롤을 제거하는 저위험 최적화가
+  완료됨.
+- PERF-2 live 재측정은 이번 스테이지에서 수행하지 않음(다음 단계로 보류).
+
+## 다음 작업
+- PERF-2(limit=3) live 재측정 1회(별도 승인 후) — wall time 변화 확인, 누락률/
+  상세성공률 유지 여부 확인.
+- 통과 시 PERF-3(limit=10)로 진행.
