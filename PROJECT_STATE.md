@@ -843,3 +843,49 @@ Premium Mode 통합 결과 필드:
 - PERF-2(limit=3) live 재측정 1회(별도 승인 후) — wall time 변화 확인, 누락률/
   상세성공률 유지 여부 확인.
 - 통과 시 PERF-3(limit=10)로 진행.
+
+
+# 2026-07-07 PERF-2R OPT-A 적용 후 limit=3 재측정 성공 기록
+
+## 실행 조건
+- keyword: 서울특별시 강동구 카페
+- limit: 3
+- dev 직접 스크립트(scratchpad/perf2_limit3_after_opta.py, 기존 스크립트 복사본)
+- visible: True
+- capture_artifacts: True
+- 실행 횟수: 1회
+- 정보 탭 클릭 없음
+- CAPTCHA 우회/회피 없음
+- 코드/테스트 무수정
+
+## 결과
+- rows count: 3 / 3
+- 누락률: 0.0%
+- 상세 성공률(place_id 채움률): 100% (3/3)
+- 총 wall time: 12.689초 (기존 OPT-A 이전 13.141초 대비 -0.452초, -3.4%)
+- 업체당 평균 시간(카드 처리): 1.346초 (기존 1.169초)
+- 카드별 시간 avg/min/max/p90: 1.346 / 1.141 / 1.555 / 1.512초
+- 필드 채움률: 대표전화 100%, 주소 100%, 플레이스 URL 100%, 인스타 100%,
+  홈페이지 0%, 블로그 0% (업체 특성상 정상)
+- CAPTCHA/Timeout 신호: 없음
+- DetailCollectionAborted: 없음
+- 예외 발생: 없음
+- target_count 스크롤 생략 로그 확인됨:
+  `[list_scraper] target_count(8) already satisfied, skip scroll`
+  (limit=3 + max(5, 3//2)=5 → target_count=8, 공식대로 정확히 산출)
+- report JSON: scratchpad/perf2_limit3_after_opta_report.json (기존
+  perf2_limit3_report.json은 덮어쓰지 않고 별도 파일로 보존)
+
+## 판단
+- 안정성 게이트(rows 3/3·상세성공률 100%·CAPTCHA/Abort/예외 없음) 전부 유지되어 PASS.
+- OPT-A의 스크롤 생략 로직이 로그로 명확히 검증됨(카드가 이미 충분히 로드되어 스크롤
+  2회를 건너뜀).
+- wall time은 소폭 개선(-3.4%)되었으나, 이번 실행에서는 카드 처리 자체 시간의 자연
+  변동(네트워크/서버 응답)이 늘어 스크롤 절감분을 일부 상쇄함. 즉 개선폭은 제한적이며,
+  이는 설계 단계에서 예측한 대로(고정 비용인 settle 5초 등이 그대로 남아 있어 소량
+  실행에서는 효과가 부분적일 것) 부합함.
+- settle(searchIframe)/entryIframe wait 등 추가 최적화는 안정성 직결 요소라 이번
+  범위에서 계속 보류.
+
+## 다음 작업
+- PERF-3(limit=10) live 측정으로 진행(별도 승인 후).

@@ -16,7 +16,7 @@
 - [x] Stop / Pause 이벤트가 상세 수집 경로에 전달됨
 - [x] 부분 실패 시 부분 결과 보존 반환 (collect_pc_full 계약)
 - [ ] 다건(limit>1) / 다지역 대량 흐름 실사용 검증 (출시 후 별도 확인 권장)
-  - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료 / live 재측정 대기 (2026-07-07, PROJECT_STATE.md 참조)
+  - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS / PERF-3(limit=10) 대기 (2026-07-07, PROJECT_STATE.md 참조)
 
 ## 2. Excel 스키마 체크
 
