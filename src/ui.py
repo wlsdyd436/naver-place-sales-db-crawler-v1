@@ -511,6 +511,12 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log(f"[ui] parsed count={len(parsed_places)}")
         return parsed_places, parsed_places, []
 
+    def _note_security_block(self, decision) -> None:
+        # SAFE-1: collect_pc_full의 on_security_block 콜백. CAPTCHA/보안 차단 감지를
+        # 인스턴스 상태에 기록만 하고, 실제 Queue 중단/저장/안내는 _run_queue_pipeline이 담당한다.
+        self._security_block_decision = decision
+        self.log("[ui] 보안 확인(CAPTCHA) 감지: 안전 중단합니다.")
+
     def _collect_premium_query(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
         # 2026-07-06 Stage 3D: premium 분기를 새 PC full engine(collect_pc_full)에 연결.
         # 카드 index 클릭 -> entryIframe에서 전화/주소/플레이스 URL/SNS를 한 번에 수집하며,
@@ -529,6 +535,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 stop_event=self.stop_event,
                 pause_event=self.pause_event,
                 diagnostic_config=cfg,
+                on_security_block=self._note_security_block,
                 collector=collector,
             )
         self.log(f"[ui] pc full count={len(rows)}")
@@ -560,6 +567,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         all_mobile_data = []
         all_pc_data = []
         total = len(query_queue)
+        self._security_block_decision = None
 
         try:
             saved_output_path = self.make_timestamped_output_path(output_path, mode)
@@ -567,6 +575,7 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.log(f"[ui] 최종 저장 경로={saved_output_path}")
 
             was_stopped = False
+            security_blocked = False
             for index, job in enumerate(query_queue, start=1):
                 if self.stop_event.is_set():
                     was_stopped = True
@@ -614,11 +623,19 @@ class SalesDbCrawlerApp(ctk.CTk):
                     self.log("[ui] 사용자에 의해 Queue 수집이 중단되었습니다.")
                     self.set_status("사용자 중단")
                     break
+                if self._security_block_decision is not None:
+                    security_blocked = True
+                    self.log("[ui] 현재까지 수집된 결과는 저장됩니다.")
+                    self.log("[ui] 남은 Queue는 반복 요청 방지를 위해 중단합니다.")
+                    self.set_status("보안 확인 감지 — 부분 저장됨")
+                    break
 
             if not all_merged_data and not all_mobile_data and not all_pc_data:
                 self.log("[ui] 누적 데이터가 없어 Excel 저장을 건너뜁니다.")
                 self.after(0, self.progress_percent_var.set, f"0/{total}")
-                if was_stopped:
+                if security_blocked:
+                    self.set_status("보안 확인 감지 — 부분 저장됨")
+                elif was_stopped:
                     self.set_status("사용자 중단")
                 else:
                     self.set_status("수집 결과 없음")
@@ -638,7 +655,17 @@ class SalesDbCrawlerApp(ctk.CTk):
 
             self.last_output_path = saved_path
             self.log(f"[ui] 저장 완료: {saved_path}")
-            if was_stopped:
+            if security_blocked:
+                self.set_status("보안 확인 감지 — 부분 저장됨")
+                self.show_info(
+                    "보안 확인 감지",
+                    "네이버 보안 확인으로 인해 수집을 안전하게 중단했습니다.\n"
+                    "현재까지 수집된 결과는 정상 저장되었습니다.\n"
+                    "짧은 시간에 반복 실행하면 차단이 강화될 수 있습니다.\n"
+                    "잠시 후 다시 시도해 주세요.\n"
+                    "※ 보안 확인은 우회하지 않습니다.",
+                )
+            elif was_stopped:
                 self.set_status("사용자 중단")
                 self.show_info("중단", "Queue 수집이 중단되었고 누적 데이터는 저장되었습니다.")
             else:

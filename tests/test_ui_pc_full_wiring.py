@@ -128,12 +128,41 @@ def check_premium_uses_pc_full_engine(reporter: ValidationReporter) -> None:
             calls.get("kwargs", {}).get("collector") == "COLLECTOR_SENTINEL"
             and calls.get("kwargs", {}).get("diagnostic_config") == "CFG_SENTINEL"
         ),
+        "on_security_block 콜백 전달": calls.get("kwargs", {}).get("on_security_block") == app._note_security_block,
     }
     if all(checks.values()):
         reporter.pass_("premium 분기가 collect_pc_full로 연결되고 (rows,[],rows) 반환, parse/merge 우회")
     else:
         failed = [name for name, ok in checks.items() if not ok]
         reporter.fail(f"premium 연결 검증 실패 항목: {failed} (calls={calls}, result={result})")
+
+
+# ---------------------------------------------------------------------------
+# SAFE-1: 보안 차단 콜백(_note_security_block) 검증
+# ---------------------------------------------------------------------------
+
+
+def check_note_security_block_sets_instance_state(reporter: ValidationReporter) -> None:
+    app = _make_app()
+    logged = []
+    app.log = lambda message: logged.append(message)
+
+    class FakeDecision:
+        reason = type("R", (), {"value": "captcha_or_security_block"})()
+
+    decision = FakeDecision()
+    app._note_security_block(decision)
+
+    ok = (
+        getattr(app, "_security_block_decision", None) is decision
+        and any("보안 확인" in message and "CAPTCHA" in message for message in logged)
+    )
+    if ok:
+        reporter.pass_("_note_security_block 호출 시 인스턴스 상태 세팅 + 감지 로그 출력")
+    else:
+        reporter.fail(
+            f"_note_security_block 결과가 예상과 다름: decision={getattr(app, '_security_block_decision', None)}, logged={logged}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +237,7 @@ def main() -> int:
     check_premium_uses_pc_full_engine(reporter)
     check_legacy_premium_preserved(reporter)
     check_basic_path_unchanged(reporter)
+    check_note_security_block_sets_instance_state(reporter)
     reporter.summary()
     return 1 if reporter.fail_count else 0
 

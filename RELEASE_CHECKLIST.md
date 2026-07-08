@@ -2,7 +2,7 @@
 
 본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
 
-최종 갱신: 2026-07-08 (PERF-4)
+최종 갱신: 2026-07-08 (SAFE-1)
 
 ---
 
@@ -78,7 +78,7 @@
 - [-] legacy 수집 엔진 제거
 - [-] 버전 표기(README H1) 갱신 여부 결정
 - [-] 다건/다지역 대량 live 검증
-- [ ] CAPTCHA/대량 수집 리스크 설계 검토 — PERF-4(limit=30)에서 CAPTCHA 발생 확인(2026-07-08)에 따라 limit=50/100/300 등 대량 규모 측정보다 우선 필요. 검토 완료 전까지 release_candidate 생성 보류
+- [ ] CAPTCHA/대량 수집 리스크 설계 검토 — PERF-4(limit=30)에서 CAPTCHA 발생 확인(2026-07-08)에 따라 limit=50/100/300 등 대량 규모 측정보다 우선 필요. SAFE-1(§11)로 UI 안내/부분저장/Queue 조기중단은 구현 완료, 자동 딜레이/배치 휴식 등 부하 완화 정책은 여전히 보류. 검토 완료 전까지 release_candidate 생성 보류
 
 ## 9. 패키징 / 빌드 체크
 
@@ -104,3 +104,17 @@
   - `build.bat`로 빌드 → `dist/NaverPlaceSalesDBCollector.exe` 실행 → 상세 수집 `limit=1` → `output/*.xlsx` 통합_결과 11컬럼 생성 확인, place_id 비노출, CAPTCHA/예외 없음
   - 목적: 배포 산출물(EXE + ms-playwright)로 실제 end-to-end 동작을 출시 게이트로 확인
   - 결과: EXE 실행/GUI 표시/Excel 생성 모두 성공, 통합_결과 11컬럼·place_id 비노출 확인, 생성 파일 `naver_place_premium_db_20260707_0238.xlsx` (PROJECT_STATE.md 2026-07-07 Tier 2 기록 참조)
+
+## 11. CAPTCHA/보안 확인 대응 (SAFE-1)
+
+PERF-4(limit=30, 2026-07-08)에서 실제 CAPTCHA/보안 확인이 발생했으나 UI에 그 사실이 전달되지 않고 "정상 완료"로 오인될 수 있는 문제가 확인되어, 최소 배선(SAFE-1)으로 대응했다. CAPTCHA 우회/자동 해결/DOM 조작/stealth는 여전히 절대 금지이며, 이번 단계는 감지 이후의 **정직한 안내·부분 저장·안전 중단**만 다룬다.
+
+- [x] `collect_pc_full`에 optional keyword-only `on_security_block` 콜백 추가(기존 인자/반환 계약 불변, best-effort 호출)
+- [x] `classify_exception`이 `CAPTCHA_OR_SECURITY_BLOCK`으로 분류한 경우에만 콜백 호출
+- [x] UI(`_note_security_block`)가 감지 시 인스턴스 상태 기록 + 로그 출력
+- [x] 보안 차단 감지 시 남은 Queue 조기 중단(현재까지 누적 결과는 기존 저장 흐름으로 Excel 저장)
+- [x] 최종 안내가 정상 완료가 아닌 "보안 확인 감지" 메시지로 분기(상태 라벨: `보안 확인 감지 — 부분 저장됨`)
+- [x] 단위 테스트 추가(`test_pc_pipeline.py` 4종, `test_ui_pc_full_wiring.py` 1종 + 기존 3종 회귀 확인)
+- [-] 자동 딜레이/배치 휴식 등 부하 완화 정책 — SAFE-1 범위 밖, 후속 SAFE-2 후보로 보류
+- [ ] limit=30 재테스트 — SAFE-1 반영 후 별도 승인 하에 1회 진행 예정(성공 기준: CAPTCHA 발생 시 UI가 명확히 안내하고 부분 저장·안전 중단하는지)
+- [-] limit=50/100/300 대량 측정 — SAFE-1 + 30 재테스트 통과 전까지 계속 보류

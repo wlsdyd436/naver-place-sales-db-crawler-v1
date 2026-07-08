@@ -10,7 +10,7 @@ from src.pc.diagnostics import (
     capture_page_diagnostics,
     create_diagnostic_run_dir,
 )
-from src.pc.safety import classify_exception
+from src.pc.safety import SafetyReason, classify_exception
 
 
 def collect_pc_full(
@@ -22,6 +22,7 @@ def collect_pc_full(
     *,
     diagnostic_config=None,
     on_partial_save=None,
+    on_security_block=None,
     collector=None,
 ) -> list:
     """PC 단일 엔진 수집 facade(계약 골격).
@@ -36,6 +37,11 @@ def collect_pc_full(
 
     stop_event/pause_event는 이 함수가 직접 polling하지 않고 collector에
     그대로 전달만 합니다.
+
+    on_security_block(decision)은 CAPTCHA/보안 차단(classify_exception의
+    SafetyReason.CAPTCHA_OR_SECURITY_BLOCK)으로 분류된 경우에만 best-effort로
+    1회 호출된다(SAFE-1). 우회/자동 해결을 시도하지 않으며, 호출자(ui.py)가
+    사용자 안내에 사용한다. 부분 보존 반환(results) 계약은 변경되지 않는다.
     """
     if diagnostic_config is None:
         diagnostic_config = DiagnosticConfig.safe_default()
@@ -53,6 +59,7 @@ def collect_pc_full(
         decision = classify_exception(exc)
         _try_capture_diagnostics(exc, decision, diagnostic_config, keyword)
         _try_partial_save(on_partial_save, results)
+        _try_notify_security_block(on_security_block, decision)
         return results
 
     return results
@@ -85,4 +92,20 @@ def _try_partial_save(on_partial_save, results) -> None:
         on_partial_save(list(results))
     except Exception:
         # 콜백 실패가 부분 보존 반환 흐름을 깨서는 안 된다.
+        pass
+
+
+def _try_notify_security_block(on_security_block, decision) -> None:
+    """CAPTCHA/보안 차단 감지를 best-effort로 호출자에게 알립니다.
+
+    콜백은 CAPTCHA/보안 차단으로 분류된 경우에만 호출하며, 실패해도 부분 보존
+    반환 흐름을 깨서는 안 된다.
+    """
+    if on_security_block is None:
+        return
+    if decision.reason != SafetyReason.CAPTCHA_OR_SECURITY_BLOCK:
+        return
+    try:
+        on_security_block(decision)
+    except Exception:
         pass

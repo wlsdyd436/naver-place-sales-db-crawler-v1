@@ -227,6 +227,77 @@ def check_capture_artifacts_false_no_artifacts(reporter: ValidationReporter) -> 
             shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# SAFE-1: on_security_block 콜백 검증
+# ---------------------------------------------------------------------------
+
+
+def check_on_security_block_called_for_captcha(reporter: ValidationReporter) -> None:
+    page = FakePage()
+    captured = []
+    result = collect_pc_full(
+        "보안차단테스트키워드",
+        limit=5,
+        collector=make_captcha_collector(page),
+        on_security_block=lambda decision: captured.append(decision),
+    )
+    ok = (
+        result == [{"업체명": "C카페"}]
+        and len(captured) == 1
+        and captured[0].reason.value == "captcha_or_security_block"
+    )
+    if ok:
+        reporter.pass_("CAPTCHA 예외 시 on_security_block이 SafetyDecision으로 1회 호출되고 부분 결과 유지")
+    else:
+        reporter.fail(f"on_security_block CAPTCHA 호출 결과가 예상과 다름: result={result}, captured={captured}")
+
+
+def check_on_security_block_not_called_for_timeout(reporter: ValidationReporter) -> None:
+    captured = []
+    result = collect_pc_full(
+        "강동구 카페",
+        limit=10,
+        collector=mock_collector_partial_timeout,
+        on_security_block=lambda decision: captured.append(decision),
+    )
+    if result == [{"업체명": "A카페"}, {"업체명": "B카페"}] and not captured:
+        reporter.pass_("일반 Timeout(CAPTCHA 키워드 없음)에서는 on_security_block 미호출, 부분 결과 유지")
+    else:
+        reporter.fail(f"Timeout 경로에서 on_security_block 호출 여부가 예상과 다름: result={result}, captured={captured}")
+
+
+def check_on_security_block_none_default_unchanged(reporter: ValidationReporter) -> None:
+    page = FakePage()
+    # on_security_block 미지정(기본값 None) -> 기존 동작(부분 결과 반환)이 그대로 유지되는지 확인
+    result = collect_pc_full(
+        "보안콜백미지정테스트",
+        limit=5,
+        collector=make_captcha_collector(page),
+    )
+    if result == [{"업체명": "C카페"}]:
+        reporter.pass_("on_security_block 미지정 시 기존 동작(부분 결과 반환) 불변")
+    else:
+        reporter.fail(f"on_security_block 기본값 경로 결과가 예상과 다름: {result}")
+
+
+def check_on_security_block_exception_does_not_break_partial_return(reporter: ValidationReporter) -> None:
+    page = FakePage()
+
+    def boom(decision):
+        raise RuntimeError("콜백 고의 실패")
+
+    result = collect_pc_full(
+        "보안콜백예외테스트",
+        limit=5,
+        collector=make_captcha_collector(page),
+        on_security_block=boom,
+    )
+    if result == [{"업체명": "C카페"}]:
+        reporter.pass_("on_security_block 콜백이 예외를 던져도 부분 결과 반환이 깨지지 않음")
+    else:
+        reporter.fail(f"콜백 예외 시 부분 결과 반환이 예상과 다름: {result}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -238,6 +309,11 @@ def main() -> int:
     check_collector_none_raises_not_implemented(reporter)
     check_default_config_no_artifacts(reporter)
     check_capture_artifacts_false_no_artifacts(reporter)
+
+    check_on_security_block_called_for_captcha(reporter)
+    check_on_security_block_not_called_for_timeout(reporter)
+    check_on_security_block_none_default_unchanged(reporter)
+    check_on_security_block_exception_does_not_break_partial_return(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0
