@@ -2,7 +2,7 @@
 
 본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
 
-최종 갱신: 2026-07-08 (SAFE-1)
+최종 갱신: 2026-07-08 (SAFE-1V)
 
 ---
 
@@ -18,6 +18,7 @@
 - [ ] 다건(limit>1) / 다지역 대량 흐름 실사용 검증 (출시 후 별도 확인 권장)
   - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS, PERF-3(limit=10) PASS, PERF-3S(dev UI Stop·Pause·부분저장, limit=10 full run) PASS (2026-07-08, PROJECT_STATE.md 참조)
   - PERF-4(limit=30) **FAIL** — page=2에서 CAPTCHA/보안 확인 발생, `DetailCollectionAborted`로 안전 종료(부분 결과 15/30 보존, 크래시/우회 시도 없음) (2026-07-08, PROJECT_STATE.md 참조)
+  - SAFE-1V(dev UI, limit=30) — 30/30 정상 수집은 다시 **FAIL**(page=2에서 CAPTCHA 재발생), 단 CAPTCHA 대응 자체는 PASS(§11 참조) (2026-07-08, PROJECT_STATE.md 참조)
 
 ## 2. Excel 스키마 체크
 
@@ -116,5 +117,5 @@ PERF-4(limit=30, 2026-07-08)에서 실제 CAPTCHA/보안 확인이 발생했으�
 - [x] 최종 안내가 정상 완료가 아닌 "보안 확인 감지" 메시지로 분기(상태 라벨: `보안 확인 감지 — 부분 저장됨`)
 - [x] 단위 테스트 추가(`test_pc_pipeline.py` 4종, `test_ui_pc_full_wiring.py` 1종 + 기존 3종 회귀 확인)
 - [-] 자동 딜레이/배치 휴식 등 부하 완화 정책 — SAFE-1 범위 밖, 후속 SAFE-2 후보로 보류
-- [ ] limit=30 재테스트 — SAFE-1 반영 후 별도 승인 하에 1회 진행 예정(성공 기준: CAPTCHA 발생 시 UI가 명확히 안내하고 부분 저장·안전 중단하는지)
-- [-] limit=50/100/300 대량 측정 — SAFE-1 + 30 재테스트 통과 전까지 계속 보류
+- [x] **SAFE-1V** limit=30 재테스트(dev UI, 2026-07-08) — **PASS**: page=2에서 CAPTCHA 재발생, SAFE-1 로그(`보안 확인(CAPTCHA) 감지: 안전 중단합니다` 등) 정상 출력, 부분 결과 15/30 Excel 저장(`naver_place_premium_db_20260708_1453.xlsx`), 남은 Queue 조기 중단, 앱 크래시/우회 시도 없음. 단 30/30 정상 수집 자체는 이번에도 FAIL(성공 기준은 "CAPTCHA 미발생"이 아니라 "발생 시 정직한 안내·안전 중단"이었으므로 PASS 판정) (PROJECT_STATE.md 2026-07-08 SAFE-1V 기록 참조)
+- [-] limit=50/100/300 대량 측정 — page=2 CAPTCHA 재발생 반복 확인(PERF-4, SAFE-1V)으로 현재 방식 그대로 진행은 부적절. SAFE-2(수집 속도/배치/부하 완화 정책) 설계 및 적용 전까지 계속 보류
