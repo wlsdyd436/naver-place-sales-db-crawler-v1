@@ -951,3 +951,50 @@ Premium Mode 통합 결과 필드:
 
 ## 다음 작업
 - PERF-3S: dev UI(`python app.py`)에서 Stop/Pause 및 부분 저장 확인(별도 승인 후).
+
+
+# 2026-07-08 PERF-3S dev UI Pause/Resume/Stop 및 부분 저장 검증 기록
+
+## 실행 조건
+- keyword: 서울특별시 강동구 카페
+- limit: 10
+- 수집 모드: 상세 수집(PC·전화·SNS)
+- 실행 방식: 개발환경 python app.py
+- 정보 탭 클릭 없음
+- CAPTCHA 우회 없음
+- release_candidate/zip 생성 없음
+
+## 결과 (Pause → Resume → Stop 중단 시나리오)
+- 일시정지 동작: 정상
+- 재개 동작: 정상
+- 정지 동작: 정상
+- 부분 저장: 정상
+- Stop 시점 full collect done, rows=5
+- pc full count=5
+- 누적 통합_결과=5 / 누적 원본_모바일=5 / 누적 원본_PC=5
+- Excel 저장 완료: output\naver_place_premium_db_20260708_1410.xlsx
+- CAPTCHA/Timeout 없음, 예외 없음, 앱 강제 종료 불필요
+
+## 추가 결과 (동일 조건, limit=10 끝까지 실행)
+- full collect done, rows=10
+- pc full count=10
+- 누적 통합_결과=10 / 누적 원본_모바일=10 / 누적 원본_PC=10
+- Excel 저장 완료: output\naver_place_premium_db_20260708_1410.xlsx
+- CAPTCHA/Timeout 없음, 예외 없음
+
+## 관찰된 사항
+- `[browser_session] entryIframe found` 로그가 반복 출력됨 — 카드 클릭 후 상세 iframe을 정상 탐지했다는 debug 로그로 판단되며 오류는 아님.
+- 내부 로그에 "모바일 원본" 표현이 남아 있음.
+
+## 판단
+- PERF-3S PASS: Pause / Resume / Stop / 부분저장 모두 성공 기준 충족.
+- dev UI limit=10 full run PASS.
+
+## UI 정리 후보 (별도 메모, 이번 단계에서는 배선/수정하지 않음)
+- 수집 모드 제거 후보
+- 온라인 채널 "(준비 중)" 표기 제거 후보
+- `entryIframe found` 반복 debug 로그 숨김 또는 verbose 전용화 후보
+- 로그 내 "모바일 원본" 표현 정리 후보
+
+## 다음 작업
+- PERF-4: limit=30 성능/안정성 테스트(별도 승인 후).

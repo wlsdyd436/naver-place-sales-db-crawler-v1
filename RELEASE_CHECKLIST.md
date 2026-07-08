@@ -2,7 +2,7 @@
 
 본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
 
-최종 갱신: 2026-07-06 (Stage 3F)
+최종 갱신: 2026-07-08 (PERF-3S)
 
 ---
 
@@ -16,7 +16,7 @@
 - [x] Stop / Pause 이벤트가 상세 수집 경로에 전달됨
 - [x] 부분 실패 시 부분 결과 보존 반환 (collect_pc_full 계약)
 - [ ] 다건(limit>1) / 다지역 대량 흐름 실사용 검증 (출시 후 별도 확인 권장)
-  - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS, PERF-3(limit=10) PASS / PERF-3S(Stop·Pause·부분저장) 대기 (2026-07-07, PROJECT_STATE.md 참조)
+  - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS, PERF-3(limit=10) PASS, PERF-3S(dev UI Stop·Pause·부분저장, limit=10 full run) PASS (2026-07-08, PROJECT_STATE.md 참조)
 
 ## 2. Excel 스키마 체크
 
