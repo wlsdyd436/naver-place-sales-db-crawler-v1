@@ -998,3 +998,52 @@ Premium Mode 통합 결과 필드:
 
 ## 다음 작업
 - PERF-4: limit=30 성능/안정성 테스트(별도 승인 후).
+
+
+# 2026-07-08 PERF-4 limit=30 CAPTCHA 발생 및 안전 종료 검증 기록
+
+## 실행 조건
+- keyword: 서울특별시 강동구 카페
+- limit: 30
+- dev 직접 스크립트(scratchpad/perf4_limit30.py, PERF-3 계측 구조 재사용 후 삭제)
+- visible: True
+- capture_artifacts: True
+- PLAYWRIGHT_BROWSERS_PATH 미설정(dev 기본 경로)
+- 실행 횟수: 1회, 실패 후 재시도 없음
+- 정보 탭 클릭 없음
+- CAPTCHA 우회/회피 없음
+- 코드/테스트 무수정
+
+## 결과
+- rows count: 15 / 30
+- 누락률: 50.0%
+- 상세 성공률(place_id 채움률): 66.7% (10/15)
+- 총 wall time: 60.10초
+- 업체당 평균 wall time: 4.01초
+- 카드 처리 평균(순수 상세 진입): 2.82초
+- 카드별 시간 avg/min/max/p90: 2.82 / 0.97 / 6.03 / 6.02초
+- 주소 채움률: 66.7%
+- 대표전화 채움률: 60.0%
+- 플레이스 URL 채움률: 66.7%
+- 홈페이지 채움률: 6.7%
+- 인스타 채움률: 53.3%
+- 블로그 채움률: 0.0%
+- 페이지 전환: 발생, page=1 → page=2 (max_page_seen=2)
+- target_count 스크롤 생략/조기종료 로그: 없음(빈 배열, limit=30의 target_count=35에 이번 실행에서 미도달)
+- CAPTCHA/Timeout 신호: **CAPTCHA/보안 확인 발생** — page=2에서 카드 클릭 시 `#wtm-captcha-root`가 pointer event를 가로챔("보안 확인을 완료해 주세요")
+- DetailCollectionAborted: 발생 — 연속 5건 상세 진입 실패로 세션 안전 종료
+- 예외: DetailCollectionAborted 1건(예상된 안전 종료 경로, 미처리 예외 아님), 앱 크래시/강제 종료 없음
+- 새 진단 폴더: `logs/diagnostics/20260708_142431_746696_서울특별시_강동구_카페_captcha_or_security_block/`
+  (exception.txt, iframe_summary.json, metadata.json, page.html, screenshot.png, url.txt)
+- report JSON: scratchpad/perf4_limit30_report.json (기록 반영 후 scratchpad 폴더 삭제)
+
+## 판단
+- PERF-4는 성공 기준(CAPTCHA/Timeout 없음)을 충족하지 못해 **FAIL**.
+- 다만 엔진 안전 설계는 의도대로 정상 동작함: CAPTCHA 발생 → `classify_exception`이 `captcha_or_security_block`으로 정확히 분류 → 진단 캡처(1건) → `DetailCollectionAborted` 발생 → `pipeline.collect_pc_full`이 부분 결과(15건)를 그대로 반환. 크래시나 CAPTCHA 우회 시도 없이 안전 종료됨.
+- 코드 결함이 아니라 30건·2페이지 규모에서 네이버 측 실제 보안 확인이 트리거된 운영 리스크로 판단됨. 2026-07-01/2026-07-03 기록의 "규모가 커질수록 CAPTCHA 리스크 증가" 가설과 일치.
+- 이번 결과로 다음 단계 계획이 변경됨: 원래 예정이던 PERF-5(limit=50/100/300 등 대량 규모 확장 측정)는 보류하고, **CAPTCHA/대량 수집 리스크 설계 검토**를 다음 단계로 전환함.
+
+## 다음 작업
+- limit=50/100/300 등 대량 규모 성능 측정은 보류.
+- CAPTCHA/대량 수집 리스크 설계 검토(예: 요청 간격 조정, 세션당 안전 처리 건수 상한, 실패 시 재개 전략 등)를 다음 단계 후보로 설정.
+- release_candidate 생성은 위 리스크 검토 완료 전까지 보류.

@@ -2,7 +2,7 @@
 
 본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
 
-최종 갱신: 2026-07-08 (PERF-3S)
+최종 갱신: 2026-07-08 (PERF-4)
 
 ---
 
@@ -17,6 +17,7 @@
 - [x] 부분 실패 시 부분 결과 보존 반환 (collect_pc_full 계약)
 - [ ] 다건(limit>1) / 다지역 대량 흐름 실사용 검증 (출시 후 별도 확인 권장)
   - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS, PERF-3(limit=10) PASS, PERF-3S(dev UI Stop·Pause·부분저장, limit=10 full run) PASS (2026-07-08, PROJECT_STATE.md 참조)
+  - PERF-4(limit=30) **FAIL** — page=2에서 CAPTCHA/보안 확인 발생, `DetailCollectionAborted`로 안전 종료(부분 결과 15/30 보존, 크래시/우회 시도 없음) (2026-07-08, PROJECT_STATE.md 참조)
 
 ## 2. Excel 스키마 체크
 
@@ -77,6 +78,7 @@
 - [-] legacy 수집 엔진 제거
 - [-] 버전 표기(README H1) 갱신 여부 결정
 - [-] 다건/다지역 대량 live 검증
+- [ ] CAPTCHA/대량 수집 리스크 설계 검토 — PERF-4(limit=30)에서 CAPTCHA 발생 확인(2026-07-08)에 따라 limit=50/100/300 등 대량 규모 측정보다 우선 필요. 검토 완료 전까지 release_candidate 생성 보류
 
 ## 9. 패키징 / 빌드 체크
 
