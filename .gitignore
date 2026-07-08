@@ -10,3 +10,4 @@ logs/*.log
 logs/diagnostics/
 .pytest_cache/
 .vscode/
+scratchpad/

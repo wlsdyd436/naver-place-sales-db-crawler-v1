@@ -1092,4 +1092,29 @@ Premium Mode 통합 결과 필드:
 - 온라인 채널 "(준비 중)" 표기 제거 후보
 - `entryIframe found` 반복 debug 로그 숨김 또는 verbose 전용화 후보
 - 로그 내 "모바일 원본" 표현 정리 후보
+
+
+# 2026-07-08 ARCH-300 PoC-1 착수 기록 (기술 검증, 제품 기능 아님)
+
+## 원칙
+- ARCH-300 PoC-1은 제품 기능 확정이 아니라 **기술 검증**이다.
+- 직접 API 호출이 아니라 Playwright 브라우저가 정상 렌더링 중 자연히 발생시키는 응답을 관찰한다("브라우저 네트워크 응답 관찰" / Network·List collector — "네트워크 스니핑" 표현은 사용하지 않는다).
+- CAPTCHA 우회/자동 해결/stealth/proxy/무단 반복 호출은 금지한다.
+- UI/pipeline/product path에는 아직 연결하지 않는다(독립 모듈 + 독립 PoC 스크립트로만 검증).
+- LEGAL_NOTICE.md/README.md/RELEASE_CHECKLIST.md의 정식 수정은 PoC 성공 후, 제품 기능 채택 여부를 판단하는 별도 단계에서 진행한다(이번 기록 시점에는 원칙만 남기고 해당 문서는 아직 수정하지 않음).
+
+## PoC-1 live probe 결과 (2026-07-08, 1회 실행)
+- 검색어: 서울특별시 강동구 카페, `map.naver.com/v5/search/...` 정상 렌더링(클릭/페이지 전환 없음).
+- 후보 응답(candidate responses): 1건 — `map.naver.com/p/api/search/allSearch?...`(resource_type=xhr, status=200).
+- `result.place.list`(알려진 경로)에서 업체 리스트 20건 추출, dedup 후에도 20건(충돌 없음).
+- 앞 10개를 11컬럼 row로 매핑 성공(업체명/업종/리뷰수/주소/대표전화/플레이스 URL/수집일까지 채움). 과거 detail_scraper 실측(오베르캄프 본점 등)과 교차 검증상 값이 합리적으로 일치.
+- CAPTCHA/429/보안 확인: 발생하지 않음(페이지 텍스트 보조 확인 포함).
+- **300개 가능 여부는 아직 미확정.** 이번 PoC-1은 page=1 최초 렌더링만 관찰했으며, 페이지 전환(클릭 필요)을 포함한 PoC-2 이상에서 규모·CAPTCHA 재현 여부를 별도 검증해야 한다.
+
+## 발견된 데이터 품질 이슈 및 PoC-1.1 보정
+- **업종**: 응답의 category 값이 list(`["카페,디저트","베이커리"]`)인 경우 `_first_present`가 그대로 `str()`화해 `"['카페,디저트', '베이커리']"` 형태의 Python repr 문자열이 되는 문제 발견 → `_extract_category`를 신설해 list면 `", "`로 join, 문자열이면 그대로, 없으면 빈칸으로 정리.
+- **홈페이지/인스타/블로그**: 응답의 `homePage` 필드가 네이버 UI 관례상 대표 외부 링크(인스타그램 링크 포함)를 종류 무관하게 담고 있어, 그대로 "홈페이지" 컬럼에 넣으면 인스타 링크가 홈페이지로 잘못 분류되는 문제 발견 → `_classify_external_links`를 신설해 `instagram.com`→인스타, `blog.naver.com`류→블로그, 그 외→홈페이지로 도메인 기준 분류(detail_scraper의 `_extract_entry_sns`와 동일한 관례 적용). 값이 list로 여러 개 와도 각각 분류.
+- **리뷰수**: 기존 로직(`visitorReviewCount`/`reviewCount`/`blogReviewCount` 중 첫 확인값)이 이미 숫자/문자열 모두 크래시 없이 처리하고 있어 로직 변경 없음. 방문자/블로그 리뷰 분리가 필요해지면 확장할 수 있도록 주석만 보강.
+- **플레이스 URL**: `place/{id}/home` 제네릭 세그먼트는 PoC 단계의 임시 구성이며 실제 리다이렉트 유효성은 미검증이라는 점을 주석으로 명확히 함(검증은 PoC-2 이상으로 이관, 이번 단계에서 live 재검증하지 않음).
+- 테스트: `tests/test_pc_network_list_scraper.py`에 category list join, 인스타/블로그/일반 도메인/URL list 분류 테스트 5종 추가(총 14 PASS / FAIL 0). live 재실행 없이 fixture만으로 검증.
 - release_candidate 생성은 위 리스크 검토 완료 전까지 보류.
