@@ -407,3 +407,27 @@ def dedup_rows(rows, seen: set) -> list:
         seen.add(key)
         unique_rows.append(row)
     return unique_rows
+
+
+def count_rows_by_source_page(rows) -> dict:
+    """rows(list[dict])를 source_page 값 기준으로 몇 건인지 집계한다(PoC-3).
+
+    여러 page(1/2/3...)에서 모인 row를 병합한 뒤, page별로 몇 건씩 확보됐는지
+    확인하기 위한 순수 집계 함수다. Playwright나 파일 IO를 다루지 않으므로
+    live 브라우저 없이 fixture만으로 테스트할 수 있다.
+
+    `_map_item_to_row`가 `source_page`를 채우지 않은 행(예: 기존 PoC-1 스타일
+    호출)은 "unknown" 키로 묶는다. place_id/source_page는 Excel에는 노출되지
+    않는 내부 필드이므로, 이 집계 결과도 진단/로그 용도로만 쓰고 Excel 저장에는
+    사용하지 않는다.
+
+    확장 포인트: page 외에 다른 기준(예: 응답 URL)으로도 집계하고 싶다면
+    `row.get("source_page", ...)` 부분만 원하는 키로 바꾼 유사 함수를 추가한다.
+    """
+    counts: dict = {}
+    for row in rows:
+        key = row.get("source_page")
+        if key is None:
+            key = "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return counts

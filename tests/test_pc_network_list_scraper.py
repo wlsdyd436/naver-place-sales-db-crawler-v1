@@ -15,6 +15,7 @@ from src.pc.network_list_scraper import (
     _map_item_to_row,
     build_candidate_record,
     classify_captcha_signal,
+    count_rows_by_source_page,
     dedup_rows,
     is_candidate_response,
 )
@@ -447,6 +448,65 @@ def check_captcha_signal_click_exception_is_strong_signal(reporter: ValidationRe
         reporter.fail(f"무관 예외 처리 결과가 예상과 다름: {unrelated_signal}")
 
 
+# ---------------------------------------------------------------------------
+# PoC-3: page=1/2/3 3페이지 병합 집계 검증
+# ---------------------------------------------------------------------------
+
+
+def check_count_rows_by_source_page_three_pages(reporter: ValidationReporter) -> None:
+    """page=1/2/3에서 온 row를 병합했을 때 source_page별 건수가 정확히 집계되는지 확인한다."""
+    seen: set = set()
+    page1_rows = dedup_rows(
+        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=1) for i in range(1, 21)],
+        seen,
+    )
+    page2_rows = dedup_rows(
+        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=2) for i in range(21, 91)],
+        seen,
+    )
+    page3_rows = dedup_rows(
+        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=3) for i in range(91, 141)],
+        seen,
+    )
+    merged = page1_rows + page2_rows + page3_rows
+    counts = count_rows_by_source_page(merged)
+
+    ok = counts == {1: 20, 2: 70, 3: 50}
+    if ok:
+        reporter.pass_("page=1/2/3 병합 후 source_page별 건수가 각각 20/70/50건으로 정확히 집계됨")
+    else:
+        reporter.fail(f"source_page별 집계 결과가 예상과 다름: {counts}")
+
+    # source_page를 채우지 않은 행(예: PoC-1 스타일 호출)은 "unknown"으로 묶여야 한다.
+    legacy_row = _map_item_to_row({"id": "9999", "name": "레거시카페"}, "2026-07-09")
+    counts_with_unknown = count_rows_by_source_page(merged + [legacy_row])
+    if counts_with_unknown.get("unknown") == 1 and counts_with_unknown.get(1) == 20:
+        reporter.pass_("source_page 미지정(레거시) 행은 'unknown'으로 별도 집계됨")
+    else:
+        reporter.fail(f"unknown 집계 결과가 예상과 다름: {counts_with_unknown}")
+
+
+def check_total_dedup_after_three_page_merge(reporter: ValidationReporter) -> None:
+    """page=1/2/3 응답 중 일부가 겹치더라도(같은 place_id 재등장) 3페이지 병합 후
+    총 dedup row 수가 정확한지 확인한다(PoC-3: 중복 있는 실전 시나리오 모사)."""
+    seen: set = set()
+    page1_items = [{"id": "1", "name": "A"}, {"id": "2", "name": "B"}]
+    page2_items = [{"id": "2", "name": "B"}, {"id": "3", "name": "C"}, {"id": "4", "name": "D"}]  # id=2 중복
+    page3_items = [{"id": "4", "name": "D"}, {"id": "5", "name": "E"}]  # id=4 중복
+
+    page1_rows = dedup_rows([_map_item_to_row(i, "2026-07-09", source_page=1) for i in page1_items], seen)
+    page2_rows = dedup_rows([_map_item_to_row(i, "2026-07-09", source_page=2) for i in page2_items], seen)
+    page3_rows = dedup_rows([_map_item_to_row(i, "2026-07-09", source_page=3) for i in page3_items], seen)
+    merged = page1_rows + page2_rows + page3_rows
+
+    place_ids = [row["place_id"] for row in merged]
+    ok = len(merged) == 5 and len(place_ids) == len(set(place_ids)) and set(place_ids) == {"1", "2", "3", "4", "5"}
+    if ok:
+        reporter.pass_("page=1/2/3에 중복 place_id가 섞여도 3페이지 병합 후 총 5건(중복 2건 제거)으로 정확히 집계됨")
+    else:
+        reporter.fail(f"3페이지 병합 dedup 결과가 예상과 다름: place_ids={place_ids}")
+
+
 def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) -> None:
     cases = {
         "allsearch xhr": (True, "https://map.naver.com/p/api/search/allSearch?query=x", "xhr"),
@@ -489,6 +549,8 @@ def main() -> int:
     check_captcha_signal_passive_marker_does_not_halt(reporter)
     check_captcha_signal_visible_indicator_is_active(reporter)
     check_captcha_signal_click_exception_is_strong_signal(reporter)
+    check_count_rows_by_source_page_three_pages(reporter)
+    check_total_dedup_after_three_page_merge(reporter)
     check_is_candidate_response_filters_correctly(reporter)
 
     reporter.summary()

@@ -1190,4 +1190,46 @@ PoC-1이 관찰한 page=1 응답에 이어, 상세 카드 클릭/entryIframe 진
 - page=3까지 확장하거나(다음 PoC 후보), 현재 90건 규모에서 안정성을 한 번 더 재확인하는 것 중 우선순위 판단 필요.
 - 300개 목표를 위해서는 여러 페이지에 걸친 반복 전환이 필요하므로, page 수가 늘어날수록 CAPTCHA 리스크가 다시 커질 가능성은 배제할 수 없음 - 규모를 단계적으로(예: page=3, 이어서 page=5) 늘려가며 매 단계 CAPTCHA 신호를 3단계 판정으로 재확인하는 점진적 접근을 권장.
 - 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음.
+
+
+# 2026-07-09 ARCH-300 PoC-3 page=1→2→3 점진 확장 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 목표
+PoC-2R(page=1→2 성공, 90건, CAPTCHA 없음)에 이어 page=3까지만 소규모로 확장 검증한다.
+300개 전면 확장이 아니며, UI/pipeline에는 연결하지 않는다.
+
+## 구현
+- `scratchpad/arch300_network_probe/poc3_page3_probe.py` 신규 - page=1→2→3을 루프로 순회하며 매 page 전환 전 3단계 CAPTCHA 신호(PoC-2R과 동일한 가시성 기반 판정)를 재확인하고, 응답 status=429 감지 시에도 즉시 중단하도록 추가.
+- `src/pc/network_list_scraper.py`에 `count_rows_by_source_page(rows)` 신규 - source_page별 건수 집계(순수 함수, live 없이 테스트 가능). PoC-2와 동일하게 `browser_session._CAPTCHA_PROBE_SELECTORS`/`list_scraper._click_next_page`/`safety.is_captcha_or_security_message`를 읽기 전용으로만 재사용.
+- `tests/test_pc_network_list_scraper.py`에 2종 추가(총 28 PASS / FAIL 0): 3페이지 병합 시 source_page별 건수 집계 및 "unknown" 처리, 중복 place_id가 섞인 3페이지 병합 시 총 dedup 건수 검증.
+- 이번에는 `poc3_mapped_rows_full.json`으로 **전체** row를 저장(샘플 아님을 파일명에 명시, PoC-2의 "top 20만 저장" 한계를 보완).
+
+## PoC-3 live 실행 결과 (1회, 재시도 없음)
+- keyword: 서울특별시 강동구 카페
+- page=1: candidate 1건, raw 20건, dedup 20건(정상).
+- page=2: `_click_next_page(frame, 2)` **클릭은 성공**(예외 없음)했으나, 대기(4초) 동안 캡처된 후보 응답은 무관한 `pcmap-api.place.naver.com/graphql` 요청(status=405, JSON 파싱 실패) 1건뿐이었다. **실제 업체 리스트 응답은 이번 실행에서 캡처하지 못함**(raw=0, dedup=0) - PoC-2R에서는 동일 시나리오로 70건을 확보했던 것과 달리 이번엔 타이밍상 놓친 것으로 보인다(런마다 변동 가능성).
+- page=3: `_click_next_page(frame, 3)` 클릭 시도 중 **실제 CAPTCHA에 의해 pointer event가 가로채였다**(Playwright 클릭 예외 발생, 요소가 실제로 보이는 상태(`element is visible, enabled and stable`)에서 `<div id="wtm-captcha-root">` 하위의 `aria-label="보안 인증 필요"` 다이얼로그가 클릭을 가로챔). `click_intercepted_by_captcha=True`로 정확히 분류되어 **즉시 중단**(우회 시도 없음).
+- `active_captcha_detected=False`(주기적 가시성 체크 시점에는 아직 안 보였음), `passive_captcha_marker_found=True`(page=1/2 확인 시점 모두, 이전과 동일하게 상시 placeholder), `status_429_seen=False`.
+- **총 dedup row 수: 20건**(page=1분만, page=2 실데이터 미포착 + page=3 도달 실패로 인해).
+
+## 판단 — 이번 CAPTCHA는 오탐이 아니라 실제 신호로 판단됨
+- PoC-2(오탐)와 달리 이번 신호는 **클릭 예외 기반**(`click_intercepted_by_captcha`)이며, Playwright 자체가 "element is visible, enabled and stable"이라고 확인한 상태에서 CAPTCHA 다이얼로그가 pointer event를 가로챈 것이 로그로 명확히 남았다. 3단계 판정 체계가 의도대로 "진짜 신호와 오탐을 구분"해낸 사례로 볼 수 있다.
+- PERF-4/SAFE-1V(카드 클릭 기반 엔진)는 page=1→2 진입 시점에 CAPTCHA가 발생했던 반면, 이번 순수 페이지네이션 접근은 **page=2→3 전환 시점**(즉 한 단계 더 진행한 후)에 CAPTCHA를 만났다. 이는 "카드 클릭을 없애면 CAPTCHA 리스크가 완전히 사라진다"가 아니라 **"클릭/요청 볼륨이 늘어날수록 다시 리스크가 커진다"는 가설과 일치**한다.
+- page=2의 실제 리스트 응답을 이번엔 캡처하지 못한 것은 CAPTCHA와 무관한 별개의 타이밍 이슈로 보이며(캡처 자체가 실패한 것이지 데이터가 없었다는 뜻은 아님, PoC-2R에서는 동일 지점에서 70건을 확보한 바 있음), 대기 시간(4초)이 이번 세션 조건에서는 다소 짧았을 가능성이 있다.
+
+## 결과 요약
+- page=1 raw/dedup: 20 / 20
+- page=2 raw/dedup: 0 / 0(클릭 성공, 실제 리스트 응답 캡처 실패 - 무관 응답 1건만 포착)
+- page=3 raw/dedup: 0 / 0(클릭이 CAPTCHA에 의해 차단되어 도달 실패)
+- 총 dedup: 20건
+- active_captcha_detected: False / passive_captcha_marker_found: True / **click_intercepted_by_captcha: True** / status_429_seen: False
+- response URL 패턴: `map.naver.com/p/api/search/allSearch?...`(page=1, 정상), `pcmap-api.place.naver.com/graphql`(status=405, 무관 요청)
+
+## 100~160급 확장 가능성 판단
+**아직 이르다.** 이번 실행은 page=2 실데이터 재현조차 못했고 page=3에서 실제 CAPTCHA로 막혔다. PoC-2R(90건 성공)과 PoC-3(20건, page=3에서 실차단) 사이의 **실행 간 결과 변동성 자체가 중요한 신호**다 - 즉 안전 마진이 실행마다 달라질 수 있다는 뜻이므로, 100~160개처럼 더 많은 페이지 전환을 요구하는 규모로 바로 확장하는 것은 리스크가 크다. 300개는 물론 100개 수준도 이번 근거만으로는 뒷받침되지 않는다.
+
+## 다음 작업
+- 규모 확장(50/100/160/300)으로 진행하지 않는다.
+- 다음 단계 후보: (a) page=2 대기시간을 4초보다 늘려 재관찰(같은 page=2 지점의 데이터 캡처 안정성 확인), (b) 동일 조건(page=1→2→3)으로 시간 간격을 두고 1회 더 재현성 확인, (c) CAPTCHA가 발생하는 지점(page 2→3)이 매번 동일한지, 아니면 세션/시간대에 따라 변하는지 별도 관찰.
+- 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음, CAPTCHA 우회 시도 없음.
 - release_candidate 생성은 위 리스크 검토 완료 전까지 보류.
