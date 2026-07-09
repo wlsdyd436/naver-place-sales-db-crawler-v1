@@ -1,0 +1,20 @@
+{
+  "카페": {
+    "type": "defined",
+    "subcategories": ["디저트카페", "브런치카페", "베이커리카페"]
+  },
+  "음식점": {
+    "type": "umbrella",
+    "strategy": "split_to_subverticals",
+    "subverticals": ["한식", "중식", "일식", "고기집", "분식", "술집"]
+  },
+  "한식": {
+    "type": "defined",
+    "parent_keyword": "음식점",
+    "subcategories": ["백반", "국밥", "찌개"]
+  },
+  "미용실": {
+    "type": "niche",
+    "subcategories": ["남성미용실", "여성미용실", "헤어샵"]
+  }
+}

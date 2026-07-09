@@ -1557,3 +1557,58 @@ PoC-7의 강동구 "카페" target=300 조기 종료 성공(17개 쿼리 실행,
 - 미용실의 Tier3(헤어샵/여성미용실) 낭비 쿼리 패턴처럼, 업종별로 "효율적인 세부업종 후보"가 다를 수 있음 - `low_efficiency` 신호를 활용한 사전 필터링(REGION-DATA-1 설계 §6) 필요성이 이번 실측으로 더 명확해짐.
 - 정적 지역 데이터 자산화, UI/pipeline 연결, LEGAL_NOTICE/README 정식 수정은 여전히 별도 태스크로 보류(제품 배선 결정 시점까지).
 - CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토(이번 업종별 편차 포함) 완료 전까지 보류.
+
+# 2026-07-09 ARCH-300C PoC-9A 음식점 세부업종(한식) 분해 전략 검증 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+PoC-8에서 "음식점"(umbrella 키워드)을 직접 질의했을 때 4번째 쿼리(암사동)에서
+active CAPTCHA가 발생했다. Opus REGION-DATA-1 재설계(§4)는 "umbrella 키워드를
+직접 질의하지 않고 한식/중식/일식 등 정의형 세부업종으로 분해하면 안전성이
+개선될 수 있다"는 가설(H3)을 제시했다. 이 PoC-9A는 **"음식점"을 절대
+검색하지 않고** "한식"이라는 세부업종 하나만으로 이 분해 전략의 유효성을
+최소 노출로 검증했다. `src/pc/region_expander.py`/`network_list_scraper.py`/
+`region_data.py`는 이번에도 무수정.
+
+## 구현
+- `data/verticals_kr.json` 신규 — 카페(defined)/음식점(umbrella, strategy=split_to_subverticals)/한식(defined, parent_keyword=음식점)/미용실(niche) 4개 항목.
+- `src/pc/vertical_presets.py` 신규(선택 구현) — `load_vertical_presets(path)`, `get_vertical_preset(presets, keyword)` 순수 로더. 파일 없으면 `FileNotFoundError` 전파, 미존재 키워드는 `None` 반환.
+- `tests/test_pc_vertical_presets.py` 신규 — 6건 PASS(전체 항목 로드, defined/umbrella 조회, 미존재 키워드, non-dict 방어, 파일 없음 예외).
+- `scratchpad/arch300_network_probe/poc9_food_subvertical_probe.py` 신규 — PoC-7/8 구조 재사용. `verticals_kr.json`에서 "한식"의 `parent_keyword=="음식점"`을 읽기 전용으로 확인만 하고, 생성된 쿼리 문자열에 "음식점"이 섞이지 않았는지 방어적으로 재확인(assert + 런타임 체크) 후 실행.
+- 기존 테스트(region_expander/network_list_scraper/region_data) 무변경, 회귀 0(13/39/3 PASS 유지).
+
+## PoC-9A live 실행 결과 (1회, 재시도 없음)
+
+**"한식"도 4번째 쿼리(암사동)에서 active CAPTCHA로 안전 중단 — PoC-8 "음식점"과 정확히 동일한 위치·순번.**
+
+- `executed_query_count=4`, `skipped_query_count=20`, `before_trim_unique_count=80`, `final_unique_count=80`(target=300 미도달), `stop_reason=active_captcha`, `stopped_after_query_index=4`, `stopped_after_query="서울특별시 강동구 암사동 한식"`.
+- Tier1 앞 3개 쿼리(천호동/성내동/길동)는 raw=20/unique=20/dup=0의 완벽한 패턴(카페·음식점과 동일) - 4번째(암사동)에서 `active_captcha_detected=True`(가시성+유의미한 크기 확인, 오탐 아님).
+- `total_raw_items=80`, `duplicate_count=0`, `duplicate_rate=0%`, `total_wall_seconds=26.987`, `rows_per_second≈2.96`.
+- Tier2/Tier3는 실행되지 못함(안전 중단으로 스킵).
+- `passive_captcha_marker_found=True`, `status_429_seen=False`.
+
+## 카페(PoC-7) / 음식점 umbrella(PoC-8) 대비 비교
+
+| 케이스 | target 도달 | 중단 지점 | before_trim | dup률(중단 전) | CAPTCHA |
+|---|---|---|---|---|---|
+| 카페(PoC-7) | 성공(17번째) | - | 309 | 9.12% | 없음 |
+| 음식점 umbrella(PoC-8) | 실패 | **4번째, 암사동** | 80 | 0% | **active(4번째)** |
+| 한식 분해(PoC-9A) | 실패 | **4번째, 암사동** | 80 | 0% | **active(4번째)** |
+
+**"음식점"과 "한식"이 완전히 동일한 지점(4번째 쿼리, 암사동)에서 완전히 동일한 패턴(raw=80/unique=80/dup=0 후 active CAPTCHA)으로 중단됐다.**
+
+## 판단 — "umbrella 키워드가 원인"이라는 가설(H3)이 이번 실측으로 반박됨
+- **H3(umbrella 과폭 키워드가 CAPTCHA 원인) 기각**: "한식"은 명백한 정의형(defined) 세부업종인데도 umbrella였던 "음식점"과 정확히 동일한 위치에서 동일하게 실패했다. 분해 전략은 이번 1회 실측에서 **안전성을 개선하지 못했다.**
+- **새로 부상하는 가설**: (a) **암사동 자체의 위치적 요인**(이 시점에 암사동 페이지 렌더링/응답이 특이했을 가능성), (b) **세션/시점 누적 요인(H4 확장판)** - 오늘 하루 동안 이미 PoC-6/7/8에서 강동구를 대상으로 다수의 연속 조회를 수행했으므로, 동일 IP/세션에 누적된 요청량이 임계치에 가까워졌고 그로 인해 이번 PoC-9A 4번째 쿼리에서 우연히 걸렸을 가능성. **카페(PoC-7)가 17개 연속 무사했던 것은 그날 초반 실행이었기 때문일 수 있고, 음식점/한식은 이미 여러 PoC가 누적된 이후 실행이었다는 시점 차이가 있다** - 이는 개별 PoC 로그만으로는 확정할 수 없는 교차 실행 누적 효과 가설이다.
+- **암사동이라는 특정 동이 반복적으로 실패 지점이 된 것은 우연으로 치부하기엔 두 번 연속(PoC-8, PoC-9A) 재현됐다** - n=2로는 여전히 확정할 수 없지만, "특정 지역(암사동)이 다른 지역보다 민감하다"는 가설도 새로 세워야 한다.
+- **분해 전략을 폐기하지는 않는다**: 세부업종 분해는 데이터 품질(업종 컬럼 명확성) 측면에서는 여전히 유효하지만, **"분해하면 CAPTCHA를 피할 수 있다"는 안전성 근거는 이번 실측으로 성립하지 않는다.**
+
+## 300개 제품 흐름에 대한 현재 판단(강동구 한식 1회 실측 기준으로 제한)
+- **강동구·"한식"·1회 실측 기준으로, umbrella 분해 전략은 target=300에 도달하지 못했고(80건), CAPTCHA 안전성도 개선되지 않았다.** "세부업종으로 쪼개면 안전해진다"는 이전 설계 가설은 기각됐다.
+- 이 결과가 (a) 암사동이라는 특정 위치의 문제인지, (b) 오늘 하루 누적된 세션/IP 요청량 문제인지, (c) 단순 우연(n=2)인지는 **여전히 미확정**이며, 추가 실측 없이는 구분할 수 없다. 다만 추가 실측 자체가 노출을 늘리는 트레이드오프가 있으므로 신중한 판단이 필요하다.
+- 제품화 판단에 있어 **"업종을 잘 나누면 안전 문제가 해결된다"는 낙관적 전제를 버려야 한다** - LEGAL_NOTICE 4항 재조정 필요성은 이번에도 그대로 유지/강화된다.
+
+## 다음 작업
+- 암사동 특이성 가설과 세션 누적 가설을 구분하려면 (a) 암사동을 제외한 순서로 재실험하거나 (b) 완전히 새로운 세션(다른 시점)에서 재실험이 필요 - 둘 다 노출을 늘리므로 사용자 승인 없이 진행하지 않는다.
+- "분해하면 안전하다"는 가설이 기각됐으므로, 음식점형 전략(§4)의 안전 파라미터(세부업종 간 긴 휴지, 낮은 쿼리 상한, 즉시 전체 중단)는 여전히 유효하며 오히려 더 보수적으로 유지해야 한다.
+- 정적 지역/업종 데이터 자산화, UI/pipeline 연결, LEGAL_NOTICE/README 정식 수정은 여전히 별도 태스크로 보류(제품 배선 결정 시점까지).
+- CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토(이번 반박된 가설 포함) 완료 전까지 보류.
