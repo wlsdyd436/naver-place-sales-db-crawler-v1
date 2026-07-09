@@ -1232,4 +1232,48 @@ PoC-2R(page=1→2 성공, 90건, CAPTCHA 없음)에 이어 page=3까지만 소�
 - 규모 확장(50/100/160/300)으로 진행하지 않는다.
 - 다음 단계 후보: (a) page=2 대기시간을 4초보다 늘려 재관찰(같은 page=2 지점의 데이터 캡처 안정성 확인), (b) 동일 조건(page=1→2→3)으로 시간 간격을 두고 1회 더 재현성 확인, (c) CAPTCHA가 발생하는 지점(page 2→3)이 매번 동일한지, 아니면 세션/시간대에 따라 변하는지 별도 관찰.
 - 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음, CAPTCHA 우회 시도 없음.
+
+
+# 2026-07-09 ARCH-300C PoC-4 동 단위 검색어 분할 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+PoC-3에서 단일 검색어의 깊은 page 전환(page=2→3)이 실제 CAPTCHA를 유발함이 확인되어,
+"한 검색어를 깊게 파는" 방식은 300개 메인 엔진으로 부적합하다고 판단했다(Opus Plan Mode,
+ARCH-300C 설계). 대안으로 "여러 동 검색어를 얕게(page=1만) 조회해 place_id 기준으로
+합산"하는 구조의 1차 기술 검증을 PoC-4로 진행했다. 아직 제품 기능 확정이 아니며,
+UI/pipeline에는 연결하지 않았다. LEGAL_NOTICE/README 정식 수정도 보류(제품 배선 결정
+시점으로 미룸).
+
+## 구현
+- `src/pc/region_expander.py` 신규 — `build_dong_queries(city, gu, dongs, keywords)`: 구 단위 검색어를 동 단위 검색어 목록(동 × 키워드 곱)으로 분할하는 순수 함수. 직접 API 호출 없음, 공백/중복/빈 입력 방어. `tests/test_pc_region_expander.py` 신규(6 PASS / FAIL 0).
+- `src/pc/network_list_scraper.py` 보정: `_map_item_to_row`에 `source_dong`/`source_query` 선택적 내부 메타 추가(기존 `source_page`와 동일한 하위 호환 패턴, Excel 11컬럼에는 미노출). `count_rows_by_field(rows, field)` 신규 — `count_rows_by_source_page`의 일반화 버전(동/쿼리 등 임의 필드로 집계). `tests/test_pc_network_list_scraper.py`에 4종 추가(총 33 PASS / FAIL 0).
+- `scratchpad/arch300_network_probe/poc4_dong_split_probe.py` 신규 — 강동구 동 5개(천호동/성내동/길동/암사동/명일동) × "카페" × **page=1만**(pagination 클릭 없음, 상세 카드 클릭 없음, entryIframe 없음) 순회. `browser_session._CAPTCHA_PROBE_SELECTORS`/`region_expander.build_dong_queries`를 읽기 전용으로만 재사용, 나머지 보호 파일은 전부 무수정.
+
+## PoC-4 live 실행 결과 (1회, 재시도 없음)
+- 대상: 서울특별시 강동구 {천호동, 성내동, 길동, 암사동, 명일동} × "카페", 각 page=1만.
+- **동별 결과(5개 전부 완주, 중단 없음)**:
+
+| 동 | candidate | raw | unique_added | duplicate | elapsed(s) | passive | active |
+|---|---|---|---|---|---|---|---|
+| 천호동 | 1 | 20 | 20 | 0 | 5.839 | True | False |
+| 성내동 | 1 | 20 | 20 | 0 | 5.204 | True | False |
+| 길동 | 1 | 20 | 20 | 0 | 5.215 | True | False |
+| 암사동 | 1 | 20 | 20 | 0 | 5.181 | True | False |
+| 명일동 | 1 | 20 | 20 | 0 | 5.196 | True | False |
+
+- **총 unique row 수: 100건**(5동 × 20건, 전 동에 걸쳐 place_id 중복 0건 — 별도 검증 스크립트로 `len(set(place_ids))==100` 확인).
+- **중복률: 0.0%**(duplicate_rate=0.0). Gemini/Antigravity의 사전 실측 주장(동 5개, 총 100건, 중복률 0%)과 **정확히 일치**.
+- `total_wall_seconds=33.514`, `rows_per_second≈2.98`, `seconds_per_unique_row≈0.335`, `query_count=5`, `avg_rows_per_query=20.0`.
+- `active_captcha_detected=False`(5동 전부), `passive_captcha_marker_found=True`(5동 전부, 기존과 동일하게 상시 존재 placeholder), `click_intercepted_by_captcha=False`(이번 PoC-4는 pagination 클릭을 구조적으로 하지 않으므로 항상 False), `status_429_seen=False`.
+- `stop_reason=None`(끝까지 정상 완주).
+
+## 판단
+- **동 단위 얕은 조회(page=1만) 5개 연속 실행에서 CAPTCHA/429가 전혀 발생하지 않았다.** PoC-3(단일 검색어 deep pagination, page=3에서 실제 차단)와 뚜렷이 대조된다.
+- 동 간 중복이 이번 5개 표본에서는 0%였다 — 다만 동이 늘어날수록(특히 인접 동/좁은 상권) 중복률이 상승할 가능성은 배제할 수 없다(표본 5개, 1회 실행 결과일 뿐).
+- **PoC-4 기준 300개 추정**: 이번 비율(동 1개당 약 20건, 중복 0%)이 그대로 유지된다고 "낙관적으로 가정"하면 약 15개 동이 필요하다는 계산이 나오지만, 이는 **검증된 결론이 아니라 단순 외삽**이다. 실제로는 (a) 동 수가 늘수록 중복률 상승 가능성, (b) 더 많은 동을 연속 조회할 때의 CAPTCHA 리스크 누적 가능성이 모두 미검증 상태다. **300개 가능 여부는 여전히 확정하지 않는다.**
+
+## 다음 작업
+- 더 많은 동(예: 강동구 전체 동, 10개 이상)으로 확장해 (a) 중복률 추세, (b) CAPTCHA/429 누적 리스크를 관찰하는 PoC-5 후보.
+- 정적 동 목록 데이터 자산화(현재는 5개 하드코딩)는 이 방향이 채택된 이후 별도 태스크로 분리.
+- 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류), CAPTCHA 우회 시도 없음.
 - release_candidate 생성은 위 리스크 검토 완료 전까지 보류.

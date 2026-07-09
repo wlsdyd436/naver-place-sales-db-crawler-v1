@@ -270,16 +270,25 @@ def _build_place_url(item: dict) -> str:
     return f"https://pcmap.place.naver.com/place/{place_id}/home"
 
 
-def _map_item_to_row(item: dict, collected_at: str, *, source_page: int | None = None) -> dict:
+def _map_item_to_row(
+    item: dict,
+    collected_at: str,
+    *,
+    source_page: int | None = None,
+    source_dong: str | None = None,
+    source_query: str | None = None,
+) -> dict:
     """네트워크 응답의 업체 item 하나를 기존 Excel 11컬럼 row(dict)로 매핑한다.
 
     입력: item(dict, 응답에서 추출된 업체 하나), collected_at(수집일 문자열),
-    source_page(선택, PoC-2: 이 행이 어느 page 응답에서 나왔는지 디버그용으로
-    남기고 싶을 때만 전달).
+    source_page(선택, PoC-2: 어느 page 응답에서 나왔는지), source_dong(선택,
+    PoC-4: 어느 동 검색어에서 나왔는지), source_query(선택, PoC-4: 실제 사용된
+    전체 검색어 문자열) - 전부 디버그/집계용으로만 남기고 싶을 때 전달한다.
     출력: exporter.MERGED_COLUMNS(11컬럼)와 동일한 키를 가진 dict + 내부 필드
-    place_id(+source_page, 전달된 경우). place_id/source_page는 dedup/디버그용
-    내부 필드일 뿐이며, exporter가 MERGED_COLUMNS로만 투영하므로 Excel에는
-    노출되지 않는다(detail_scraper 경로와 동일한 관례).
+    place_id(+전달된 source_* 필드들). 이 내부 필드들은 dedup/디버그용일 뿐이며,
+    exporter가 MERGED_COLUMNS로만 투영하므로 Excel에는 노출되지 않는다
+    (detail_scraper 경로와 동일한 관례). 셋 다 미전달 시 기존 PoC-1/PoC-2
+    호출과 완전히 하위 호환된다(row에 해당 키 자체가 생기지 않음).
 
     새로오픈여부는 리스트 응답만으로는 신뢰할 수 있는 값을 확인하지 못해 PoC
     단계에서는 항상 빈칸이다(추후 응답 구조 추가 확인 후 채울 후보). 홈페이지/
@@ -308,6 +317,10 @@ def _map_item_to_row(item: dict, collected_at: str, *, source_page: int | None =
     }
     if source_page is not None:
         row["source_page"] = source_page
+    if source_dong is not None:
+        row["source_dong"] = source_dong
+    if source_query is not None:
+        row["source_query"] = source_query
     return row
 
 
@@ -429,5 +442,26 @@ def count_rows_by_source_page(rows) -> dict:
         key = row.get("source_page")
         if key is None:
             key = "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def count_rows_by_field(rows, field: str, *, unknown_label: str = "unknown") -> dict:
+    """rows(list[dict])를 임의의 내부 메타 필드(field) 값 기준으로 집계한다(PoC-4).
+
+    `count_rows_by_source_page`의 일반화 버전이다. 동(dong)/검색어(query) 등
+    page 외의 다른 내부 메타 기준으로도 같은 방식의 집계가 필요해져 추가했다
+    (예: `count_rows_by_field(rows, "source_dong")`). 순수 집계 함수이며
+    Playwright/파일 IO를 다루지 않아 fixture만으로 테스트할 수 있다.
+
+    field 값이 없는(None) 행은 unknown_label(기본 "unknown") 키로 묶는다.
+    place_id/source_page/source_dong/source_query 등은 모두 Excel에는
+    노출되지 않는 내부 필드이므로, 이 집계 결과도 진단/로그 용도로만 쓴다.
+    """
+    counts: dict = {}
+    for row in rows:
+        key = row.get(field)
+        if key is None:
+            key = unknown_label
         counts[key] = counts.get(key, 0) + 1
     return counts

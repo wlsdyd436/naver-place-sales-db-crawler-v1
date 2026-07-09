@@ -15,6 +15,7 @@ from src.pc.network_list_scraper import (
     _map_item_to_row,
     build_candidate_record,
     classify_captcha_signal,
+    count_rows_by_field,
     count_rows_by_source_page,
     dedup_rows,
     is_candidate_response,
@@ -507,6 +508,75 @@ def check_total_dedup_after_three_page_merge(reporter: ValidationReporter) -> No
         reporter.fail(f"3페이지 병합 dedup 결과가 예상과 다름: place_ids={place_ids}")
 
 
+# ---------------------------------------------------------------------------
+# PoC-4: source_dong/source_query 내부 메타 + count_rows_by_field 검증
+# ---------------------------------------------------------------------------
+
+
+def check_source_dong_and_query_internal_meta_not_in_excel_columns(reporter: ValidationReporter) -> None:
+    """source_dong/source_query는 place_id/source_page와 마찬가지로 디버그용
+    내부 메타일 뿐, exporter.MERGED_COLUMNS(11컬럼)에는 절대 노출되지 않아야 한다."""
+    row = _map_item_to_row(
+        {"id": "123", "name": "동단위카페"},
+        "2026-07-09",
+        source_dong="천호동",
+        source_query="서울특별시 강동구 천호동 카페",
+    )
+    ok = (
+        row.get("source_dong") == "천호동"
+        and row.get("source_query") == "서울특별시 강동구 천호동 카페"
+        and "source_dong" not in MERGED_COLUMNS
+        and "source_query" not in MERGED_COLUMNS
+    )
+    if ok:
+        reporter.pass_("source_dong/source_query는 row에 포함되지만 MERGED_COLUMNS(11컬럼)에는 없어 Excel 비노출")
+    else:
+        reporter.fail(f"source_dong/source_query 내부 메타 처리 결과가 예상과 다름: row={row}")
+
+    row_without_meta = _map_item_to_row({"id": "456", "name": "레거시카페"}, "2026-07-09")
+    if "source_dong" not in row_without_meta and "source_query" not in row_without_meta:
+        reporter.pass_("source_dong/source_query 미전달 시 row에 해당 키가 생기지 않음(기존 호출 하위 호환)")
+    else:
+        reporter.fail(f"source_dong/source_query 미전달인데 키가 생김: {row_without_meta}")
+
+
+def check_count_rows_by_field_generic_aggregation(reporter: ValidationReporter) -> None:
+    """count_rows_by_field가 source_page뿐 아니라 임의 필드(source_dong)로도
+    동일하게 집계할 수 있는지 확인한다(count_rows_by_source_page의 일반화 검증)."""
+    rows = [
+        _map_item_to_row({"id": "1", "name": "A"}, "2026-07-09", source_dong="천호동"),
+        _map_item_to_row({"id": "2", "name": "B"}, "2026-07-09", source_dong="천호동"),
+        _map_item_to_row({"id": "3", "name": "C"}, "2026-07-09", source_dong="성내동"),
+        _map_item_to_row({"id": "4", "name": "D"}, "2026-07-09"),  # source_dong 없음 -> unknown
+    ]
+    counts = count_rows_by_field(rows, "source_dong")
+    if counts == {"천호동": 2, "성내동": 1, "unknown": 1}:
+        reporter.pass_("count_rows_by_field가 source_dong 기준으로 정확히 집계(미지정 행은 unknown)")
+    else:
+        reporter.fail(f"count_rows_by_field(source_dong) 결과가 예상과 다름: {counts}")
+
+    # count_rows_by_source_page와 동일한 결과를 내는지(일반화가 기존 동작을 보존하는지) 교차 확인.
+    page_rows = [
+        _map_item_to_row({"id": "1", "name": "A"}, "2026-07-09", source_page=1),
+        _map_item_to_row({"id": "2", "name": "B"}, "2026-07-09", source_page=2),
+    ]
+    if count_rows_by_field(page_rows, "source_page") == count_rows_by_source_page(page_rows):
+        reporter.pass_("count_rows_by_field(source_page)가 기존 count_rows_by_source_page와 동일한 결과를 냄")
+    else:
+        reporter.fail(
+            f"count_rows_by_field/source_page 교차 검증 실패: "
+            f"{count_rows_by_field(page_rows, 'source_page')} vs {count_rows_by_source_page(page_rows)}"
+        )
+
+    custom_label = count_rows_by_field(
+        [_map_item_to_row({"id": "9", "name": "E"}, "2026-07-09")], "source_dong", unknown_label="미지정"
+    )
+    if custom_label == {"미지정": 1}:
+        reporter.pass_("unknown_label을 커스텀 문자열로 지정할 수 있음")
+    else:
+        reporter.fail(f"custom unknown_label 결과가 예상과 다름: {custom_label}")
+
+
 def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) -> None:
     cases = {
         "allsearch xhr": (True, "https://map.naver.com/p/api/search/allSearch?query=x", "xhr"),
@@ -551,6 +621,8 @@ def main() -> int:
     check_captcha_signal_click_exception_is_strong_signal(reporter)
     check_count_rows_by_source_page_three_pages(reporter)
     check_total_dedup_after_three_page_merge(reporter)
+    check_source_dong_and_query_internal_meta_not_in_excel_columns(reporter)
+    check_count_rows_by_field_generic_aggregation(reporter)
     check_is_candidate_response_filters_correctly(reporter)
 
     reporter.summary()
