@@ -1,4 +1,8 @@
 # 2026-06-25: V2.0 CustomTkinter UI. 기존 크롤링/파싱/엑셀 저장 파이프라인은 유지합니다.
+# 2026-07-09 UI-CLEANUP-1: 다중 키워드/수집모드 선택/온라인 채널 필터를 제거하고
+# 단일 키워드 + 자동 세분화 미리보기 중심으로 정리했다(구조 변경, 상세 설계는
+# PROJECT_STATE.md 2026-07-09 UI-CLEANUP-1 기록 참고). [DB 수집] 탭과, 아직
+# 실제 기능이 없는 [순위추적] V2 예정 탭으로 분리했다.
 import contextlib
 import os
 import re
@@ -18,6 +22,7 @@ from src.pc_crawler import crawl_places_pc
 from src.pc.config import DiagnosticConfig
 from src.pc.detail_scraper import build_full_collector
 from src.pc.pipeline import collect_pc_full
+from src.pc.region_data import load_region_layers
 
 
 REGION_DATA = {
@@ -31,6 +36,86 @@ REGION_DATA = {
     "세종특별자치시": ["세종시"],
     "경기도": ["가평군", "고양시", "과천시", "광명시", "광주시", "구리시", "군포시", "김포시", "남양주시", "동두천시", "부천시", "성남시", "수원시", "시흥시", "안산시", "안성시", "안양시", "양주시", "양평군", "여주시", "연천군", "오산시", "용인시", "의왕시", "의정부시", "이천시", "파주시", "평택시", "포천시", "하남시", "화성시"],
 }
+
+# ARCH-300C PoC-6~9에서 만든 강동구 샘플 지역 데이터(법정동/역상권)를 세부구역
+# 미리보기에 읽기 전용으로 재사용한다. 아직 강동구 외 지역은 데이터가 없으며,
+# 그 경우 "준비 중" 문구로 처리한다(§region_data.load_region_layers가 미존재
+# city/gu에 대해 빈 리스트를 반환하므로 예외 처리 불필요).
+REGIONS_SAMPLE_PATH = Path(__file__).resolve().parent.parent / "data" / "regions_kr_sample.json"
+
+# 다중 키워드로 보이는 입력을 차단하기 위한 패턴(쉼표/세미콜론/슬래시/파이프/
+# 가운뎃점/줄바꿈). 다중 키워드 UI(추가/삭제/목록) 자체를 없앤 이유는 ①큐가
+# 길어질수록 CAPTCHA 누적 리스크가 커지고(PoC-4~9 실측) ②제품 문구/기대치가
+# 단일 검색어 기준으로 단순해지기 때문이다 - REGION-DATA-1/UI-CLEANUP-1 설계
+# 참고. "카페 미용실"처럼 공백만 있는 입력은 하나의 실제 검색어일 수 있으므로
+# 의도적으로 차단 대상에서 제외한다(UI-CLEANUP-1B).
+_MULTI_KEYWORD_PATTERN = re.compile(r"[,;\n/|·]")
+
+# UI-CLEANUP-1C: 시/군/구를 여러 개 선택할 수 있는 구조로 바꾸면서, 나중에
+# 또 갈아엎지 않도록 처음부터 "여러 구 기준" 쿼리 생성으로 설계한다(사용자
+# 피드백: 구 선택은 결국 다중이 될 거라 지금 정리). 기본 선택 구는 세부구역
+# 샘플 데이터가 있는 강동구 - 다른 시/도로 바꿔 강동구가 없으면 그 시/도의
+# 첫 번째 구를 기본 선택한다.
+_DEFAULT_DISTRICT = "강동구"
+
+# 왼쪽 설정 패널 섹션 간 여백을 통일하기 위한 상수(위/아래 여백을 맞춰
+# 달라는 요청 대응). 섹션 제목은 위 16/아래 4, 섹션 본문 프레임은 아래 16으로
+# 맞춰 첫 섹션의 위쪽 여백과 마지막 섹션의 아래쪽 여백이 대칭이 되게 한다.
+_SECTION_TITLE_PADY = (16, 4)
+_SECTION_BODY_PADY = (0, 16)
+
+# UI-CLEANUP-1D-A: [DB 수집]/[순위추적] 탭 자체를 감싸는 앱 전체 외곽 여백.
+# 왼쪽 패널 "섹션 간" 여백(위 상수)과는 다른 층위 - 이건 "제목 아래 ~ 탭
+# 바로 위"와 "앱 맨 아래" 여백을 상하 대칭으로 맞추기 위한 것이다. tabview는
+# 창 전체를 채우는 단일 grid 셀이므로, 이 pady 하나만 상하 동일하게 주면
+# 창 위/아래 외곽 여백이 자동으로 대칭이 된다.
+_OUTER_PAD_X = 12
+_OUTER_PAD_Y = (14, 14)
+
+# 왼쪽 설정 패널의 최소 폭. 구를 여러 개 선택할 수 있게 되면서 체크박스
+# 텍스트(예: "영등포구")가 좁은 폭에서 잘리는 문제가 있었다 - weight 대신
+# minsize를 줘서 창을 줄여도 왼쪽 패널이 이 폭 아래로는 줄어들지 않게
+# 고정하고, 남는 폭은 오른쪽 수집 현황/로그 패널이 전부 가져가게 한다.
+_LEFT_PANEL_MIN_WIDTH = 420
+
+
+def build_collection_queries(city: str, district_selections: list[dict], keyword: str) -> list[dict]:
+    """구별 선택 상태 + 키워드로 최종 수집 쿼리 목록을 만드는 순수 함수(Tk 불필요).
+
+    district_selections: 화면에 표시된 순서 그대로, 각 구에 대해
+      {"district": str, "has_subregion_data": bool, "selected_subregions": [str, ...]}
+    형태의 dict 목록. has_subregion_data가 False면 "{city} {district} {keyword}"
+    구 기준 fallback 쿼리 1개를 만든다. True인데 selected_subregions가 비어
+    있으면(법정동/역상권을 전부 체크 해제) 그 구는 쿼리를 만들지 않고 건너뛴다
+    (세부구역 데이터가 있는 구에서 전부 해제하면 수집 대상에서 제외되어야
+    하기 때문). True이고 목록이 있으면 세부구역마다 "{city} {district}
+    {subregion} {keyword}" 쿼리를 만든다.
+
+    반환은 `_run_queue_pipeline`이 그대로 받을 수 있는 job 형태
+    [{"region": ..., "keyword": keyword, "query": ...}, ...]다 - 여러 구
+    선택을 반영하면서도 파이프라인 자체는 건드리지 않기 위함이다. 중복
+    쿼리는 제거하되 처음 등장한 순서는 유지한다.
+    """
+    jobs: list[dict] = []
+    seen_queries: set = set()
+    for entry in district_selections:
+        district = entry["district"]
+        if entry.get("has_subregion_data"):
+            for subregion in entry.get("selected_subregions") or []:
+                region_label = f"{city} {district} {subregion}"
+                query = f"{region_label} {keyword}"
+                if query in seen_queries:
+                    continue
+                seen_queries.add(query)
+                jobs.append({"region": region_label, "keyword": keyword, "query": query})
+        else:
+            region_label = f"{city} {district}"
+            query = f"{region_label} {keyword}"
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
+            jobs.append({"region": region_label, "keyword": keyword, "query": query})
+    return jobs
 
 
 class LogWriter:
@@ -53,24 +138,45 @@ class SalesDbCrawlerApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("네이버 플레이스 영업 DB 수집기 V2.0")
-        self.geometry("1000x700")
-        self.resizable(False, False)
+        # UI-CLEANUP-1D-A: 여러 구 체크박스 + 세부구역 설정 팝업까지 들어오면서
+        # 기존 1000x800/고정 크기로는 좁았다. 기본 창을 키우고 최소 크기를
+        # 지정한 뒤 크기 조절을 허용한다(왼쪽 패널은 minsize로, 오른쪽은
+        # weight로 배분 - §_build_ui). resizable(False, False)로 고정하면
+        # 사용자 모니터/DPI 환경에 따라 오히려 내용이 잘릴 위험이 커서
+        # 가변 크기로 바꿨다.
+        self.geometry("1240x820")
+        self.minsize(1100, 780)
+        self.resizable(True, True)
 
         self.selected_city_var = ctk.StringVar(value="서울특별시")
-        self.keyword_input_var = ctk.StringVar()
-        self.limit_var = ctk.StringVar(value="10")
-        self.mode_var = ctk.StringVar(value="basic")
-        self.output_path_var = ctk.StringVar(value="output/naver_place_basic_db.xlsx")
+        self.keyword_input_var = ctk.StringVar(value="카페")
+        # UI-CLEANUP-1D-B 정합성 점검: "목표 수집 개수"라는 이름과 달리, 이 값은
+        # 현재 코드에서 (1) 전체 최종 저장 목표(target_count)가 아니라 (2) 각
+        # 검색 조합(쿼리) 하나당 상한(per_query_limit)으로 그대로 전달된다
+        # (start_crawl -> _run_queue_pipeline -> _collect_premium_query/
+        # _collect_basic_query가 이 값을 매 쿼리마다 limit 인자로 재사용).
+        # 여러 구/세부구역을 선택해 쿼리가 N개가 되면, 쿼리 간 place_id dedup이
+        # 프로덕션 파이프라인에 아직 연결되지 않아(ARCH-300C 실험 코드에만
+        # dedup_rows/seen 존재, PROJECT_STATE.md 참고) 최종 저장 건수가 이
+        # 값보다 훨씬 많아질 수 있다 - "목표=최종 합산 상한"이 아니라 "검색
+        # 조합 1개당 상한"에 더 가깝다. 이번 단계에서는 정확한 전체 목표
+        # 강제(조기 종료/trim)를 억지로 구현하지 않고, UI 문구를
+        # 실제 동작에 맞게 정리했다(§_build_target_count_section).
+        self.limit_var = ctk.StringVar(value="300")
+        # 수집모드 선택 UI는 제거하지만, 내부적으로는 기존 PC 상세 수집 경로
+        # (premium)를 그대로 기본값으로 사용한다(엔진 코드는 삭제하지 않음).
+        self.mode_var = ctk.StringVar(value="premium")
+        self.output_path_var = ctk.StringVar(value="output/naver_place_premium_db.xlsx")
         self.new_open_only_var = ctk.BooleanVar(value=False)
-        self.online_channel_var = ctk.BooleanVar(value=False)
         self.review_min_var = ctk.StringVar()
         self.review_max_var = ctk.StringVar()
         self.progress_percent_var = ctk.StringVar(value="0%")
         self.eta_var = ctk.StringVar(value="예상 남은 시간: 계산 중...")
         self.current_task_var = ctk.StringVar(value="대기 중...")
+        self.total_found_var = ctk.StringVar(value="총 발견: 0개")
+        self.duplicate_removed_var = ctk.StringVar(value="중복 제거: 0개")
+        self.final_expected_var = ctk.StringVar(value="최종 저장 예정: 0개")
 
-        self.keywords = ["카페"]
-        self.district_vars = {}
         self.last_output_path = ""
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
@@ -82,105 +188,251 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.current_pause_start = None
         self.eta_after_id = None
         self.total_queries = 0
+        self.total_found_count = 0
+
+        # UI-CLEANUP-1C: 구를 여러 개 선택할 수 있으므로 선택 상태를 전부
+        # "구 이름"을 키로 하는 딕셔너리로 관리한다.
+        #   selected_district_vars: {구이름: BooleanVar}  - 구 체크박스 상태
+        #   _subdivision_layers:    {구이름: {"legal_dongs": [...], "landmarks": [...]}}
+        #                           - 구별로 한 번 로드한 세부구역 데이터 캐시
+        #   region_selection_vars:  {구이름: {"legal_dongs": {이름: BooleanVar},
+        #                                      "landmarks": {이름: BooleanVar}}}
+        # 체크박스가 화면에 그려져 있지 않아도(접힌 상태) 항상 최신 선택 상태를
+        # 담고 있어야 한다 - 요약 문구/예상 쿼리 수/시작 시 검증이 접힌
+        # 상태에서도 정확해야 하기 때문이다.
+        self.selected_district_vars: dict = {}
+        self._subdivision_layers: dict = {}
+        self.region_selection_vars: dict = {}
 
         self._build_ui()
-        self._render_district_checkboxes()
-        self._render_keyword_list()
+        self._reload_district_data()
 
     def _build_ui(self):
         self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=4)
-        self.grid_columnconfigure(1, weight=6)
+        self.grid_columnconfigure(0, weight=1)
 
-        self.left_panel = ctk.CTkFrame(self)
-        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=10, pady=6)
+        # UI-CLEANUP-1: 제목 아래에 [DB 수집] / [순위추적] 탭을 추가한다. 순위추적은
+        # 업체 DB 수집과는 다른 알고리즘(검색 노출 순위 확인)이 필요해 별도 탭으로
+        # 분리하고, 이번 단계에서는 V2 예정 화면만 제공한다(§_build_rank_tracking_tab).
+        # UI-CLEANUP-1D-A: tabview는 창 전체를 채우는 유일한 최상위 grid 셀이므로,
+        # 여기 pady를 상하 동일(_OUTER_PAD_Y)하게 주는 것만으로 "제목~탭 위" 여백과
+        # "앱 맨 아래" 여백이 자동으로 대칭이 된다(왼쪽 패널 섹션 간격과는 다른 층위).
+        # UI-CLEANUP-1D-B: [안내·정책] 탭 자리를 추가한다. 실제 판매/유지보수/
+        # 라이선스 정책 문구는 정식 배포 전에 확정해 다시 작성할 예정이므로,
+        # 이번에는 "정식 배포 전 작성 예정" placeholder만 채운 자리를 만든다
+        # (§_build_policy_tab). 1PC 라이선스 인증 등 실제 기능은 구현하지 않는다.
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.grid(row=0, column=0, sticky="nsew", padx=_OUTER_PAD_X, pady=_OUTER_PAD_Y)
+        self.db_tab = self.tabview.add("DB 수집")
+        self.rank_tab = self.tabview.add("순위추적")
+        self.policy_tab = self.tabview.add("안내·정책")
+        self.tabview.set("DB 수집")
+
+        self.db_tab.grid_rowconfigure(0, weight=1)
+        # 왼쪽 패널은 minsize로 폭을 고정(구 이름 잘림 방지), 오른쪽은 weight=1로
+        # 남는 공간을 전부 흡수한다 - 창을 늘리거나 줄여도 왼쪽 폭은 안정적으로
+        # 유지되고 오른쪽만 늘었다 줄었다 한다.
+        self.db_tab.grid_columnconfigure(0, weight=0, minsize=_LEFT_PANEL_MIN_WIDTH)
+        self.db_tab.grid_columnconfigure(1, weight=1)
+
+        # UI-CLEANUP-1B: 세부구역 체크박스가 펼쳐지면 왼쪽 설정 영역이 창보다
+        # 길어질 수 있어 "목표 수집 개수"가 잘리는 문제가 있었다. CTkFrame 대신
+        # CTkScrollableFrame을 써서 왼쪽 영역 전체를 세로 스크롤 가능하게 만들어
+        # 해결한다(오른쪽 수집 현황/로그 영역은 기존 CTkFrame 그대로 유지).
+        self.left_panel = ctk.CTkScrollableFrame(self.db_tab)
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
         self.left_panel.grid_columnconfigure(0, weight=1)
 
-        self.right_panel = ctk.CTkFrame(self)
-        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=10, pady=6)
+        self.right_panel = ctk.CTkFrame(self.db_tab)
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
         self.right_panel.grid_columnconfigure(0, weight=1)
         self.right_panel.grid_rowconfigure(3, weight=1)
 
         self._build_region_section()
+        self._build_subdivision_section()
         self._build_keyword_section()
         self._build_filter_section()
+        self._build_target_count_section()
         self._build_dashboard_section()
         self._build_control_section()
         self._build_log_section()
 
+        self._build_rank_tracking_tab()
+        self._build_policy_tab()
+
     def _build_region_section(self):
-        ctk.CTkLabel(self.left_panel, text="1. 지역 선택", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(8, 4))
-        region_frame = ctk.CTkFrame(self.left_panel, height=150)
-        region_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
-        region_frame.grid_propagate(False)
-        region_frame.grid_columnconfigure((0, 1), weight=1)
-        region_frame.grid_rowconfigure(0, weight=1)
+        ctk.CTkLabel(self.left_panel, text="1. 지역 선택", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        region_frame = ctk.CTkFrame(self.left_panel)
+        region_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        region_frame.grid_columnconfigure(0, weight=1)
 
-        self.city_scroll = ctk.CTkScrollableFrame(region_frame)
-        self.city_scroll.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=6)
-        self.district_scroll = ctk.CTkScrollableFrame(region_frame)
-        self.district_scroll.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=6)
+        # 시/도는 드롭다운 1개 선택을 유지한다(여러 시/도 동시 선택은 이번
+        # 범위 밖). 시/군/구는 체크박스 다중 선택으로 바꾼다 - 나중에 다시
+        # 구조를 바꾸지 않도록, 쿼리 생성(get_selected_districts +
+        # build_collection_queries)을 처음부터 "여러 구"를 전제로 짰다.
+        ctk.CTkLabel(region_frame, text="시/도", anchor="w").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+        self.city_dropdown = ctk.CTkOptionMenu(
+            region_frame, variable=self.selected_city_var,
+            values=list(REGION_DATA.keys()), command=self._on_city_changed,
+        )
+        self.city_dropdown.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
 
-        for city in REGION_DATA:
-            ctk.CTkRadioButton(self.city_scroll, text=city, variable=self.selected_city_var, value=city, command=self._render_district_checkboxes).pack(anchor="w", padx=6, pady=4)
+        ctk.CTkLabel(region_frame, text="시/군/구 (여러 개 선택 가능)", anchor="w").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 2))
+        self.district_checkbox_frame = ctk.CTkFrame(region_frame, fg_color="transparent")
+        self.district_checkbox_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 2))
+        # 3열은 "영등포구"처럼 4글자 구 이름이 잘리는 문제가 있어 2열로 줄이고
+        # 각 열에 weight를 줘 왼쪽 패널 폭(_LEFT_PANEL_MIN_WIDTH)을 넉넉히
+        # 나눠 갖게 한다(고정 폭을 텍스트에 억지로 맞추지 않기 위함).
+        self.district_checkbox_frame.grid_columnconfigure((0, 1), weight=1)
 
-        self.toggle_all_button = ctk.CTkButton(region_frame, text="전체 선택 / 해제", command=self.toggle_all_districts)
-        self.toggle_all_button.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        self.district_summary_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            region_frame, textvariable=self.district_summary_var, anchor="w", text_color="gray",
+        ).grid(row=4, column=0, sticky="w", padx=12, pady=(2, 10))
+
+    def _render_district_checkboxes(self):
+        """selected_district_vars(현재 시/도의 구 목록)를 2열 체크박스로 그린다."""
+        for child in self.district_checkbox_frame.winfo_children():
+            child.destroy()
+        row = 0
+        col = 0
+        for district, var in self.selected_district_vars.items():
+            ctk.CTkCheckBox(
+                self.district_checkbox_frame, text=district, variable=var,
+                command=lambda d=district: self._on_district_toggle(d),
+            ).grid(row=row, column=col, sticky="w", padx=8, pady=4)
+            col += 1
+            if col >= 2:
+                col = 0
+                row += 1
+        self._update_district_summary()
+
+    def _update_district_summary(self):
+        self.district_summary_var.set(f"선택한 구: {len(self.get_selected_districts())}개")
+
+    def get_selected_districts(self) -> list[str]:
+        """현재 체크된 구 이름을 REGION_DATA 순서 그대로 반환한다."""
+        return [district for district, var in self.selected_district_vars.items() if var.get()]
+
+    def _build_subdivision_section(self):
+        ctk.CTkLabel(self.left_panel, text="2. 세부구역 설정", font=ctk.CTkFont(size=14, weight="bold")).grid(row=2, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        subdivision_frame = ctk.CTkFrame(self.left_panel)
+        subdivision_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        subdivision_frame.grid_columnconfigure(0, weight=1)
+
+        # 자동 세분화 자체는 여전히 화면 표시/선택 상태 보관용이며, 실제 검색
+        # 쿼리 생성에는 아직 연결되지 않는다(ARCH-300C 계층형 큐는 PoC-6~9
+        # 실험 단계이며 파이프라인 미연결 - get_selected_subregions()가 그
+        # 연결 지점이 될 확장 포인트다).
+        self.auto_subdivide_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            subdivision_frame, text="선택한 구를 동/상권 단위로 자동 세분화",
+            variable=self.auto_subdivide_var, command=self._refresh_subdivision_view,
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        # 선택된 구 수 + 예상 수집 쿼리 수(실제 build_collection_queries 결과
+        # 기준)를 함께 보여준다 - 선택이 바뀔 때마다 _update_subdivision_summary
+        # 에서 갱신한다.
+        self.subdivision_summary_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            subdivision_frame, textvariable=self.subdivision_summary_var,
+            justify="left", anchor="w", text_color="gray",
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
+
+        # UI-CLEANUP-1E: 안전 안내 취지는 유지하되(SAFE-1과 동일 - 우회 표현
+        # 없이 사실만 전달) 한 줄로 축약한다. 자세한 배경(쿼리 수 증가 이유 등)은
+        # 안내·정책 탭에서 다룰 예정이다.
+        ctk.CTkLabel(
+            subdivision_frame,
+            text="보안 확인 감지 시 수집을 중단하고 현재 결과를 저장합니다.",
+            anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        # UI-CLEANUP-1D-A: 법정동/역상권 체크박스 목록을 왼쪽 패널에 직접 펼치면
+        # (구가 여러 개일수록) 패널이 매우 길어지고, CTkScrollableFrame 안에서
+        # 큰 위젯 트리를 자주 destroy/recreate하면서 스크롤 잔상처럼 보이는
+        # 렌더링 문제가 있었다. 그래서 메인 화면에는 요약 + 버튼만 두고,
+        # 실제 법정동/역상권 체크박스는 별도 팝업(Toplevel)에서만 그린다
+        # (§_open_subregion_popup). 행정동은 팝업에서도 표시하지 않는다(법정동
+        # 기준으로 300개 목표를 채운다는 REGION-DATA-1 설계 결론 - 행정동을
+        # 섞으면 PoC-5에서 확인된 것처럼 같은 지역이 이중 집계될 위험이 있다).
+        # 체크박스 상태는 get_selected_subregions()를 거쳐 build_collection_queries가
+        # 실제 검색 쿼리에 반영한다.
+        self.subregion_popup_button = ctk.CTkButton(
+            subdivision_frame, text="수집할 동/상권 설정", command=self._open_subregion_popup,
+        )
+        self.subregion_popup_button.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 10))
+
+        self._subregion_popup = None
+        self._subregion_popup_container = None
 
     def _build_keyword_section(self):
-        ctk.CTkLabel(self.left_panel, text="2. 키워드 입력", font=ctk.CTkFont(size=14, weight="bold")).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 4))
-        keyword_input_frame = ctk.CTkFrame(self.left_panel)
-        keyword_input_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 4))
-        keyword_input_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self.left_panel, text="3. 키워드 입력", font=ctk.CTkFont(size=14, weight="bold")).grid(row=4, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        keyword_frame = ctk.CTkFrame(self.left_panel)
+        keyword_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        keyword_frame.grid_columnconfigure(0, weight=1)
 
-        self.keyword_entry = ctk.CTkEntry(keyword_input_frame, textvariable=self.keyword_input_var, placeholder_text="예: 카페, 미용실, 병원")
-        self.keyword_entry.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=6)
-        self.keyword_entry.bind("<Return>", self._handle_keyword_return)
-        self.keyword_entry._entry.bind("<Return>", self._handle_keyword_return)
-        self.bind_all("<Return>", self._handle_keyword_return)
-        self.add_keyword_button = ctk.CTkButton(keyword_input_frame, text="추가", width=70, command=self.add_keyword)
-        self.add_keyword_button.grid(row=0, column=1, padx=(0, 10), pady=10)
-
-        keyword_list_container = ctk.CTkFrame(self.left_panel, height=78)
-        keyword_list_container.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 4))
-        keyword_list_container.grid_propagate(False)
-        keyword_list_container.grid_columnconfigure(0, weight=1)
-        keyword_list_container.grid_rowconfigure(0, weight=1)
-        self.keyword_list_frame = ctk.CTkScrollableFrame(keyword_list_container)
-        self.keyword_list_frame.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.keyword_list_frame.grid_columnconfigure(0, weight=1)
-        self.clear_keyword_button = ctk.CTkButton(self.left_panel, text="전체 삭제", fg_color="gray", command=self.clear_keywords)
-        self.clear_keyword_button.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 6))
+        # 다중 키워드 추가/목록/삭제 UI를 제거하고 단일 입력창만 남긴다.
+        # 이유: 큐가 길어질수록(지역x키워드 곱집합) 연속 요청이 늘어 CAPTCHA
+        # 누적 리스크가 커진다는 것이 PoC-4~9 실측으로 확인됐고, 여러 키워드를
+        # 한 번에 도는 기능은 현재 안정성 근거가 없다 - 다중 키워드 시도는
+        # start_crawl에서 쉼표/세미콜론/줄바꿈 패턴으로 사전 차단한다.
+        ctk.CTkLabel(keyword_frame, text="수집할 업종/검색어", anchor="w").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        self.keyword_entry = ctk.CTkEntry(keyword_frame, textvariable=self.keyword_input_var, placeholder_text="예: 카페")
+        self.keyword_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
+        ctk.CTkLabel(
+            keyword_frame, text="현재 버전은 키워드 1개만 지원합니다.",
+            anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_filter_section(self):
-        ctk.CTkLabel(self.left_panel, text="3. 상세 필터", font=ctk.CTkFont(size=14, weight="bold")).grid(row=6, column=0, sticky="w", padx=14, pady=(0, 4))
+        ctk.CTkLabel(self.left_panel, text="4. 필터", font=ctk.CTkFont(size=14, weight="bold")).grid(row=6, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
         filter_frame = ctk.CTkFrame(self.left_panel)
-        filter_frame.grid(row=7, column=0, sticky="ew", padx=14, pady=(0, 14))
+        filter_frame.grid(row=7, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
         filter_frame.grid_columnconfigure((1, 3), weight=1)
 
+        # 온라인 채널(블로그/인스타 등 존재) 필터는 제거한다: 홈페이지/인스타/
+        # 블로그는 이제 기본 수집 컬럼으로 항상 가져오므로 "있는 업체만" 필터가
+        # 더 이상 필요하지 않다. 단, 엑셀 결과의 홈페이지/인스타/블로그 컬럼
+        # 자체는 그대로 유지한다(exporter.MERGED_COLUMNS 변경 없음).
         self.new_open_checkbox = ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var)
-        self.new_open_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
-        self.online_channel_checkbox = ctk.CTkCheckBox(filter_frame, text="온라인 채널(블로그/인스타 등) 존재 (준비 중)", variable=self.online_channel_var)
-        self.online_channel_checkbox.grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+        self.new_open_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(
+            filter_frame,
+            text="체크 시 새로오픈 업체만 저장합니다.\n체크 해제 시 전체 업체를 포함합니다.",
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
 
-        ctk.CTkLabel(filter_frame, text="리뷰 수:").grid(row=2, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
+        ctk.CTkLabel(filter_frame, text="리뷰 수:").grid(row=2, column=0, sticky="w", padx=(12, 6), pady=(0, 10))
         self.review_min_entry = ctk.CTkEntry(filter_frame, textvariable=self.review_min_var, placeholder_text="Min", width=70)
-        self.review_min_entry.grid(row=2, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ctk.CTkLabel(filter_frame, text="~").grid(row=2, column=2, padx=2, pady=(0, 6))
+        self.review_min_entry.grid(row=2, column=1, sticky="ew", padx=(0, 6), pady=(0, 10))
+        ctk.CTkLabel(filter_frame, text="~").grid(row=2, column=2, padx=2, pady=(0, 10))
         self.review_max_entry = ctk.CTkEntry(filter_frame, textvariable=self.review_max_var, placeholder_text="Max", width=70)
-        self.review_max_entry.grid(row=2, column=3, sticky="ew", padx=(6, 12), pady=(0, 6))
+        self.review_max_entry.grid(row=2, column=3, sticky="ew", padx=(6, 12), pady=(0, 10))
 
-        ctk.CTkLabel(filter_frame, text="수집 모드:").grid(row=3, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
-        mode_frame = ctk.CTkFrame(filter_frame, fg_color="transparent")
-        mode_frame.grid(row=3, column=1, columnspan=3, sticky="w", padx=(0, 12), pady=(0, 6))
-        self.basic_radio = ctk.CTkRadioButton(mode_frame, text="빠른 수집(모바일)", variable=self.mode_var, value="basic", command=self.on_mode_change)
-        self.basic_radio.pack(side="left", padx=(0, 12))
-        self.premium_radio = ctk.CTkRadioButton(mode_frame, text="상세 수집(PC·전화·SNS)", variable=self.mode_var, value="premium", command=self.on_mode_change)
-        self.premium_radio.pack(side="left")
+    def _build_target_count_section(self):
+        # UI-CLEANUP-1D-B에서 "조기 종료" 문구는 제거했지만, 라벨 자체가 여전히
+        # "목표 수집 개수"라 전체 목표처럼 오해될 수 있었다. limit_var는 실제로
+        # 전체 목표가 아니라 검색 조합(쿼리) 1개당 상한이므로(§self.limit_var
+        # 정의부 주석), 라벨/문구를 그 동작 그대로 표현하도록 다시 정정했다.
+        ctk.CTkLabel(self.left_panel, text="5. 검색 조합당 수집 상한", font=ctk.CTkFont(size=14, weight="bold")).grid(row=8, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        target_frame = ctk.CTkFrame(self.left_panel)
+        target_frame.grid(row=9, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        target_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(filter_frame, text="수집 개수:").grid(row=4, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
-        self.limit_entry = ctk.CTkEntry(filter_frame, textvariable=self.limit_var, width=80)
-        self.limit_entry.grid(row=4, column=1, sticky="w", padx=(0, 6), pady=(0, 6))
+        self.limit_entry = ctk.CTkEntry(target_frame, textvariable=self.limit_var, width=100)
+        self.limit_entry.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        # UI-CLEANUP-1E: "네이버 플레이스 검색 구조상 최대 300개" 관련 긴 설명은
+        # 안내·정책 탭에서 정식 문구로 다룰 예정이라 여기서는 핵심만 남긴다.
+        # 조기 종료 문구는 다시 추가하지 않는다(1D-B 결정 유지).
+        ctk.CTkLabel(
+            target_frame,
+            text=(
+                "각 검색 조합마다 적용되는 수집 상한입니다.\n"
+                "전체 저장 개수는 지역 수와 중복 제거 결과에 따라 달라집니다."
+            ),
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
@@ -192,7 +444,14 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.progress_bar.set(0)
         ctk.CTkLabel(status_card, textvariable=self.progress_percent_var, font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, padx=(0, 16), pady=(16, 8))
         ctk.CTkLabel(status_card, textvariable=self.eta_var, anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 6))
-        ctk.CTkLabel(status_card, textvariable=self.current_task_var, anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 16))
+        ctk.CTkLabel(status_card, textvariable=self.current_task_var, anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
+        # 총 발견/최종 저장 예정은 실제 집계값을 반영한다. 중복 제거는 현재
+        # 파이프라인이 쿼리 간 dedup을 추적하지 않아(ARCH-300C 계층형 큐 미연결)
+        # 항상 0으로 표시된다 - 실제로 연결되기 전까지 근거 없는 숫자를 보여주지
+        # 않기 위한 정직한 placeholder다(§_reset_collection_stats).
+        ctk.CTkLabel(status_card, textvariable=self.total_found_var, anchor="w").grid(row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 2))
+        ctk.CTkLabel(status_card, textvariable=self.duplicate_removed_var, anchor="w").grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 2))
+        ctk.CTkLabel(status_card, textvariable=self.final_expected_var, anchor="w").grid(row=5, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 16))
 
     def _build_control_section(self):
         button_frame = ctk.CTkFrame(self.right_panel)
@@ -212,54 +471,367 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self.log("[ui] 실행 준비 완료")
 
-    def _render_district_checkboxes(self):
-        for child in self.district_scroll.winfo_children():
-            child.destroy()
-        self.district_vars = {}
-        for index, district in enumerate(REGION_DATA.get(self.selected_city_var.get(), [])):
-            var = ctk.BooleanVar(value=index == 0)
-            ctk.CTkCheckBox(self.district_scroll, text=district, variable=var).pack(anchor="w", padx=6, pady=4)
-            self.district_vars[district] = var
+    def _build_rank_tracking_tab(self):
+        # 순위추적은 업체 DB 수집(리스트/상세 수집)과는 전혀 다른 알고리즘
+        # (특정 키워드로 검색했을 때 노출 순서를 확인)이 필요하다. 이번
+        # UI-CLEANUP-1은 화면 정리 작업이므로 실제 검색/크롤러/DB 스키마/
+        # 자동 스케줄링은 구현하지 않고, 어떤 기능이 올 예정인지 보여주는
+        # 정적 미리보기만 제공한다. 실제 구현은 DB 수집 MVP 안정화 이후
+        # 별도 단계(PROJECT_STATE.md 참고)에서 진행한다.
+        self.rank_tab.grid_rowconfigure(0, weight=1)
+        self.rank_tab.grid_columnconfigure(0, weight=1)
 
-    def toggle_all_districts(self):
-        if not self.district_vars:
+        container = ctk.CTkScrollableFrame(self.rank_tab)
+        container.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        container.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(container, text="순위추적 V2 예정", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w", pady=(4, 4))
+        ctk.CTkLabel(
+            container,
+            text=(
+                "순위추적은 업체 DB 수집과 별도 알고리즘으로 동작합니다.\n"
+                "특정 업체 또는 특정 키워드를 기준으로 노출 순위를 확인하고,\n"
+                "날짜별 변화를 기록하는 기능입니다."
+            ),
+            justify="left", anchor="w", text_color="gray",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        self._build_rank_tracking_card(
+            container, row=2, title="업체별 순위",
+            description="특정 업체가 여러 키워드에서 몇 위인지 확인합니다.",
+            example=(
+                "예: 굽네치킨 천호점\n"
+                "- 천호동 치킨: 7위\n"
+                "- 강동구 치킨: 15위\n"
+                "- 천호역 치킨: 4위"
+            ),
+        )
+        self._build_rank_tracking_card(
+            container, row=3, title="키워드별 순위",
+            description="특정 키워드에서 어떤 업체들이 상위에 노출되는지 확인합니다.",
+            example=(
+                "예: 천호동 치킨\n"
+                "1위 교촌치킨 천호점\n"
+                "2위 굽네치킨 천호점\n"
+                "3위 BBQ 천호점"
+            ),
+        )
+        self._build_rank_tracking_card(
+            container, row=4, title="날짜별 변화 기록",
+            description="매일 또는 주간 단위로 순위 변화를 저장하고 리포트화합니다.",
+            example=None,
+        )
+
+        self.rank_placeholder_button = ctk.CTkButton(container, text="순위추적 기능 준비중", state="disabled")
+        self.rank_placeholder_button.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+
+    def _build_rank_tracking_card(self, parent, row: int, title: str, description: str, example: str | None):
+        card = ctk.CTkFrame(parent)
+        card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(card, text=description, anchor="w", justify="left").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4 if example else 10))
+        if example:
+            ctk.CTkLabel(card, text=example, justify="left", anchor="w", text_color="gray").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+
+    def _build_policy_tab(self):
+        # [안내·정책] 탭은 이번 단계에서 "자리"만 만든다 - 최종 판매/유지보수/
+        # 라이선스 정책 문구는 개발이 끝난 뒤 확정해서 다시 쓸 예정이므로,
+        # 지금 길게 확정된 법률 문서처럼 작성하지 않는다. 1PC 라이선스 인증,
+        # 결제/고객센터/계정 기능은 여기서 구현하지 않는다(개발 마지막 단계의
+        # 별도 태스크).
+        self.policy_tab.grid_rowconfigure(0, weight=1)
+        self.policy_tab.grid_columnconfigure(0, weight=1)
+
+        container = ctk.CTkScrollableFrame(self.policy_tab)
+        container.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        container.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(container, text="안내·정책", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w", pady=(4, 4))
+        ctk.CTkLabel(
+            container, text="이 영역은 정식 배포 전 최종 안내 문구를 작성할 예정입니다.",
+            anchor="w", text_color="gray",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        placeholder_sections = [
+            "수집 기준 안내",
+            "보안 확인 및 부분 저장 안내",
+            "유지보수 / A/S 안내",
+            "라이선스 안내",
+            "사용자 주의사항",
+        ]
+        for index, title in enumerate(placeholder_sections, start=2):
+            card = ctk.CTkFrame(container)
+            card.grid(row=index, column=0, sticky="ew", pady=(0, 10))
+            card.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+            ctk.CTkLabel(card, text="정식 배포 전 작성 예정", anchor="w", text_color="gray").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+
+    def _on_city_changed(self, _city: str):
+        self._reload_district_data()
+
+    def _reload_district_data(self):
+        """시/도가 바뀔 때 그 시/도의 구 목록으로 선택 상태를 완전히 새로
+        만든다(다른 시/도의 세부구역 데이터는 이어받지 않는다). 기본으로
+        _DEFAULT_DISTRICT(강동구)가 있으면 그것을, 없으면 첫 번째 구를
+        선택한다.
+        """
+        city = self.selected_city_var.get()
+        districts = REGION_DATA.get(city, [])
+        default_district = _DEFAULT_DISTRICT if _DEFAULT_DISTRICT in districts else (districts[0] if districts else None)
+
+        self.selected_district_vars = {name: ctk.BooleanVar(value=(name == default_district)) for name in districts}
+        self._subdivision_layers = {}
+        self.region_selection_vars = {}
+
+        self._render_district_checkboxes()
+        if default_district:
+            self._ensure_subregion_data_loaded(default_district)
+        self._render_subregion_selection_if_popup_open()
+        self._refresh_subdivision_view()
+
+    def _on_district_toggle(self, district: str):
+        """구 체크박스를 눌렀을 때: 새로 체크된 구면 세부구역 데이터를 로드하고
+        (전체 선택으로 초기화), 세부구역 화면/요약/예상 쿼리 수를 갱신한다.
+        체크 해제된 구는 region_selection_vars에서 지우지 않는다 - 다시
+        체크하면 이전 선택 상태가 그대로 남아 있어야 하기 때문이다.
+        """
+        var = self.selected_district_vars.get(district)
+        if var is not None and var.get():
+            self._ensure_subregion_data_loaded(district)
+        self._render_subregion_selection_if_popup_open()
+        self._update_district_summary()
+        self._refresh_subdivision_view()
+
+    def _ensure_subregion_data_loaded(self, district: str):
+        """이 구의 법정동/역상권 데이터가 아직 로드되지 않았으면 지금 로드하고
+        전체 선택 상태로 초기화한다(요구사항: 새로 선택된 구는 전체 선택)."""
+        if district in self._subdivision_layers:
             return
-        should_select = not all(var.get() for var in self.district_vars.values())
-        for var in self.district_vars.values():
-            var.set(should_select)
+        city = self.selected_city_var.get()
+        layers = load_region_layers(REGIONS_SAMPLE_PATH, city, district)
+        self._subdivision_layers[district] = layers
+        self.region_selection_vars[district] = {
+            "legal_dongs": {name: ctk.BooleanVar(value=True) for name in layers.get("legal_dongs", [])},
+            "landmarks": {name: ctk.BooleanVar(value=True) for name in layers.get("landmarks", [])},
+        }
 
-    def _handle_keyword_return(self, event):
-        if event.widget in (self.keyword_entry, self.keyword_entry._entry):
-            self.add_keyword()
-            return "break"
-        return None
+    def _is_subregion_popup_open(self) -> bool:
+        popup = self._subregion_popup
+        return popup is not None and popup.winfo_exists()
 
-    def add_keyword(self):
+    def _open_subregion_popup(self):
+        """"수집할 동/상권 설정" 버튼 클릭 시 팝업(Toplevel)을 연다.
+
+        이미 열려 있으면 새로 만들지 않고 기존 창을 앞으로 가져온다(중복
+        생성/상태 꼬임 방지). 팝업 안의 체크박스는 region_selection_vars의
+        BooleanVar를 그대로 공유하므로, 체크/해제는 즉시 실제 상태에 반영된다
+        - "적용"/"닫기"는 팝업을 닫고 메인 화면 요약을 갱신하는 역할만 한다.
+        """
+        if self._is_subregion_popup_open():
+            self._subregion_popup.lift()
+            self._subregion_popup.focus_force()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("수집할 동/상권 설정")
+        popup.geometry("560x620")
+        popup.minsize(480, 420)
+        popup.transient(self)
+        popup.grab_set()
+        popup.grid_rowconfigure(0, weight=1)
+        popup.grid_columnconfigure(0, weight=1)
+        # 사용자가 팝업의 닫기(X) 버튼을 눌러도 메인 요약이 갱신되도록 연결.
+        popup.protocol("WM_DELETE_WINDOW", self._close_subregion_popup)
+
+        container = ctk.CTkScrollableFrame(popup)
+        container.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+        container.grid_columnconfigure((0, 1, 2), weight=1)
+
+        button_row = ctk.CTkFrame(popup, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ctk.CTkButton(button_row, text="전체 선택", width=100, command=lambda: self._set_all_subregions(True)).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=lambda: self._set_all_subregions(False)).pack(side="left")
+        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_subregion_popup).pack(side="right")
+        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_subregion_popup).pack(side="right", padx=(0, 6))
+
+        self._subregion_popup = popup
+        self._subregion_popup_container = container
+        self._render_subregion_selection()
+
+    def _close_subregion_popup(self):
+        """팝업의 적용/닫기/창 닫기(X) 공통 처리 - 상태는 이미 실시간 반영되어
+        있으므로, 메인 화면 요약(선택 구 수/예상 쿼리 수)만 다시 계산하고
+        팝업을 정리한다."""
+        self._update_subdivision_summary()
+        popup = self._subregion_popup
+        self._subregion_popup = None
+        self._subregion_popup_container = None
+        if popup is not None:
+            try:
+                popup.grab_release()
+                popup.destroy()
+            except Exception:
+                pass
+
+    def _render_subregion_selection_if_popup_open(self):
+        """팝업이 열려 있을 때만 내용을 다시 그린다(닫혀 있으면 그릴 대상이
+        없으므로 스킵) - 지역/구 선택이 바뀔 때마다 호출된다."""
+        if self._is_subregion_popup_open():
+            self._render_subregion_selection()
+
+    def _build_subregion_checkbox_grid(self, parent, vars_dict: dict, start_row: int, columns: int = 3) -> int:
+        """vars_dict(이름 -> BooleanVar)의 각 항목을 체크박스로 그려 3열로 배치한다.
+
+        새 BooleanVar를 만들지 않고 이미 존재하는 var를 그대로 재사용한다 -
+        접혔다 펼쳐져도(또는 전체 선택/해제 버튼으로 바뀐 값이) 그대로
+        유지되어야 하기 때문이다. 반환값은 다음에 이어 그릴 row 번호다.
+        """
+        row = start_row
+        col = 0
+        for name, var in vars_dict.items():
+            ctk.CTkCheckBox(
+                parent, text=name, variable=var, command=self._update_subdivision_summary,
+            ).grid(row=row, column=col, sticky="w", padx=8, pady=3)
+            col += 1
+            if col >= columns:
+                col = 0
+                row += 1
+        if col != 0:
+            row += 1
+        return row
+
+    def _render_subregion_selection(self):
+        """팝업 컨테이너에 선택된 구마다 법정동/역상권 체크박스(데이터 있음)
+        또는 "준비 중" 안내(데이터 없음)를 순서대로 그린다. 전체 선택/해제
+        버튼은 팝업 하단에 한 번만 있으므로 여기서는 그리지 않는다."""
+        if not self._is_subregion_popup_open():
+            return
+        container = self._subregion_popup_container
+        for child in container.winfo_children():
+            child.destroy()
+
+        row = 0
+        for district in self.get_selected_districts():
+            legal_vars = self.region_selection_vars.get(district, {}).get("legal_dongs", {})
+            landmark_vars = self.region_selection_vars.get(district, {}).get("landmarks", {})
+
+            ctk.CTkLabel(
+                container, text=district, anchor="w",
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 2))
+            row += 1
+
+            if not legal_vars and not landmark_vars:
+                ctk.CTkLabel(
+                    container,
+                    text=f"이 지역의 세부구역 데이터는 아직 준비 중입니다.\n현재는 {district} 기준으로 수집합니다.",
+                    justify="left", anchor="w", text_color="gray",
+                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+                row += 1
+                continue
+
+            if legal_vars:
+                ctk.CTkLabel(
+                    container, text="법정동", anchor="w",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 2))
+                row += 1
+                row = self._build_subregion_checkbox_grid(container, legal_vars, row)
+
+            if landmark_vars:
+                ctk.CTkLabel(
+                    container, text="역/상권", anchor="w",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 2))
+                row += 1
+                row = self._build_subregion_checkbox_grid(container, landmark_vars, row)
+
+        if not self.get_selected_districts():
+            ctk.CTkLabel(container, text="선택된 구가 없습니다.", text_color="gray").grid(row=0, column=0, sticky="w")
+
+    def _set_all_subregions(self, select: bool):
+        # 요구사항: 전체 선택/해제는 "현재 선택된 모든 구"의 법정동/역상권에
+        # 적용한다. 선택 해제된 구의 캐시된 상태까지 건드려도 무해하다(그
+        # 구가 다시 체크되기 전까지는 쿼리 생성에 영향이 없으므로).
+        for district_vars in self.region_selection_vars.values():
+            for group in district_vars.values():
+                for var in group.values():
+                    var.set(select)
+        self._update_subdivision_summary()
+
+    def get_selected_subregions(self) -> dict:
+        """선택된 구별로 현재 체크된 법정동/역상권 이름 목록을 반환한다.
+
+        반환: {구이름: {"legal_dongs": [...], "landmarks": [...]}, ...}
+        (선택된 구 중 세부구역 데이터가 로드된 구만 키가 생긴다). 실제 수집
+        쿼리 반영은 _build_collection_queries()가 이 값을 읽어 처리한다.
+        """
+        result = {}
+        for district in self.get_selected_districts():
+            district_vars = self.region_selection_vars.get(district, {})
+            result[district] = {
+                "legal_dongs": [name for name, var in district_vars.get("legal_dongs", {}).items() if var.get()],
+                "landmarks": [name for name, var in district_vars.get("landmarks", {}).items() if var.get()],
+            }
+        return result
+
+    def _build_collection_queries(self) -> list[dict]:
+        """현재 UI 선택 상태(시/도 + 선택된 구들 + 세부구역 + 키워드)로 실제
+        수집 쿼리 목록을 만든다. 계산 자체는 Tk와 무관한 순수 함수
+        build_collection_queries에 위임한다(그래야 Tk 없이 단위 테스트할 수
+        있다). 자동 세분화가 꺼져 있으면 데이터가 있는 구도 구 기준
+        fallback으로만 처리한다.
+        """
+        city = self.selected_city_var.get()
         keyword = self.keyword_input_var.get().strip()
         if not keyword:
+            return []
+
+        selected_subregions = self.get_selected_subregions()
+        auto_subdivide = self.auto_subdivide_var.get()
+
+        district_selections = []
+        for district in self.get_selected_districts():
+            layers = self._subdivision_layers.get(district, {})
+            has_data = auto_subdivide and bool(layers.get("legal_dongs") or layers.get("landmarks"))
+            subregions: list[str] = []
+            if has_data:
+                entry = selected_subregions.get(district, {"legal_dongs": [], "landmarks": []})
+                subregions = entry["legal_dongs"] + entry["landmarks"]
+            district_selections.append({
+                "district": district,
+                "has_subregion_data": has_data,
+                "selected_subregions": subregions,
+            })
+        return build_collection_queries(city, district_selections, keyword)
+
+    def _estimate_query_count(self) -> int:
+        return len(self._build_collection_queries())
+
+    def _update_subdivision_summary(self):
+        selected_districts = self.get_selected_districts()
+        if not selected_districts:
+            self.subdivision_summary_var.set("선택된 구가 없습니다.")
             return
-        if keyword not in self.keywords:
-            self.keywords.append(keyword)
-            self._render_keyword_list()
-        self.keyword_input_var.set("")
+        query_count = self._estimate_query_count()
+        self.subdivision_summary_var.set(f"선택된 구: {len(selected_districts)}개\n예상 수집 쿼리: {query_count}개")
 
-    def remove_keyword(self, keyword: str):
-        self.keywords = [item for item in self.keywords if item != keyword]
-        self._render_keyword_list()
-
-    def clear_keywords(self):
-        self.keywords = []
-        self._render_keyword_list()
-
-    def _render_keyword_list(self):
-        for child in self.keyword_list_frame.winfo_children():
-            child.destroy()
-        if not self.keywords:
-            ctk.CTkLabel(self.keyword_list_frame, text="추가된 키워드가 없습니다.", text_color="gray").grid(row=0, column=0, sticky="w", padx=8, pady=8)
-            return
-        for row, keyword in enumerate(self.keywords):
-            ctk.CTkLabel(self.keyword_list_frame, text=keyword, anchor="w").grid(row=row, column=0, sticky="ew", padx=(8, 6), pady=4)
-            ctk.CTkButton(self.keyword_list_frame, text="X", width=34, height=26, fg_color="gray", command=lambda item=keyword: self.remove_keyword(item)).grid(row=row, column=1, padx=(0, 8), pady=4)
+    def _refresh_subdivision_view(self):
+        """자동 세분화 on/off에 따라 "수집할 동/상권 설정" 버튼 표시 여부만
+        갱신한다(선택 상태 자체는 건드리지 않음 - 그건
+        _ensure_subregion_data_loaded/_set_all_subregions 몫). 요약 문구(선택
+        구 수 + 예상 쿼리 수)는 자동 세분화 여부와 무관하게 항상 갱신한다.
+        데이터 없는 구만 선택된 경우에도 팝업에서 "준비 중" 안내를 보여줘야
+        하므로, 버튼은 선택된 구가 있으면 항상 표시한다(데이터 유무로
+        숨기지 않음 - UI-CLEANUP-1C까지는 데이터 없으면 버튼 자체를 숨겼지만,
+        여러 구 중 일부만 데이터가 없는 경우를 다루기 어려워 팝업 분리와
+        함께 정리했다)."""
+        if not self.auto_subdivide_var.get() or not self.get_selected_districts():
+            self.subregion_popup_button.grid_remove()
+        else:
+            self.subregion_popup_button.grid()
+        self._update_subdivision_summary()
 
     def log(self, message: str):
         self.after(0, self._append_log, message)
@@ -280,7 +852,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
     def _set_left_panel_state(self, state: str):
         for widget in self._iter_children(self.left_panel):
-            if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkEntry, ctk.CTkRadioButton)):
+            if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkEntry, ctk.CTkRadioButton, ctk.CTkOptionMenu)):
                 widget.configure(state=state)
 
     def _iter_children(self, parent):
@@ -303,12 +875,6 @@ class SalesDbCrawlerApp(ctk.CTk):
     def show_error(self, title: str, message: str):
         self.after(0, lambda: messagebox.showerror(title, message))
 
-    def on_mode_change(self):
-        if self.mode_var.get() == "premium":
-            self.output_path_var.set("output/naver_place_premium_db.xlsx")
-        else:
-            self.output_path_var.set("output/naver_place_basic_db.xlsx")
-
     def _reset_eta_state(self, total_queries: int):
         self._cancel_eta_timer()
         self.completed_queries = 0
@@ -318,6 +884,16 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.total_pause_time = 0.0
         self.current_pause_start = None
         self.total_queries = total_queries
+
+    def _reset_collection_stats(self):
+        # 총 발견/최종 저장 예정은 이번 실행에서 실제로 집계된 값을 반영한다.
+        # 중복 제거는 현재 파이프라인이 쿼리 간 dedup을 추적하지 않으므로
+        # (ARCH-300C 계층형 큐 미연결) 항상 0으로 둔다 - 실제로 연결되기 전까지
+        # 근거 없는 숫자를 보여주지 않기 위함이다.
+        self.total_found_count = 0
+        self.total_found_var.set("총 발견: 0개")
+        self.duplicate_removed_var.set("중복 제거: 0개")
+        self.final_expected_var.set("최종 저장 예정: 0개")
 
     def _cancel_eta_timer(self):
         if not self.eta_after_id:
@@ -409,20 +985,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log("[ui] 중지 요청: 현재 진행 중인 수집이 끝난 후 중단됩니다.")
         self.set_status("중지 요청됨")
 
-    def _get_selected_regions(self):
-        city = self.selected_city_var.get().strip()
-        selected_districts = [district for district, var in self.district_vars.items() if var.get()]
-        if selected_districts:
-            return [f"{city} {district}" for district in selected_districts]
-        return [city] if city else []
-
-    def _build_query_queue(self, regions: list[str], keywords: list[str]) -> list[dict]:
-        return [
-            {"region": region, "keyword": keyword, "query": f"{region} {keyword}"}
-            for region in regions
-            for keyword in keywords
-        ]
-
     def _filter_by_review_count(self, places, min_val, max_val):
         filtered_places = []
         for row in places or []:
@@ -436,27 +998,48 @@ class SalesDbCrawlerApp(ctk.CTk):
             filtered_places.append(row)
         return filtered_places
 
+    def _validate_single_keyword(self, raw_keyword: str) -> str | None:
+        """다중 키워드로 보이는 입력이면 에러 메시지를, 문제 없으면 None을 반환한다.
+
+        _MULTI_KEYWORD_PATTERN(쉼표/세미콜론/슬래시/파이프/가운뎃점/줄바꿈)에
+        걸리는 입력만 차단한다. "카페 미용실"처럼 공백만 있는 입력은 하나의
+        검색어로 볼 수 있으므로 막지 않는다.
+        """
+        if _MULTI_KEYWORD_PATTERN.search(raw_keyword):
+            return "현재 버전은 키워드 1개만 지원합니다.\n여러 키워드 수집은 안정성 문제로 제공하지 않습니다."
+        return None
+
     def start_crawl(self):
-        regions = self._get_selected_regions()
-        keywords = [keyword.strip() for keyword in self.keywords if keyword.strip()]
+        raw_keyword = self.keyword_input_var.get()
         output_path = self.output_path_var.get().strip()
         mode = self.mode_var.get()
         new_open_only = self.new_open_only_var.get()
         review_min_raw = self.review_min_var.get().strip()
         review_max_raw = self.review_max_var.get().strip()
 
-        if not regions:
-            self.log("[ui] 실패: 지역을 선택하세요")
+        if not self.get_selected_districts():
+            self.log("[ui] 실패: 구를 1개 이상 선택하세요")
             return
-        if not keywords:
+
+        # 다중 키워드 UI를 제거한 대신, 다중 키워드로 보이는 입력은 수집 시작
+        # 전에 막는다(§_validate_single_keyword).
+        keyword_error = self._validate_single_keyword(raw_keyword)
+        if keyword_error:
+            self.log(f"[ui] 실패: {keyword_error}")
+            self.show_error("키워드 입력 오류", keyword_error)
+            return
+
+        keyword = raw_keyword.strip()
+        if not keyword:
             self.log("[ui] 실패: 키워드를 입력하세요")
             return
+
         try:
             limit = int(self.limit_var.get().strip())
             if limit <= 0:
                 raise ValueError
         except ValueError:
-            self.log("[ui] 실패: 수집 개수는 양수여야 합니다")
+            self.log("[ui] 실패: 목표 수집 개수는 양수여야 합니다")
             return
         try:
             review_min = int(review_min_raw) if review_min_raw else None
@@ -468,9 +1051,19 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.log("[ui] 실패: 저장 경로가 비어 있습니다")
             return
 
-        query_queue = self._build_query_queue(regions, keywords)
+        # 선택된 구/세부구역 상태를 실제 쿼리로 변환한다(§_build_collection_queries).
+        # 세부구역 데이터가 있는 구에서 법정동/역상권을 전부 해제했거나, 선택된
+        # 구/세부구역이 전혀 없으면 쿼리가 0개가 되므로 여기서 차단한다.
+        query_queue = self._build_collection_queries()
+        if not query_queue:
+            message = "수집할 지역 또는 동/상권이 선택되지 않았습니다.\n최소 1개 이상의 구 또는 세부구역을 선택해주세요."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("지역/세부구역 선택 오류", message)
+            return
+
         first_job = query_queue[0]
         self._reset_eta_state(len(query_queue))
+        self._reset_collection_stats()
         self.pause_event.clear()
         self.btn_pause.configure(text="일시정지")
         self.stop_event.clear()
@@ -483,14 +1076,12 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.last_output_path = output_path
 
         self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
-        self.log(f"[ui] 선택 지역 수={len(regions)}")
-        self.log(f"[ui] 선택 키워드 수={len(keywords)}")
-        self.log(f"[ui] 선택 모드={mode}")
-        self.log(f"[ui] 수집 개수={limit}")
+        self.log(f"[ui] 선택 구={', '.join(self.get_selected_districts())}")
+        self.log(f"[ui] 키워드={keyword}")
+        self.log(f"[ui] 목표 수집 개수={limit}(검색 조합 1개당 상한, 쿼리 {len(query_queue)}개)")
         self.log(f"[ui] 저장 경로={output_path}")
-        self.log(f"[ui] 신규오픈 필터={self.new_open_only_var.get()} (TODO)")
-        self.log(f"[ui] 온라인 채널 필터={self.online_channel_var.get()} (TODO)")
-        self.log(f"[ui] 리뷰 수 필터={self.review_min_var.get()}~{self.review_max_var.get()} (TODO)")
+        self.log(f"[ui] 신규오픈 필터={new_open_only}")
+        self.log(f"[ui] 리뷰 수 필터={self.review_min_var.get()}~{self.review_max_var.get()}")
 
         threading.Thread(
             target=self._run_queue_pipeline,
@@ -543,6 +1134,8 @@ class SalesDbCrawlerApp(ctk.CTk):
 
     def _collect_premium_query_legacy(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
         # Stage 3C까지의 모바일+PC 병합 premium 로직(fallback/롤백용, 현재 호출부 없음).
+        # UI에서 "빠른 수집(모바일)" 선택 자체는 사라졌지만, 엔진 코드는 삭제하지
+        # 않는다(요청 범위: UI 노출 제거만, 크롤러 엔진 대규모 변경 금지).
         self.log("[ui] Premium Mode: 기본 데이터(전화번호) 수집 중...")
         with contextlib.redirect_stdout(LogWriter(self.log)):
             mobile_raw = crawl_places(query, limit, new_open_only=new_open_only, stop_event=self.stop_event, pause_event=self.pause_event)
@@ -563,6 +1156,12 @@ class SalesDbCrawlerApp(ctk.CTk):
         return merged_data, mobile_data, pc_data
 
     def _run_queue_pipeline(self, query_queue: list[dict], limit: int, output_path: str, mode: str, new_open_only=False, review_min=None, review_max=None):
+        # 정합성 참고(UI-CLEANUP-1D-B): limit은 아래 for 루프에서 매 쿼리마다
+        # 그대로 재사용된다(전체 누적 목표가 아니라 쿼리 1개당 상한) - 쿼리가
+        # 여러 개면 전체 raw 수집량은 limit x len(query_queue)까지 늘어날 수
+        # 있고, 쿼리 간 place_id dedup은 아직 이 파이프라인에 연결되지 않았다.
+        # 이 사실을 감추지 않기 위해 목표 개수 UI 문구에서 "조기 종료" 표현을
+        # 제거했다(§_build_target_count_section, §self.limit_var).
         all_merged_data = []
         all_mobile_data = []
         all_pc_data = []
@@ -602,6 +1201,10 @@ class SalesDbCrawlerApp(ctk.CTk):
                 mobile_rows = list(mobile_data or [])
                 pc_rows = list(pc_data or [])
 
+                # "총 발견"은 이번 쿼리에서 필터 적용 전 확보한 raw 건수를 누적한다.
+                self.total_found_count += len(merged_rows)
+                self.after(0, self.total_found_var.set, f"총 발견: {self.total_found_count}개")
+
                 if mode == "premium" and (review_min is not None or review_max is not None):
                     before_count = len(merged_rows)
                     merged_rows = self._filter_by_review_count(merged_rows, review_min, review_max)
@@ -615,6 +1218,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                     basic_rows = merged_rows or mobile_rows
                     all_merged_data.extend(basic_rows)
                     all_mobile_data.extend(mobile_rows or basic_rows)
+                self.after(0, self.final_expected_var.set, f"최종 저장 예정: {len(all_merged_data)}개")
                 self._record_query_complete(self.current_query_start_time, query_pause_time_at_start)
                 self._set_queue_progress(index, total)
                 self.log(f"[{index}/{total}] {region} / {keyword} 수집 완료")
@@ -659,11 +1263,10 @@ class SalesDbCrawlerApp(ctk.CTk):
                 self.set_status("보안 확인 감지 — 부분 저장됨")
                 self.show_info(
                     "보안 확인 감지",
-                    "네이버 보안 확인으로 인해 수집을 안전하게 중단했습니다.\n"
-                    "현재까지 수집된 결과는 정상 저장되었습니다.\n"
+                    "보안 확인이 감지되어 수집을 중단했습니다.\n"
+                    "우회하지 않고 현재까지 수집된 결과를 저장합니다.\n"
                     "짧은 시간에 반복 실행하면 차단이 강화될 수 있습니다.\n"
-                    "잠시 후 다시 시도해 주세요.\n"
-                    "※ 보안 확인은 우회하지 않습니다.",
+                    "잠시 후 다시 시도해 주세요.",
                 )
             elif was_stopped:
                 self.set_status("사용자 중단")
@@ -704,6 +1307,3 @@ class SalesDbCrawlerApp(ctk.CTk):
 def run_app():
     app = SalesDbCrawlerApp()
     app.mainloop()
-
-
-
