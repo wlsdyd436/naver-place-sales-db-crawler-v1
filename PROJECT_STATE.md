@@ -1117,4 +1117,77 @@ Premium Mode 통합 결과 필드:
 - **리뷰수**: 기존 로직(`visitorReviewCount`/`reviewCount`/`blogReviewCount` 중 첫 확인값)이 이미 숫자/문자열 모두 크래시 없이 처리하고 있어 로직 변경 없음. 방문자/블로그 리뷰 분리가 필요해지면 확장할 수 있도록 주석만 보강.
 - **플레이스 URL**: `place/{id}/home` 제네릭 세그먼트는 PoC 단계의 임시 구성이며 실제 리다이렉트 유효성은 미검증이라는 점을 주석으로 명확히 함(검증은 PoC-2 이상으로 이관, 이번 단계에서 live 재검증하지 않음).
 - 테스트: `tests/test_pc_network_list_scraper.py`에 category list join, 인스타/블로그/일반 도메인/URL list 분류 테스트 5종 추가(총 14 PASS / FAIL 0). live 재실행 없이 fixture만으로 검증.
+
+
+# 2026-07-08 ARCH-300 PoC-2 page=1→2 전환 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 목표
+PoC-1이 관찰한 page=1 응답에 이어, 상세 카드 클릭/entryIframe 진입 없이 페이지네이션
+"2"번 버튼만 클릭해 page=2 전환 후에도 추가 Network 응답이 관찰되는지, 새 place_id가
+확보되는지 확인한다.
+
+## 구현
+- `scratchpad/arch300_network_probe/poc2_page2_probe.py` 신규(live probe, UI/pipeline 미연결).
+- `src/pc/network_list_scraper.py`에 PoC-2용 공통 유틸 추가:
+  - `_map_item_to_row`에 선택적 `source_page` 키워드 인자 추가(내부 디버그 메타, 미전달 시 기존 PoC-1 호출과 완전히 하위 호환, Excel 11컬럼에는 노출되지 않음).
+  - `build_candidate_record`: 후보 response 관찰 기록을 일관된 dict로 조립하는 유틸(여러 probe 스크립트가 공용).
+- probe 스크립트는 `src/pc/list_scraper._click_next_page`(페이지네이션 클릭)와 `src/pc/safety.classify_exception`(CAPTCHA 판정)을 **읽기 전용으로 재사용**했다(두 파일 모두 무수정). page=2 전환은 프로덕션 엔진과 동일한 로직으로 시도했다.
+- `tests/test_pc_network_list_scraper.py`에 4종 추가(총 20 PASS / FAIL 0): page 간 seen 공유 시 place_id 기준 dedup, 중복 없을 때 row 수 증가, `source_page` 내부 메타가 `exporter.MERGED_COLUMNS`(11컬럼)에 없음(Excel 비노출) 확인, `build_candidate_record` 형태 검증.
+
+## PoC-2 live 실행 결과 (1회, 재시도 없음)
+- keyword: 서울특별시 강동구 카페
+- page=1 최초 렌더링 직후, **페이지 텍스트 기반 CAPTCHA 마커 검사에서 `captcha_detected=True`가 발생하여 page=2 클릭을 시도조차 하지 않고 즉시 중단**했다(지침대로 우회 시도 없이 안전하게 종료).
+- page1 candidate responses: 1건, page1 raw items: 20건, dedup 20건(=PoC-1과 동일하게 정상 파싱 성공).
+- page2 candidate responses/raw items/dedup: 전부 0건(시도 자체를 안 했으므로).
+- `page2_click_attempted=false`, `page2_click_succeeded=false`.
+
+## 판단 — 이번 CAPTCHA 감지는 오탐(false positive)일 가능성이 높음
+- `captcha_detected=true`이면서도 **동일 응답에서 20건이 완전히 정상 파싱**된 것은 모순적이다. 실제 CAPTCHA가 콘텐츠 로드를 막았다면 이렇게 깨끗하게 20건이 나오기 어렵다.
+- 이는 2026-07-01 CAPTCHA 감지 타이밍 진단 기록과 정확히 일치하는 패턴이다: `#wtm-captcha-root`류 요소/문자열은 **페이지 최초 로드 시점부터 DOM에 상시 존재할 수 있으며, `is_visible()`은 그 구간에서 한 번도 True를 반환하지 않았다.** 이번 PoC-2의 `_looks_like_captcha_text`는 `page.content()` 전체 텍스트에서 `"captcha"`/`"wtm-captcha"` 등 **단순 substring 존재 여부만** 검사했으므로, 실제 활성 보안 확인 여부와 무관하게 상시 오탐할 수 있는 구조였다(가시성 미확인).
+- 즉 이번 실행은 "page=2에서 CAPTCHA가 실제로 재현되었다"는 근거가 아니라, **PoC-2 스크립트 자체의 감지 로직 한계로 page=2 가설을 아직 검증하지 못한 상태**로 봐야 한다.
+
+## 결과
+- page=1→2 전환 여부: **미검증**(시도하지 않음).
+- CAPTCHA/429/보안 확인 발생 여부: 페이지 텍스트 마커 기준 "감지됨"으로 기록되었으나, 위 판단에 따라 **실제 활성 CAPTCHA인지는 불확실(오탐 가능성 높음)**.
+- 300개 가능 여부: 여전히 미확정. **이번 단계에서는 page=2 확장 가능성조차 실측하지 못했다.**
+
+## 다음 작업
+- limit=30/50/100 등 규모 확장 테스트로 넘어가지 않는다(page=2 자체가 아직 미검증).
+- 다음 PoC-2 재시도(별도 승인 후 1회) 전에 CAPTCHA 감지 로직을 보강해야 한다: 단순 substring 검사 대신 `is_visible()` 기반 가시성 확인, 또는 `browser_session.probe_captcha_dom_present`처럼 이미 검증된 방식을 참고하거나, 클릭 실패 예외 기반 판정(`classify_exception`)에 더 무게를 두는 방향 검토.
+- 진단 정확도를 높인 뒤 동일 조건(서울특별시 강동구 카페, page=1→2)으로 PoC-2를 1회 재시도.
+
+
+# 2026-07-08 ARCH-300 PoC-2R CAPTCHA 감지 보정 및 page=1→2 재실험 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+직전 PoC-2는 page.content() 전체 텍스트의 단순 substring 검색으로 CAPTCHA를 오탐(20건이
+정상 파싱됐음에도 captcha_detected=True)해 page=2 클릭 자체를 시도하지 못했다(INCONCLUSIVE).
+이번 PoC-2R은 감지 로직을 가시성 기반 3단계로 보정한 뒤 동일 조건으로 1회 재실험했다.
+
+## 감지 로직 보정
+- `src/pc/network_list_scraper.py`에 `classify_captcha_signal(*, marker_present_in_dom, element_visible, bounding_box_area, click_exception_message)` 신설. Playwright 객체를 직접 다루지 않는 순수 함수(원시 신호를 호출자가 넘겨야 함 - fixture로 테스트 가능).
+  - `passive_captcha_marker_found`: DOM/HTML에 마커 존재(가시성 무관) - **중단 근거 아님, 기록만**.
+  - `active_captcha_detected`: 마커가 실제로 보이고(is_visible) 의미 있는 크기(bounding_box_area>0) - **중단 근거**.
+  - `click_intercepted_by_captcha`: 클릭 예외 메시지에 CAPTCHA 키워드 포함(`safety.is_captcha_or_security_message` 읽기 전용 재사용) - **중단 근거**.
+- `scratchpad/arch300_network_probe/poc2_page2_probe.py`를 전면 보정: `page.content()` 단순 텍스트 검사를 제거하고, `browser_session._CAPTCHA_PROBE_SELECTORS`(읽기 전용 재사용)로 각 마커 selector의 `count()`/`is_visible()`/`bounding_box()`를 직접 확인해 `classify_captcha_signal`에 넘기는 방식으로 교체. `src/pc/browser_session.py`, `src/pc/list_scraper.py`, `src/pc/safety.py`는 이번에도 무수정(읽기 전용 재사용만).
+- 테스트: `tests/test_pc_network_list_scraper.py`에 3종 추가(총 25 PASS / FAIL 0) - passive만 있으면 중단 안 함, 가시성+크기 확인 시 active로 분류, 클릭 예외의 wtm-captcha-root가 강한 신호(click_intercepted_by_captcha)로 분류.
+
+## PoC-2R live 실행 결과 (1회, 재시도 없음)
+- keyword: 서울특별시 강동구 카페
+- page=1: candidate responses 1건, raw items 20건, dedup 20건. **passive_captcha_marker_found=True, active_captcha_detected=False**(마커는 DOM에 있지만 `element_visible=False`, `bounding_box_area=0.0` - 상시 존재 placeholder임이 직접 확인됨) → 기록만 하고 page=2 클릭 계속 시도.
+- page=2: `_click_next_page(frame, 2)` **클릭 성공**(예외 없음, `click_intercepted_by_captcha=False`). 클릭 후 3~5초 대기 후 재확인해도 여전히 passive만 있고 active 없음.
+- page=2: candidate responses 1건, **raw items 70건, dedup 70건(page=1의 20건과 place_id 중복 0건, 전부 신규)**.
+- **총 dedup row 수: 90건**(page=1의 20건 + page=2의 70건).
+- `status_429_seen=false`.
+- 상세 데이터 품질(저장된 상위 20건 = page=1분 전량) 확인 결과 업체명/업종(join 정상)/리뷰수/주소/대표전화/플레이스 URL/인스타 분류 모두 PoC-1.1 보정이 그대로 정상 반영됨. 다만 이번 저장 파일은 top 20만 기록해 page=2 표본은 개별 확인하지 못했고, 90건 중 dedup 카운트(정량 지표)로만 page=2 성공을 확인함.
+
+## 판단
+- **직전 PoC-2의 CAPTCHA 감지는 오탐이었음이 확인됨.** 가시성 기반으로 재확인한 결과 실제로는 active CAPTCHA도, 클릭 차단도 없었다.
+- **page=1→2 전환은 실제로 성공**했고, CAPTCHA 없이 90건(20+70)을 확보했다 - PERF-4/SAFE-1V(카드 클릭 기반 엔진)에서 page=2 진입 시 반복적으로 CAPTCHA가 발생했던 것과 대조적으로, **카드 클릭 없이 페이지네이션만 사용하는 이번 접근에서는 같은 지점에서 CAPTCHA가 재현되지 않았다.** 이는 ARCH-300의 핵심 가설(클릭 볼륨을 줄이면 CAPTCHA 리스크가 낮아진다)과 일치하는 고무적인 신호다.
+- 다만 **1회 실행 결과이며, 300개 가능 여부는 여전히 미확정.** page=3 이상, 더 큰 규모(50/100개 후보)에서도 동일하게 안전한지는 별도 검증이 필요하다.
+
+## 다음 작업
+- page=3까지 확장하거나(다음 PoC 후보), 현재 90건 규모에서 안정성을 한 번 더 재확인하는 것 중 우선순위 판단 필요.
+- 300개 목표를 위해서는 여러 페이지에 걸친 반복 전환이 필요하므로, page 수가 늘어날수록 CAPTCHA 리스크가 다시 커질 가능성은 배제할 수 없음 - 규모를 단계적으로(예: page=3, 이어서 page=5) 늘려가며 매 단계 CAPTCHA 신호를 3단계 판정으로 재확인하는 점진적 접근을 권장.
+- 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음.
 - release_candidate 생성은 위 리스크 검토 완료 전까지 보류.

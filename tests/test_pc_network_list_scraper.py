@@ -9,9 +9,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.exporter import MERGED_COLUMNS
 from src.pc.network_list_scraper import (
     _extract_list_items,
     _map_item_to_row,
+    build_candidate_record,
+    classify_captcha_signal,
     dedup_rows,
     is_candidate_response,
 )
@@ -289,6 +292,161 @@ def check_homepage_url_list_classified_individually(reporter: ValidationReporter
         reporter.fail(f"URL list 분류 결과가 예상과 다름: {row}")
 
 
+# ---------------------------------------------------------------------------
+# PoC-2: page 간 병합 dedup / source_page 내부 메타 검증
+# ---------------------------------------------------------------------------
+
+
+def check_multi_page_merge_dedup_by_place_id(reporter: ValidationReporter) -> None:
+    """page=1 rows + page=2 rows를 같은 seen으로 이어 붙일 때 place_id 기준으로
+    중복이 제거되는지 확인한다(PoC-2: 페이지 전환 후 응답을 이어붙이는 시나리오
+    모사, seen을 페이지 간 재사용하는 것이 실제 probe 스크립트의 방식과 동일)."""
+    page1_items = [
+        {"id": "111111", "name": "카페 A"},
+        {"id": "222222", "name": "카페 B"},
+    ]
+    page2_items = [
+        {"id": "111111", "name": "카페 A"},  # page=1과 동일 업체(중복) -> 제외되어야 함
+        {"id": "333333", "name": "카페 C"},
+    ]
+
+    seen: set = set()
+    page1_rows = dedup_rows(
+        [_map_item_to_row(item, "2026-07-08", source_page=1) for item in page1_items], seen
+    )
+    page2_rows = dedup_rows(
+        [_map_item_to_row(item, "2026-07-08", source_page=2) for item in page2_items], seen
+    )
+    merged = page1_rows + page2_rows
+
+    place_ids = [row["place_id"] for row in merged]
+    ok = len(merged) == 3 and len(place_ids) == len(set(place_ids)) and "111111" in place_ids and "333333" in place_ids
+    if ok:
+        reporter.pass_("page=1/page=2 응답을 같은 seen으로 이어붙이면 place_id 기준 중복(111111)이 제거됨")
+    else:
+        reporter.fail(f"page 간 병합 dedup 결과가 예상과 다름: place_ids={place_ids}")
+
+
+def check_multi_page_merge_grows_when_no_duplicates(reporter: ValidationReporter) -> None:
+    """page=2에 겹치는 place_id가 전혀 없으면, 병합 후 총 row 수가 page=1 + page=2
+    개수만큼 그대로 증가하는지 확인한다(PoC-2의 핵심 가설: 새 place_id가 있으면
+    총 확보량이 늘어나야 함)."""
+    page1_items = [{"id": "111111", "name": "카페 A"}, {"id": "222222", "name": "카페 B"}]
+    page2_items = [{"id": "444444", "name": "카페 D"}, {"id": "555555", "name": "카페 E"}, {"id": "666666", "name": "카페 F"}]
+
+    seen: set = set()
+    page1_rows = dedup_rows([_map_item_to_row(item, "2026-07-08") for item in page1_items], seen)
+    page2_rows = dedup_rows([_map_item_to_row(item, "2026-07-08") for item in page2_items], seen)
+
+    if len(page1_rows) == 2 and len(page2_rows) == 3 and len(page1_rows + page2_rows) == 5:
+        reporter.pass_("중복 place_id가 없으면 병합 후 총 row 수가 page=1+page=2 개수만큼 증가함")
+    else:
+        reporter.fail(f"증가분 검증 결과가 예상과 다름: page1={len(page1_rows)}, page2={len(page2_rows)}")
+
+
+def check_source_page_internal_meta_not_in_excel_columns(reporter: ValidationReporter) -> None:
+    """source_page는 디버그용 내부 메타일 뿐, exporter의 실제 Excel 11컬럼
+    (MERGED_COLUMNS)에는 절대 포함되지 않아야 한다(place_id와 동일한 관례)."""
+    row = _map_item_to_row({"id": "777777", "name": "카페 G"}, "2026-07-08", source_page=2)
+
+    ok = (
+        row.get("source_page") == 2
+        and "source_page" not in MERGED_COLUMNS
+        and "place_id" not in MERGED_COLUMNS
+    )
+    if ok:
+        reporter.pass_("source_page는 row에는 포함되지만 exporter.MERGED_COLUMNS(11컬럼)에는 없어 Excel 비노출")
+    else:
+        reporter.fail(f"source_page 내부 메타 처리 결과가 예상과 다름: row={row}, MERGED_COLUMNS={MERGED_COLUMNS}")
+
+    # source_page를 전달하지 않으면(PoC-1 기존 호출 방식) row에 아예 키가 생기지 않아야 함(하위 호환).
+    row_without_source_page = _map_item_to_row({"id": "888888", "name": "카페 H"}, "2026-07-08")
+    if "source_page" not in row_without_source_page:
+        reporter.pass_("source_page 미전달 시 row에 해당 키 자체가 생기지 않음(기존 PoC-1 호출 하위 호환)")
+    else:
+        reporter.fail(f"source_page 미전달인데 키가 생김: {row_without_source_page}")
+
+
+def check_build_candidate_record_shape(reporter: ValidationReporter) -> None:
+    record = build_candidate_record(
+        "https://map.naver.com/p/api/search/allSearch?query=x",
+        200,
+        "xhr",
+        top_level_keys=["result"],
+    )
+    ok = (
+        record["url"] == "https://map.naver.com/p/api/search/allSearch?query=x"
+        and record["status"] == 200
+        and record["resource_type"] == "xhr"
+        and record["top_level_keys"] == ["result"]
+        and record["parse_error"] is None
+    )
+    if ok:
+        reporter.pass_("build_candidate_record가 후보 응답 메타를 예상 형태로 조립")
+    else:
+        reporter.fail(f"build_candidate_record 결과가 예상과 다름: {record}")
+
+    error_record = build_candidate_record("https://x", 500, "fetch", parse_error="ValueError: bad json")
+    if error_record["top_level_keys"] == [] and error_record["parse_error"] == "ValueError: bad json":
+        reporter.pass_("build_candidate_record가 파싱 실패(parse_error)도 예외 없이 기록")
+    else:
+        reporter.fail(f"build_candidate_record 실패 케이스 결과가 예상과 다름: {error_record}")
+
+
+# ---------------------------------------------------------------------------
+# PoC-2R: CAPTCHA 감지 오탐 보정(classify_captcha_signal) 검증
+# ---------------------------------------------------------------------------
+
+
+def check_captcha_signal_passive_marker_does_not_halt(reporter: ValidationReporter) -> None:
+    """DOM에 마커는 있지만 실제로 보이지 않는 경우(2026-07-01/07-08 관찰과 동일한
+    상시 존재 placeholder 패턴) - 중단 근거(active/click_intercepted)가 되면 안 된다."""
+    signal = classify_captcha_signal(marker_present_in_dom=True, element_visible=False)
+    should_halt = signal["active_captcha_detected"] or signal["click_intercepted_by_captcha"]
+    ok = signal["passive_captcha_marker_found"] is True and should_halt is False
+    if ok:
+        reporter.pass_("passive marker만 있으면 active/click_intercepted가 전부 False라 중단 근거가 되지 않음")
+    else:
+        reporter.fail(f"passive-only 신호 처리 결과가 예상과 다름: {signal}")
+
+
+def check_captcha_signal_visible_indicator_is_active(reporter: ValidationReporter) -> None:
+    """마커가 실제로 화면에 보이고 유의미한 크기를 가지면 active로 분류되어 중단 근거가 된다."""
+    signal = classify_captcha_signal(marker_present_in_dom=True, element_visible=True, bounding_box_area=1234.0)
+    should_halt = signal["active_captcha_detected"] or signal["click_intercepted_by_captcha"]
+    if signal["active_captcha_detected"] is True and should_halt is True:
+        reporter.pass_("가시성+유의미한 크기가 확인되면 active_captcha_detected=True로 중단 신호가 됨")
+    else:
+        reporter.fail(f"visible indicator 처리 결과가 예상과 다름: {signal}")
+
+    zero_area_signal = classify_captcha_signal(marker_present_in_dom=True, element_visible=True, bounding_box_area=0.0)
+    if zero_area_signal["active_captcha_detected"] is False:
+        reporter.pass_("가시성은 True여도 bounding_box_area=0이면 active로 판정하지 않음(방어적)")
+    else:
+        reporter.fail(f"bounding_box_area=0 처리 결과가 예상과 다름: {zero_area_signal}")
+
+
+def check_captcha_signal_click_exception_is_strong_signal(reporter: ValidationReporter) -> None:
+    """클릭 예외 메시지에 wtm-captcha-root 등 CAPTCHA 키워드가 있으면
+    click_intercepted_by_captcha=True로 강한 신호로 분류되어 중단 근거가 된다."""
+    message = (
+        'Timeout 3000ms exceeded. <div id="wtm-captcha-root">...</div> '
+        "subtree intercepts pointer events"
+    )
+    signal = classify_captcha_signal(click_exception_message=message)
+    should_halt = signal["active_captcha_detected"] or signal["click_intercepted_by_captcha"]
+    if signal["click_intercepted_by_captcha"] is True and should_halt is True:
+        reporter.pass_("클릭 예외 메시지의 wtm-captcha-root가 click_intercepted_by_captcha로 분류되어 중단 신호가 됨")
+    else:
+        reporter.fail(f"클릭 예외 분류 결과가 예상과 다름: {signal}")
+
+    unrelated_signal = classify_captcha_signal(click_exception_message="TimeoutError: element not found")
+    if unrelated_signal["click_intercepted_by_captcha"] is False:
+        reporter.pass_("CAPTCHA와 무관한 클릭 예외는 click_intercepted_by_captcha=False로 유지됨")
+    else:
+        reporter.fail(f"무관 예외 처리 결과가 예상과 다름: {unrelated_signal}")
+
+
 def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) -> None:
     cases = {
         "allsearch xhr": (True, "https://map.naver.com/p/api/search/allSearch?query=x", "xhr"),
@@ -324,6 +482,13 @@ def main() -> int:
     check_homepage_blog_url_classified_as_blog(reporter)
     check_homepage_generic_url_classified_as_homepage(reporter)
     check_homepage_url_list_classified_individually(reporter)
+    check_multi_page_merge_dedup_by_place_id(reporter)
+    check_multi_page_merge_grows_when_no_duplicates(reporter)
+    check_source_page_internal_meta_not_in_excel_columns(reporter)
+    check_build_candidate_record_shape(reporter)
+    check_captcha_signal_passive_marker_does_not_halt(reporter)
+    check_captcha_signal_visible_indicator_is_active(reporter)
+    check_captcha_signal_click_exception_is_strong_signal(reporter)
     check_is_candidate_response_filters_correctly(reporter)
 
     reporter.summary()

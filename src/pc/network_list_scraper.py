@@ -15,6 +15,11 @@
 # 네이버 내부 응답의 JSON 구조는 비공식/미문서화이며 사전 예고 없이 바뀔 수 있다.
 # 따라서 모든 파싱은 방어적으로 작성한다: 알려진 경로를 우선 시도하고, 실패하면
 # 휴리스틱으로 재귀 탐색하며, 그래도 실패하면 예외를 던지지 않고 빈 값을 반환한다.
+#
+# safety.is_captcha_or_security_message는 읽기 전용으로 재사용한다(src/pc/safety.py는
+# 수정하지 않는다) - 클릭 예외 메시지의 CAPTCHA/보안 차단 키워드 판정 로직을
+# 중복 구현하지 않기 위함이다.
+from src.pc.safety import is_captcha_or_security_message
 
 _CANDIDATE_RESOURCE_TYPES = ("xhr", "fetch")
 
@@ -265,13 +270,16 @@ def _build_place_url(item: dict) -> str:
     return f"https://pcmap.place.naver.com/place/{place_id}/home"
 
 
-def _map_item_to_row(item: dict, collected_at: str) -> dict:
+def _map_item_to_row(item: dict, collected_at: str, *, source_page: int | None = None) -> dict:
     """네트워크 응답의 업체 item 하나를 기존 Excel 11컬럼 row(dict)로 매핑한다.
 
-    입력: item(dict, 응답에서 추출된 업체 하나), collected_at(수집일 문자열).
-    출력: exporter.MERGED_COLUMNS(11컬럼)와 동일한 키를 가진 dict + 내부 필드 place_id.
-    place_id는 dedup/디버그용 내부 필드일 뿐이며, exporter가 MERGED_COLUMNS로만
-    투영하므로 Excel에는 노출되지 않는다(detail_scraper 경로와 동일한 관례).
+    입력: item(dict, 응답에서 추출된 업체 하나), collected_at(수집일 문자열),
+    source_page(선택, PoC-2: 이 행이 어느 page 응답에서 나왔는지 디버그용으로
+    남기고 싶을 때만 전달).
+    출력: exporter.MERGED_COLUMNS(11컬럼)와 동일한 키를 가진 dict + 내부 필드
+    place_id(+source_page, 전달된 경우). place_id/source_page는 dedup/디버그용
+    내부 필드일 뿐이며, exporter가 MERGED_COLUMNS로만 투영하므로 Excel에는
+    노출되지 않는다(detail_scraper 경로와 동일한 관례).
 
     새로오픈여부는 리스트 응답만으로는 신뢰할 수 있는 값을 확인하지 못해 PoC
     단계에서는 항상 빈칸이다(추후 응답 구조 추가 확인 후 채울 후보). 홈페이지/
@@ -284,7 +292,7 @@ def _map_item_to_row(item: dict, collected_at: str) -> dict:
     homepage_raw = _first_raw_value(item, _FIELD_KEY_CANDIDATES["홈페이지"])
     homepage, insta, blog = _classify_external_links(homepage_raw)
 
-    return {
+    row = {
         "업체명": _first_present(item, _FIELD_KEY_CANDIDATES["업체명"]),
         "업종": _extract_category(item),
         "새로오픈여부": "",  # PoC 단계: 신뢰할 수 있는 필드 미확인
@@ -297,6 +305,81 @@ def _map_item_to_row(item: dict, collected_at: str) -> dict:
         "인스타": insta,
         "블로그": blog,
         "place_id": _first_present(item, _ID_KEY_CANDIDATES),
+    }
+    if source_page is not None:
+        row["source_page"] = source_page
+    return row
+
+
+def build_candidate_record(url: str, status, resource_type: str, *, top_level_keys=None, parse_error=None) -> dict:
+    """live probe 스크립트가 관찰한 후보 response 하나를 요약 dict로 조립한다.
+
+    PoC-1/PoC-2 등 여러 probe 스크립트가 동일한 형태로 관찰 로그(JSON)를 남기도록
+    돕는 유틸이다. 이 함수는 Playwright response 객체를 직접 다루지 않는다(그
+    처리 - url/status/resource_type 추출, response.json() 시도 - 는 호출자인
+    probe 스크립트가 이미 완료했다는 전제이며, 이 함수는 결과를 dict로 정리만
+    한다). 이 모듈이 "브라우저를 직접 다루지 않고 관찰 결과만 가공한다"는
+    원칙을 유지하기 위함이다.
+
+    top_level_keys/parse_error는 probe 스크립트가 response.json() 파싱을
+    시도한 결과(성공 시 최상위 키 목록, 실패 시 에러 메시지)를 그대로 넘기면
+    된다.
+    """
+    return {
+        "url": url,
+        "status": status,
+        "resource_type": resource_type,
+        "top_level_keys": list(top_level_keys) if top_level_keys else [],
+        "parse_error": parse_error,
+    }
+
+
+def classify_captcha_signal(
+    *,
+    marker_present_in_dom: bool = False,
+    element_visible: bool = False,
+    bounding_box_area: float = 0.0,
+    click_exception_message: str = "",
+) -> dict:
+    """관찰된 원시 신호를 CAPTCHA/보안 확인 판정 3단계로 조합한다(PoC-2R 오탐 보정).
+
+    이 함수는 Playwright page/locator 객체를 직접 다루지 않는다. locator.count(),
+    locator.is_visible(), bounding_box() 같은 실제 브라우저 호출은 probe
+    스크립트가 미리 수행해 bool/문자열로 넘겨야 한다 - 그래야 live 브라우저
+    없이 fixture만으로 테스트할 수 있다.
+
+    2026-07-01/2026-07-08 관찰(PROJECT_STATE.md 기록): "#wtm-captcha-root" 같은
+    마커 요소/문자열은 페이지 최초 로드 시점부터 DOM에 상시 존재할 수 있지만
+    is_visible()이 한 번도 True를 반환하지 않는 경우가 있다(활성 챌린지가
+    아니라 항상 존재하는 static placeholder). 따라서 "DOM에 존재한다"는 사실
+    만으로는 활성 CAPTCHA로 판정하지 않는다(오탐 방지).
+
+    반환 3개 키(중단 판단은 호출자가 active_captcha_detected 또는
+    click_intercepted_by_captcha만 근거로 사용해야 한다 - passive만 있으면
+    기록만 하고 계속 진행):
+      - passive_captcha_marker_found: 마커가 DOM/HTML에 존재(가시성 무관).
+        단독으로는 중단 근거가 아니다.
+      - active_captcha_detected: 마커가 실제로 보이고(element_visible) 의미
+        있는 크기(bounding_box_area > 0)를 가짐. 중단 근거로 사용한다.
+      - click_intercepted_by_captcha: 클릭 시도 중 발생한 예외 메시지에
+        CAPTCHA/보안 차단 키워드가 포함됨(safety.is_captcha_or_security_message
+        재사용). pointer event가 실제로 가로채였다는 가장 신뢰도 높은 신호이며,
+        중단 근거로 사용한다.
+
+    확장 포인트: 새로운 CAPTCHA 판정 신호(예: 특정 응답 status 코드)를 추가하려면
+    이 함수에 키워드 인자를 추가하고 반환 dict에 반영한다.
+    """
+    marker_present_in_dom = bool(marker_present_in_dom)
+    element_visible = bool(element_visible)
+    active = marker_present_in_dom and element_visible and bounding_box_area > 0
+    click_intercepted = bool(click_exception_message) and is_captcha_or_security_message(
+        click_exception_message
+    )
+
+    return {
+        "passive_captcha_marker_found": marker_present_in_dom,
+        "active_captcha_detected": active,
+        "click_intercepted_by_captcha": click_intercepted,
     }
 
 
