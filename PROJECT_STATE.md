@@ -1499,3 +1499,61 @@ unique row가 300 이상이 되는 즉시 남은 쿼리를 실행하지 않고 �
 - 정적 지역 데이터 자산화(전국 법정동/역상권, 공개 출처 기반)는 여전히 별도 태스크로 분리.
 - 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류).
 - CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토 완료 전까지 보류.
+
+# 2026-07-09 ARCH-300C PoC-8 업종 재현성 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+PoC-7의 강동구 "카페" target=300 조기 종료 성공(17개 쿼리 실행, 300 도달)을
+"카페"라는 단일 업종에 일반화하지 않기 위해, 같은 강동구 지역 레이어(법정동
+9개/역상권 6개, Tier1→Tier2→Tier3 순서)를 그대로 두고 **업종 키워드만
+"음식점"/"미용실"로 바꿔** 재현성을 확인했다. Tier3 세부업종은 카페 전용
+(디저트카페 등) 대신 음식점=한식/중식/일식, 미용실=남성미용실/여성미용실/
+헤어샵을 사용했다(둘 다 자연스러운 한국어 검색어로 판단되어 생략하지 않음).
+`src/pc/region_expander.py`/`network_list_scraper.py`/`region_data.py`/
+테스트는 이번에도 **무수정**(PoC-6/7의 기존 함수만 재사용). 각 업종 live는
+1회만 실행, 재시도 없음.
+
+## 구현
+- `scratchpad/arch300_network_probe/poc8_keyword_repro_probe.py` 신규 — PoC-7 구조를 키워드별 설정(KEYWORD_CONFIGS: food=음식점/한식·중식·일식, hair=미용실/남성미용실·여성미용실·헤어샵)로 일반화. 명령줄 인자로 업종을 선택해 각각 별도 실행(`python poc8_keyword_repro_probe.py food`, `hair`).
+
+## PoC-8 live 실행 결과 (업종별 1회, 재시도 없음)
+
+### 음식점 — **active CAPTCHA로 4번째 쿼리에서 안전 중단**
+- Tier1(법정동) 진행 중 4번째 쿼리("서울특별시 강동구 암사동 음식점")에서 `active_captcha_detected=True`(passive placeholder가 아니라 실제 가시성+유의미한 크기가 확인된 신호) 발생 → **즉시 안전 중단, 우회 시도 없음**.
+- `executed_query_count=4`, `skipped_query_count=20`, `before_trim_unique_count=80`, `final_unique_count=80`(target=300 미도달), `stop_reason=active_captcha`, `stopped_after_query_index=4`.
+- `total_raw_items=80`, `duplicate_count=0`, `duplicate_rate=0%`(4개 쿼리 모두 신규, CAPTCHA 발생 전까지는 카페와 동일한 100% 신규 패턴).
+- `total_wall_seconds=27.328`, `rows_per_second≈2.93`.
+- Tier1만: raw=80/unique=80/dup=0/avg_efficiency=1.0(중단 전까지는 정상 패턴).
+- `passive_captcha_marker_found=True`, `status_429_seen=False`.
+
+### 미용실 — **24개 쿼리 전부 완주, target=300 근접 미달(290건)**
+- CAPTCHA/429 전혀 발생하지 않고 큐 소진까지 정상 진행.
+- `executed_query_count=24`, `skipped_query_count=0`, `before_trim_unique_count=290`, `final_unique_count=290`(target=300 미도달), `stop_reason=queue_exhausted`.
+- `total_raw_items=448`, `duplicate_count=158`, `duplicate_rate=35.27%`(카페 PoC-7의 9.12%보다 훨씬 높음).
+- `total_wall_seconds=161.092`, `rows_per_second≈1.80`.
+- **Tier별**: tier1(법정동) raw=180/unique=180/dup=0%/avg_efficiency=1.0(카페와 동일하게 완벽). tier2(역/상권) raw=109/unique=50/dup=54.13%/avg_efficiency=0.462(카페의 0.8583보다 크게 낮음). tier3(세부업종) raw=159/unique=60/dup=62.26%/avg_efficiency=0.3519 - 특히 "헤어샵"(천호동/성내동/길동 전부 unique_added=0)과 "여성미용실"(성내동/길동 unique_added=0)은 이미 확보한 "미용실"/"남성미용실" 결과와 거의 완전히 겹쳐 **사실상 낭비 쿼리**였다.
+- `active_captcha_detected=False`, `passive_captcha_marker_found=True`, `status_429_seen=False`.
+
+## 카페(PoC-7) 대비 비교
+
+| 업종 | target=300 도달 | 실행/스킵 | before_trim | final | dup률 | CAPTCHA | 소요시간 |
+|---|---|---|---|---|---|---|---|
+| 카페(PoC-7) | **성공**(17번째 쿼리) | 17/7 | 309 | 300 | 9.12% | 없음 | 115.22s |
+| 음식점 | 실패(안전 중단) | 4/20 | 80 | 80 | 0%(중단 전까지) | **active 발생(4번째 쿼리)** | 27.33s |
+| 미용실 | 실패(큐 소진, 10건 부족) | 24/0 | 290 | 290 | 35.27% | 없음 | 161.09s |
+
+## 판단 — "카페" 1회 성공이 다른 업종에 그대로 일반화되지 않음이 실측으로 확인됨
+- **음식점은 카페보다 훨씬 어렵다(위험하다)**: 동일한 지역 레이어, 동일한 Tier 순서인데도 **4번째 법정동 쿼리에서 실제 active CAPTCHA가 발생**했다. Tier1의 앞 3개 쿼리(천호동/성내동/길동)는 카페와 동일하게 raw=20/unique=20/dup=0의 완벽한 패턴이었으나, 4번째(암사동)에서 신호가 바뀌었다 - 이는 PoC-2/PoC-3에서 확인된 "오탐 아닌 실제 신호" 판정 기준(가시성+유의미한 크기)을 그대로 만족했으므로 오탐이 아니라 **실제 CAPTCHA 트리거**로 판단한다. 다만 원인은 아직 불명확하다(업종 키워드 자체의 검색량/트래픽 특성 때문인지, 단순히 이번 실행 시점의 우연인지는 1회 표본으로는 구분 불가).
+- **미용실은 카페보다 쉽지 않다(target 미달)**: CAPTCHA/429는 없었지만 세부업종(Tier3) 확장의 절반가량이 사실상 중복(헤어샵/여성미용실 다수가 unique_added=0)이라 300에 10건 못 미친 290건에서 큐가 소진됐다. Tier1(법정동)은 업종과 무관하게 항상 100% 신규(180건)로 안정적이었지만, Tier2/3(역상권/세부업종) 확장 효율은 업종별로 크게 다르다는 것이 이번 실측의 핵심 발견이다.
+- **공통적으로 확인된 것**: Tier1(법정동 baseline)은 카페/음식점(중단 전까지)/미용실 전부에서 raw=20/unique=20/dup=0%로 동일하게 완벽했다 - 법정동 기반 baseline 자체는 업종과 무관하게 안정적인 것으로 보인다(1회 표본 기준). 반면 확장 레이어(Tier2/3)의 효율과, 심지어 CAPTCHA 발생 여부까지도 업종별로 다르다.
+
+## 300개 제품 흐름에 대한 현재 판단(강동구 표본 기준으로 제한)
+- **강동구 표본 1회 실측 기준으로, target=300 조기 종료 흐름은 "카페"에서는 성공했지만 "음식점"에서는 실제 CAPTCHA로 안전 중단됐고 "미용실"에서는 300에 못 미쳤다(290건).** "임의의 업종에서 항상 300을 안전하게 달성한다"는 주장은 이번 실측으로 명백히 성립하지 않는다.
+- 특히 음식점에서의 active CAPTCHA 발생은, **업종/키워드에 따라 CAPTCHA 트리거 빈도가 달라질 수 있다는 새로운 리스크 신호**다. "카페 24개 연속 안전"이라는 이전 PoC-4~7의 결과를 다른 업종에도 안전하다고 확대 해석해서는 안 된다.
+- 이는 제품화 판단에 있어 LEGAL_NOTICE 4항(대량 자동화 미포함) 재조정 필요성뿐 아니라, **업종별 안전성 편차를 감안한 추가 실측(더 많은 업종·더 많은 반복)이 필요하다**는 점을 함께 시사한다.
+
+## 다음 작업
+- 음식점 CAPTCHA 발생이 업종 특성 때문인지 우연인지 확인하기 위한 추가 반복 실측(다른 시점/다른 구)은 신중히 검토 - 반복 실측 자체가 노출을 늘리는 트레이드오프가 있음을 인지.
+- 미용실의 Tier3(헤어샵/여성미용실) 낭비 쿼리 패턴처럼, 업종별로 "효율적인 세부업종 후보"가 다를 수 있음 - `low_efficiency` 신호를 활용한 사전 필터링(REGION-DATA-1 설계 §6) 필요성이 이번 실측으로 더 명확해짐.
+- 정적 지역 데이터 자산화, UI/pipeline 연결, LEGAL_NOTICE/README 정식 수정은 여전히 별도 태스크로 보류(제품 배선 결정 시점까지).
+- CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토(이번 업종별 편차 포함) 완료 전까지 보류.
