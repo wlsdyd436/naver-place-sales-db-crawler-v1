@@ -1429,3 +1429,73 @@ UI/pipeline 미연결, page=1만(page=2 이상 클릭 없음).
 - 정적 지역 데이터 자산화(전국 법정동/역상권, 공개 출처 기반)는 여전히 별도 태스크로 분리.
 - 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류) - **300개 목표를 실제로 초과 달성한 이번 결과는 오히려 LEGAL_NOTICE 4항(대량 자동화 미포함)과의 재조정 필요성을 더 높인다.**
 - CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토 완료 전까지 보류.
+
+# 2026-07-09 ARCH-300C PoC-7 target=300 조기 종료 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+PoC-6은 `should_stop_for_target`을 계산만 하고 큐를 끝까지(24개 쿼리) 실행했다.
+PoC-7은 이 target_limit=300 조기 종료를 **실제 중단 조건으로 적용**해, 누적
+unique row가 300 이상이 되는 즉시 남은 쿼리를 실행하지 않고 멈추는 제품형
+흐름을 검증했다. 또한 PoC-6 실측(Tier2 역/상권 avg_efficiency=0.7667 > Tier3
+세부업종 0.4778)을 반영해 **Tier 실행 순서를 Tier1→Tier2→Tier3로 변경**했다
+(기존 PoC-6은 Tier1→Tier3→Tier2). 여전히 제품 기능 확정이 아니며 UI/pipeline
+미연결, page=1만(page=2 이상 클릭 없음).
+
+## 구현
+- `scratchpad/arch300_network_probe/poc7_target_300_probe.py` 신규 — PoC-6 구조를 재사용하되, 매 쿼리 후 `should_stop_for_target(cumulative_unique_before_trim, 300)`을 실제 중단 조건으로 적용. 안전 중단(429/active CAPTCHA)이 target 도달보다 항상 우선한다. 최종 결과는 `all_unique_rows[:300]`으로 trim. `src/pc/region_expander.py`/`network_list_scraper.py`/`region_data.py`는 **무수정**(PoC-6에서 이미 만든 `build_tiered_query_queue`의 `enabled_tiers=("tier1","tier2","tier3")` 인자와 `should_stop_for_target`/`classify_query_efficiency`만으로 이번 실험 요구가 전부 충족됨).
+- `tests/test_pc_region_expander.py`/`test_pc_network_list_scraper.py`/`test_pc_region_data.py` 무변경 - 사전 확인 결과 회귀 0(13/39/3 PASS 유지).
+
+## PoC-7 live 실행 결과 (1회, 재시도 없음)
+- 대상: 서울특별시 강동구, Tier1(법정동 9개×카페) → Tier2(역/상권 6개×카페) → Tier3(천호동/성내동/길동×세부업종). 총 24개 쿼리 중 **17개만 실행, target=300 도달로 정상 조기 종료**.
+
+| 순번 | Tier | 쿼리 | raw | unique_added | 누적(trim 전) |
+|---|---|---|---|---|---|
+| 1~9 | tier1 | 강동구 법정동 9개×카페 | 각 20 | 각 20 | 20→180 |
+| 10 | tier2 | 천호역 카페 | 20 | 17 | 197 |
+| 11 | tier2 | 강동역 카페 | 20 | 18 | 215 |
+| 12 | tier2 | 둔촌동역 카페 | 20 | 18 | 233 |
+| 13 | tier2 | 암사역 카페 | 20 | 15 | 248 |
+| 14 | tier2 | 고덕역 카페 | 20 | 18 | 266 |
+| 15 | tier2 | 명일역 카페 | 20 | 17 | 283 |
+| 16 | tier3 | 천호동 디저트카페 | 20 | 15 | 298 |
+| 17 | tier3 | 천호동 브런치카페 | 20 | 11 | **309(300 도달, 중단)** |
+
+- **target=300 도달 시점**: 17번째 쿼리("서울특별시 강동구 천호동 브런치카페", Tier3) 직후 누적 309에서 `should_stop_for_target=True` → 남은 7개 쿼리(길동/성내동 세부업종 잔여) 미실행.
+- `executed_query_count=17`, `skipped_query_count=7`, `before_trim_unique_count=309`, `final_unique_count=300`(정확히 300으로 trim 확인).
+- `total_raw_items=340`, `duplicate_count=31`, `duplicate_rate=9.12%`(PoC-6 24개 완주 시 25.41%보다 낮음 - Tier2를 먼저 실행하고 덜 실행해 고중복 Tier3 쿼리 상당수를 애초에 건너뛴 효과).
+- `total_wall_seconds=115.22`, `rows_per_second≈2.60`, `seconds_per_unique_row≈0.384`(PoC-6의 161.046초/24쿼리보다 빠름 - 조기 종료로 쿼리 수 자체가 줄어든 효과).
+- `active_captcha_detected=False`(17개 전부), `passive_captcha_marker_found=True`(전부, 기존과 동일 상시 placeholder), `click_intercepted_by_captcha=False`(구조적으로 클릭 없음), `status_429_seen=False`. `stop_reason="target_reached"`(안전 중단 아님, 정상적인 목표 도달 중단).
+
+**Tier별 기여(trim 전/후)**:
+
+| Tier | 실행 쿼리 수 | raw | unique(trim 전) | unique(trim 후) | dup률 | avg_efficiency |
+|---|---|---|---|---|---|---|
+| tier1(법정동) | 9 | 180 | 180 | 180 | 0% | 1.0 |
+| tier2(역/상권) | 6 | 120 | 103 | 103 | 14.17% | 0.8583 |
+| tier3(세부업종) | 2 | 40 | 26 | 17(마지막 쿼리 일부만 trim에 포함) | 35% | 0.65 |
+
+## 판단 — Tier2 우선 실행이 실측으로 효과 확인됨
+- **Tier 순서 변경이 실제로 효과가 있었다**: PoC-6(Tier1→Tier3→Tier2)은 300 도달에 21개 쿼리가 필요했지만, 이번(Tier1→Tier2→Tier3)은 **17개 쿼리**만으로 도달했다 - 4개 쿼리(약 17초 상당) 절약.
+- **target=300 조기 종료가 의도대로 정확히 동작했다**: 남은 7개 쿼리를 실행하지 않고 즉시 멈췄고, 최종 결과도 정확히 300개로 trim됨(before_trim 309 → final 300).
+- **trim 경계에 걸친 쿼리(17번째, 천호동 브런치카페)는 raw 20건 중 11건이 신규였지만, 그중 2건만 최종 300에 포함**되고 나머지 9건은 이미 306~309번째 슬롯이라 잘려나갔다 - trim이 쿼리 내부 항목까지 정교하게 자르는 것이 아니라 **"이미 확보한 row 리스트의 앞 300개"**를 취하는 방식이라, 마지막 쿼리에서 어떤 특정 업체가 실제로 최종본에 남는지는 응답 내 항목 순서에 좌우된다(우연적) - 이는 결과의 정확성 문제가 아니라, "정확히 300개"라는 요구를 만족시키는 자연스러운 trim 방식의 특성이다.
+- **CAPTCHA/429는 17개 연속 조회에서도 전혀 발생하지 않았다** - PoC-4~6에 이어 재확인된 긍정적 신호.
+- 중복률(9.12%)이 PoC-6 전체 실행(25.41%)보다 크게 낮아진 것은 데이터 자체가 좋아진 게 아니라 **고중복 구간(Tier3 후반)을 애초에 실행하지 않은 결과**이다 - target-stop이 "불필요한 저효율 쿼리 실행을 자동으로 줄이는" 부수 효과가 있음을 보여준다.
+
+## 결과 요약
+- target=300 도달 여부: **성공**(17번째 쿼리에서 누적 309로 도달, 조기 종료)
+- 실행/스킵 쿼리 수: **17 실행 / 7 스킵**(총 24개 중)
+- before_trim_unique_count / final_unique_count: **309 / 300**(정확히 trim됨)
+- 속도: `total_wall_seconds=115.22`, `rows_per_second≈2.60`(PoC-6보다 빠름 - 쿼리 수 감소 효과)
+- CAPTCHA/429: 전혀 발생하지 않음
+
+## 300개 제품 흐름에 대한 현재 판단(강동구 카페 1회 실측 기준으로 제한)
+- **강동구·"카페" 키워드·1회 실측 기준으로, target=300 조기 종료 흐름이 설계대로 정확히 동작함을 확인했다.** Tier2를 Tier3보다 먼저 실행하는 순서 변경도 실측으로 효과가 검증됨(21개→17개 쿼리로 단축).
+- 이 결과를 다른 구/다른 업종/다른 실행 시점까지 일반화할 수 있는지는 **여전히 미검증**이다(1회, 1개 구, 1개 키워드 표본의 한계). 특히 (a) 강동구가 아닌 구에서도 법정동 9개 baseline이 유지되는지, (b) 다른 업종 키워드에서도 Tier2>Tier3 우선순위가 유지되는지, (c) target 도달 지점이 매번 비슷한 쿼리 수(17개 안팎)에서 일어나는지는 추가 표본이 필요하다.
+- **300개를 실제로, 정확히, 조기 종료로 달성하는 흐름이 기술적으로 검증되었다는 사실은 제품화 결정 시 LEGAL_NOTICE 4항(대량 자동화 미포함) 재조정의 필요성을 다시 한 번 뒷받침한다** - 기술 검증과 제품 배선 승인은 여전히 별개다.
+
+## 다음 작업
+- 다른 구(강동구 외)·다른 업종 키워드로 표본을 늘려 Tier 우선순위/target 도달 쿼리 수 패턴이 재현되는지 확인.
+- target-stop이 저효율 쿼리를 자동으로 건너뛰는 부수 효과를 `low_efficiency` 기반 스킵 정책(REGION-DATA-1 설계 §6 소프트 적응)과 결합할지 여부는 별도 실험으로 판단.
+- 정적 지역 데이터 자산화(전국 법정동/역상권, 공개 출처 기반)는 여전히 별도 태스크로 분리.
+- 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류).
+- CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토 완료 전까지 보류.
