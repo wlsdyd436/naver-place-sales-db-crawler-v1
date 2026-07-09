@@ -15,10 +15,12 @@ from src.pc.network_list_scraper import (
     _map_item_to_row,
     build_candidate_record,
     classify_captcha_signal,
+    classify_query_efficiency,
     count_rows_by_field,
     count_rows_by_source_page,
     dedup_rows,
     is_candidate_response,
+    should_stop_for_target,
 )
 
 
@@ -598,6 +600,70 @@ def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) 
         reporter.fail(f"is_candidate_response 판별 실패 케이스: {failed}")
 
 
+# ---------------------------------------------------------------------------
+# PoC-6: classify_query_efficiency / should_stop_for_target 검증
+# ---------------------------------------------------------------------------
+
+
+def check_classify_query_efficiency_high_ratio_not_low(reporter: ValidationReporter) -> None:
+    """PoC-4/PoC-5의 '깨끗한 동'(raw=20, unique_added=20)처럼 비율이 높으면
+    low_efficiency=False가 되어야 한다."""
+    result = classify_query_efficiency(20, 20)
+    if result["efficiency_ratio"] == 1.0 and result["low_efficiency"] is False:
+        reporter.pass_("raw=20/unique_added=20이면 efficiency_ratio=1.0, low_efficiency=False")
+    else:
+        reporter.fail(f"높은 비율 처리 결과가 예상과 다름: {result}")
+
+
+def check_classify_query_efficiency_zero_unique_is_low(reporter: ValidationReporter) -> None:
+    """PoC-5의 성내제1~3동(raw=20, unique_added=0)처럼 신규 기여가 0이면
+    low_efficiency=True가 되어야 한다."""
+    result = classify_query_efficiency(20, 0)
+    if result["efficiency_ratio"] == 0.0 and result["low_efficiency"] is True:
+        reporter.pass_("raw=20/unique_added=0이면 efficiency_ratio=0.0, low_efficiency=True(PoC-5 성내제N동 재현)")
+    else:
+        reporter.fail(f"zero unique_added 처리 결과가 예상과 다름: {result}")
+
+
+def check_classify_query_efficiency_zero_raw_items_no_crash(reporter: ValidationReporter) -> None:
+    """raw_items가 0이면(응답 자체가 없음) 0으로 나누지 않고 ratio=0.0을 반환한다."""
+    result = classify_query_efficiency(0, 0)
+    if result["efficiency_ratio"] == 0.0 and result["low_efficiency"] is True:
+        reporter.pass_("raw_items=0이어도 예외 없이 efficiency_ratio=0.0으로 처리됨")
+    else:
+        reporter.fail(f"raw_items=0 처리 결과가 예상과 다름: {result}")
+
+
+def check_classify_query_efficiency_boundary_values(reporter: ValidationReporter) -> None:
+    """비율이 임계값(0.15) 이상이어도 unique_added가 절대 하한(3) 미만이면 low_efficiency다."""
+    result = classify_query_efficiency(10, 2)  # ratio=0.2 (>=0.15) 이지만 unique_added=2 (<3)
+    if abs(result["efficiency_ratio"] - 0.2) < 1e-9 and result["low_efficiency"] is True:
+        reporter.pass_("비율은 임계값 이상이어도 unique_added 절대 하한 미만이면 low_efficiency=True")
+    else:
+        reporter.fail(f"경계값 처리 결과가 예상과 다름: {result}")
+
+
+def check_should_stop_for_target_reaches_and_below(reporter: ValidationReporter) -> None:
+    """current_count가 target에 도달/초과하면 True, 미달이면 False."""
+    ok = (
+        should_stop_for_target(300, 300) is True
+        and should_stop_for_target(301, 300) is True
+        and should_stop_for_target(299, 300) is False
+    )
+    if ok:
+        reporter.pass_("should_stop_for_target이 target 도달/초과/미달을 정확히 판단함")
+    else:
+        reporter.fail("should_stop_for_target 도달 판정 결과가 예상과 다름")
+
+
+def check_should_stop_for_target_non_positive_target_is_false(reporter: ValidationReporter) -> None:
+    """target이 0 이하이면 current_count와 무관하게 항상 False(방어적 처리)."""
+    if should_stop_for_target(100, 0) is False and should_stop_for_target(100, -1) is False:
+        reporter.pass_("target<=0이면 should_stop_for_target이 항상 False를 반환함")
+    else:
+        reporter.fail("target<=0 처리 결과가 예상과 다름")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -624,6 +690,12 @@ def main() -> int:
     check_source_dong_and_query_internal_meta_not_in_excel_columns(reporter)
     check_count_rows_by_field_generic_aggregation(reporter)
     check_is_candidate_response_filters_correctly(reporter)
+    check_classify_query_efficiency_high_ratio_not_low(reporter)
+    check_classify_query_efficiency_zero_unique_is_low(reporter)
+    check_classify_query_efficiency_zero_raw_items_no_crash(reporter)
+    check_classify_query_efficiency_boundary_values(reporter)
+    check_should_stop_for_target_reaches_and_below(reporter)
+    check_should_stop_for_target_non_positive_target_is_false(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

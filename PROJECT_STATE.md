@@ -1339,3 +1339,93 @@ dedup이 이런 중복까지 실제로 흡수하는지 확인하기 위함이었
 - 정적 동 목록 데이터 자산화(법정동/행정동 정리 포함)는 별도 태스크로 분리, 이번 PoC 결과가 그 필요성을 실측으로 뒷받침함.
 - 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류), CAPTCHA 우회 시도 없음.
 - release_candidate 생성은 위 리스크 검토 완료 전까지 보류.
+
+# 2026-07-09 ARCH-300C PoC-6 계층형 검색어(Tier1/2/3) 신규 기여량 실험 기록 (기술 검증, 제품 기능 아님)
+
+## 배경
+PoC-5에서 법정동/행정동 혼합이 중복 폭증(41.51%)의 원인임이 확인됨에 따라
+(REGION-DATA-1 설계, Opus Plan Mode), 기본 큐를 법정동만으로 정리하고
+(Tier1), 300개 목표에 부족한 부분을 채울 확장 레이어 두 가지 -
+Tier3(같은 법정동을 세부업종으로 재조회), Tier2(역/상권명 확장) - 가 실제로
+유의미한 신규 기여를 만드는지 검증했다. 이번 PoC-6는 "300개 완성 실험"이
+아니라 **Tier별 신규 기여량 측정 실험**이다. 여전히 제품 기능 확정이 아니며
+UI/pipeline 미연결, page=1만(page=2 이상 클릭 없음).
+
+## 구현
+- `data/regions_kr_sample.json` 신규 — 강동구 샘플만 포함(법정동 9개/역상권 6개/세부업종 3개), 런타임 API 호출 없음. 전국 데이터 자산화는 이번 범위 아님.
+- `src/pc/region_expander.py` 확장 — 기존 `build_dong_queries`(Tier1)는 하위 호환 유지. `build_landmark_queries`(Tier2: 역/상권×업종), `build_subcategory_queries`(Tier3: 법정동×세부업종), `build_tiered_query_queue`(Tier를 순서대로 조합 + tier/source_layer 태깅) 신규 추가. 전부 순수 함수, 직접 API 호출 없음, 공백/중복/빈 입력 방어.
+- `src/pc/network_list_scraper.py`에 `classify_query_efficiency`(efficiency_ratio, low_efficiency 판정), `should_stop_for_target`(target 도달 판정) 순수 헬퍼 추가. 이번 PoC-6에서는 둘 다 **기록/관찰용으로만** 쓰고 자동 중단/스킵에는 사용하지 않음(실제 정책 적용은 PoC-7 이후).
+- `src/pc/region_data.py` 신규(선택 구현) — `data/regions_kr_sample.json`을 읽는 얇은 로더. 파일 없으면 `FileNotFoundError` 그대로 전파, city/gu 미존재 시 빈 레이어 반환.
+- `tests/test_pc_region_expander.py`(+7), `tests/test_pc_network_list_scraper.py`(+6), `tests/test_pc_region_data.py`(신규 3) — 전부 PASS, 기존 39개 회귀 0.
+- `scratchpad/arch300_network_probe/poc6_tiered_probe.py` 신규 — PoC-5 구조 재사용, `build_tiered_query_queue`로 Tier1→Tier3→Tier2 순서(총 24개 쿼리) page=1만 수집. `browser_session._CAPTCHA_PROBE_SELECTORS`는 무수정 읽기 전용 재사용.
+
+## PoC-6 live 실행 결과 (1회, 재시도 없음)
+- 대상: 서울특별시 강동구, Tier1(법정동 9개×카페) → Tier3(천호동/성내동/길동×디저트카페/브런치카페/베이커리카페) → Tier2(역/상권 6개×카페). **24개 전부 완주, 중단 없음.**
+
+**Tier1 — 법정동 baseline (9건)**
+
+| 동 | raw | unique_added | duplicate | efficiency_ratio |
+|---|---|---|---|---|
+| 천호동 | 20 | 20 | 0 | 1.0 |
+| 성내동 | 20 | 20 | 0 | 1.0 |
+| 길동 | 20 | 20 | 0 | 1.0 |
+| 암사동 | 20 | 20 | 0 | 1.0 |
+| 명일동 | 20 | 20 | 0 | 1.0 |
+| 고덕동 | 20 | 20 | 0 | 1.0 |
+| 상일동 | 20 | 20 | 0 | 1.0 |
+| 둔촌동 | 20 | 20 | 0 | 1.0 |
+| 강일동 | 20 | 20 | 0 | 1.0 |
+
+**Tier3 — 세부업종 확장 (9건, 천호동/성내동/길동 × 디저트카페/브런치카페/베이커리카페)**
+
+| 쿼리 | raw | unique_added | duplicate | efficiency_ratio |
+|---|---|---|---|---|
+| 천호동 디저트카페 | 20 | 15 | 5 | 0.75 |
+| 천호동 브런치카페 | 20 | 11 | 9 | 0.55 |
+| 천호동 베이커리카페 | 20 | 12 | 8 | 0.60 |
+| 성내동 디저트카페 | 20 | 10 | 10 | 0.50 |
+| 성내동 브런치카페 | 20 | 6 | 14 | 0.30 |
+| 성내동 베이커리카페 | 20 | 10 | 10 | 0.50 |
+| 길동 디저트카페 | 20 | 9 | 11 | 0.45 |
+| 길동 브런치카페 | 20 | 3 | 17 | 0.15 |
+| 길동 베이커리카페 | 20 | 10 | 10 | 0.50 |
+
+**Tier2 — 역/상권 확장 (6건)**
+
+| 쿼리 | raw | unique_added | duplicate | efficiency_ratio | 누적 unique |
+|---|---|---|---|---|---|
+| 천호역 카페 | 20 | 16 | 4 | 0.80 | 282 |
+| 강동역 카페 | 20 | 12 | 8 | 0.60 | 294 |
+| 둔촌동역 카페 | 20 | 17 | 3 | 0.85 | **311(300 초과)** |
+| 암사역 카페 | 26 | 21 | 5 | 0.8077 | 332 |
+| 고덕역 카페 | 26 | 18 | 8 | 0.6923 | 350 |
+| 명일역 카페 | 20 | 17 | 3 | 0.85 | 367 |
+
+**Tier별 요약**: Tier1 raw=180/unique=180/dup=0/dup률=0%/avg_efficiency=1.0. Tier3 raw=180/unique=86/dup=94/dup률=52.22%/avg_efficiency=0.4778. Tier2 raw=132/unique=101/dup=31/dup률=23.48%/avg_efficiency=0.7667.
+
+**전체 요약**: `total_raw_items=492`, `total_unique_rows=367`, `total_duplicate_count=125`, `duplicate_rate=25.41%`, `total_wall_seconds=161.046`, `rows_per_second≈2.28`, `seconds_per_unique_row≈0.439`, `query_count=24`, `avg_rows_per_query=15.29`. `active_captcha_detected=False`(24개 전부), `passive_captcha_marker_found=True`(전부, 기존과 동일 상시 placeholder), `click_intercepted_by_captcha=False`(구조적으로 클릭 없음), `status_429_seen=False`. `stop_reason=None`(끝까지 정상 완주).
+
+## 판단 — Tier2/Tier3 확장 모두 유의미한 신규 기여, Tier2가 더 효율적
+- **Tier1(법정동 baseline)만으로는 180건**(PoC-5와 동일 패턴 재확인: 동당 20건, 중복 0%).
+- **Tier3(세부업종)는 180 raw에서 86건 신규 기여**(avg_efficiency≈0.48) - "저효율"은 아니지만 Tier2보다 중복률이 높다(52.22%). 같은 법정동을 다른 업종명으로 재조회하면 이미 잡힌 업체가 절반 이상 다시 걸린다는 뜻.
+- **Tier2(역/상권)는 132 raw에서 101건 신규 기여**(avg_efficiency≈0.77) - 이번 실측에서 **Tier2가 Tier3보다 더 효율적**이었다(REGION-DATA-1 설계 문서의 "세부업종이 더 효율적일 것"이라는 가정과 반대 - 실측으로 뒤집힘, 정직하게 기록).
+- **누적 unique가 Tier2의 3번째 쿼리(둔촌동역, 21번째 전체 쿼리)에서 311건으로 300을 넘어섰다** - 강동구 **단일 구, page=1만, 24개 쿼리**로 300 목표를 실제로 초과 달성.
+- **24개 연속 page=1 조회에서도 CAPTCHA/429가 전혀 발생하지 않았다** - PoC-4/PoC-5에 이어 재확인된 긍정적 신호.
+- 다만 `efficiency_ratio` 임계값(<0.15 또는 unique_added<3)에 걸린 쿼리는 없었다(가장 낮은 길동 브런치카페도 정확히 ratio=0.15, unique_added=3으로 경계값 자체에 걸침 - `low_efficiency=False`로 정상 처리됨, 헬퍼의 경계 조건이 실측 데이터로도 검증됨).
+
+## 결과 요약
+- total unique row 수: **367건**(24개 쿼리, 492 raw 중) - 300 목표 초과
+- 중복률: **25.41%**(Tier1 0% / Tier3 52.22% / Tier2 23.48%)
+- 속도: `total_wall_seconds=161.046`, `rows_per_second≈2.28`
+- CAPTCHA/429: 전혀 발생하지 않음(24개 연속 조회에서도 안전)
+
+## 300개 목표에 대한 현재 추정(확정 아님)
+- 이번 실행 기준으로는 **강동구 단일 구 + Tier1/2/3 조합만으로 300개를 초과 달성했다(367건)**. 다만 이는 **1회 실행, 강동구 1개 구에 대한 표본**일 뿐이며, 다른 구/다른 업종 키워드에서도 동일 패턴(법정동 baseline 100% 신규, 역/상권 확장이 세부업종보다 효율적)이 재현되는지는 아직 검증되지 않았다.
+- 미검증 요소: (a) 다른 구/업종에서도 Tier2가 Tier3보다 효율적인 패턴이 유지되는지, (b) target=300 도달 시 실제로 조기 중단하는 정책(`should_stop_for_target` 실사용)의 효과, (c) 24개보다 더 많은 연속 조회에서의 CAPTCHA/429 누적 리스크, (d) 세부업종/역상권 목록의 정적 데이터 자산화 범위(현재는 강동구 샘플만).
+
+## 다음 작업
+- PoC-7: `should_stop_for_target`을 실제로 큐 중단 조건에 적용해 target=300 조기 종료 동작을 검증(이번 PoC-6는 관찰만 하고 중단하지 않음).
+- 다른 구(강동구 외)에서도 Tier2>Tier3 효율성 패턴이 재현되는지 추가 표본 확보.
+- 정적 지역 데이터 자산화(전국 법정동/역상권, 공개 출처 기반)는 여전히 별도 태스크로 분리.
+- 여전히 UI/pipeline 미연결, LEGAL_NOTICE/README 정식 수정 없음(제품 배선 결정 시점으로 계속 보류) - **300개 목표를 실제로 초과 달성한 이번 결과는 오히려 LEGAL_NOTICE 4항(대량 자동화 미포함)과의 재조정 필요성을 더 높인다.**
+- CAPTCHA 우회 시도 없음, release_candidate 생성은 법적/운영 리스크 검토 완료 전까지 보류.

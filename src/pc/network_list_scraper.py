@@ -465,3 +465,46 @@ def count_rows_by_field(rows, field: str, *, unknown_label: str = "unknown") -> 
             key = unknown_label
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+# PoC-6(REGION-DATA-1): 쿼리별 신규 기여도가 낮은지 판단하기 위한 임계값.
+# 확장 포인트: 실측 데이터가 쌓이면 이 상수만 조정한다(호출자 코드 변경 불필요).
+_LOW_EFFICIENCY_RATIO_THRESHOLD = 0.15
+_LOW_EFFICIENCY_MIN_UNIQUE_ADDED = 3
+
+
+def classify_query_efficiency(raw_items: int, unique_added: int) -> dict:
+    """쿼리 하나가 확보한 raw_items 대비 unique_added가 효율적인지 판단한다(PoC-6).
+
+    입력: raw_items(해당 쿼리 응답에서 나온 원시 항목 수), unique_added(전역
+    dedup 후 실제로 새로 추가된 행 수, unique_added는 raw_items 이하여야
+    정상이지만 이 함수는 그 관계를 검증하지 않는다 - 호출자가 이미 dedup_rows로
+    계산한 값을 그대로 전달한다는 전제).
+    출력: {"efficiency_ratio": float, "low_efficiency": bool}.
+
+    efficiency_ratio = unique_added / raw_items(raw_items가 0이면 0.0 - PoC-5의
+    "성내제1~3동처럼 raw는 있지만 unique_added=0"인 경우와, 응답 자체가 없어
+    raw_items=0인 경우를 구분하지 않고 둘 다 낮은 효율로 취급한다).
+
+    low_efficiency는 efficiency_ratio가 _LOW_EFFICIENCY_RATIO_THRESHOLD(0.15)
+    미만이거나 unique_added가 _LOW_EFFICIENCY_MIN_UNIQUE_ADDED(3) 미만이면
+    True다. PoC-6에서는 이 값을 기록만 하고 자동 중단/스킵에는 사용하지
+    않는다(호출자가 아직 그 정책을 적용하지 않기로 결정함) - 자동 스킵 정책은
+    별도 PoC에서 검증한다.
+    """
+    ratio = (unique_added / raw_items) if raw_items > 0 else 0.0
+    low_efficiency = ratio < _LOW_EFFICIENCY_RATIO_THRESHOLD or unique_added < _LOW_EFFICIENCY_MIN_UNIQUE_ADDED
+    return {"efficiency_ratio": ratio, "low_efficiency": low_efficiency}
+
+
+def should_stop_for_target(current_count: int, target: int) -> bool:
+    """누적 unique row 수(current_count)가 목표(target)에 도달했는지 판단한다(PoC-6).
+
+    target이 0 이하이면(목표가 없거나 잘못된 값) 항상 False를 반환한다(방어적
+    처리 - 의미 없는 target으로 조기 종료하지 않는다). PoC-6에서는 이 값을
+    관찰용으로만 기록하며, 실제 큐 순회를 이 값으로 중단하는 정책은 PoC-7에서
+    검증한다.
+    """
+    if target <= 0:
+        return False
+    return current_count >= target
