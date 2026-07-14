@@ -2233,3 +2233,228 @@ page/context가 이미 닫힌 상태일 수 있으므로 `try/except`로 감싸 
   이번에 추가한 `navigation_error` 신호를 상위에서 어떻게 다룰지(재시도 없이
   즉시 다음 쿼리로 넘어갈지, 큐 자체를 안전 중단할지)를 별도로 설계해야
   한다 - 이번 단계는 "구분만" 했고 "그 이후 정책"은 결정하지 않았다.
+
+# 2026-07-14 ARCH-300C WIRE-2B-1 오케스트레이터 오류 계약 + 브라우저 생명주기 구조(live 없음)
+
+## 배경
+WIRE-2A-B가 `collect_network_query()`의 navigation_error를 timeout/CAPTCHA/429
+와 분리했지만, 그 신호를 읽는 쪽(orchestrator)이 아직 없었다. 이번 단계는
+(1) `run_collection_plan()`이 navigation_error를 인식해 안전하게 중단하도록
+확장하고, (2) 사용자 중지를 위한 `should_continue` 계약을 추가하고, (3)
+브라우저 1개·context 1개를 큐 전체에서 공유하면서 쿼리마다 새 page를
+생성/종료하는 `NetworkBrowserCollector` 생명주기 구조를 구현했다. UI 배선,
+target_count UI, Excel 저장 연결, SAFE-1 UI 연결은 이번 범위에 없다. 전부
+fake session/context/page/collect_query로만 검증했고, 실제 BrowserSession/
+Playwright/네이버 접속은 없었다.
+
+## 변경 파일
+- `src/pc/network_pipeline.py`: `run_collection_plan()`에 `should_continue`
+  선택 인자 추가, `collect_query` 결과의 `navigation_error`/
+  `navigation_error_message`를 읽어 처리, 반환 dict에 두 필드 상시 포함.
+- `src/pc/network_browser_collector.py`: `NetworkBrowserCollector` 클래스와
+  `_default_session_factory()` 추가(기존 `collect_network_query`/
+  `_QueryObservationContext`/`_probe_captcha_state`/`_make_response_handler`
+  는 무변경).
+- `tests/test_pc_network_pipeline.py`: navigation_error/should_continue 관련
+  신규 5건 추가.
+- `tests/test_pc_network_browser_collector.py`: `NetworkBrowserCollector`
+  생명주기 fake 테스트 6건 추가.
+
+## navigation_error orchestrator 처리
+매 job마다 `collect_query(job, per_query_limit)` 호출 직후
+`result.get("navigation_error")`를 확인한다(필드가 없으면 falsy이므로 기존
+collect_query와 완전히 하위 호환). True면: 해당 job은
+`executed_query_count`에 포함하되 그 job의 rows는 global dedup에 누적하지
+않고(권장 정책 그대로 채택), 즉시 `stop_reason="navigation_error"`로
+break한다. `security_blocked`/`status_429_seen`은 건드리지 않으며(CAPTCHA/429
+와 절대 혼동하지 않음) `on_security_block`도 호출하지 않는다. 반환 dict에
+`navigation_error`(bool)/`navigation_error_message`(str)를 상시 포함시켰다.
+
+## should_continue 동작
+`run_collection_plan(..., should_continue: Callable[[], bool] | None = None)`.
+매 job 실행 직전(=`collect_query` 호출 전) `should_continue is not None and
+not should_continue()`이면 그 job의 `collect_query`를 호출하지 않고 즉시
+`stop_reason="user_stopped"`로 중단한다. `None`(기본값)이면 매 반복마다
+체크 자체를 건너뛰어 기존 동작과 완전히 동일하다. 사용자 중지 시
+`on_security_block`은 호출하지 않는다.
+
+## stop_reason 목록 변화
+기존 `target_reached`/`queue_exhausted`/`security_blocked`/`status_429`/
+`empty_jobs`에 `navigation_error`, `user_stopped` 2개가 추가되어 총 7종이
+되었다.
+
+## 중단 우선순위(매 job마다, 요청된 순서 그대로 구현)
+1) `should_continue()`가 False → `user_stopped`(collect_query 미호출).
+2) `collect_query` 실행.
+3) `navigation_error` → 즉시 중단(다음 쿼리 미실행 - navigation_error가
+   발생한 page/세션을 신뢰하지 않기 때문).
+4) active CAPTCHA / 5) HTTP 429 → 기존 `security_blocked`/`status_429` 정책
+   그대로 유지(우선순위·반환 계약 변경 없음).
+6) 정상 rows를 global dedup에 반영 → 7) `target_count` 도달 검사 → 8) 다음
+   job.
+
+## NetworkBrowserCollector 생명주기
+`src/pc/network_browser_collector.py`에 추가한 클래스는 "브라우저 1개 →
+context 1개 → [쿼리마다: new_page → collect_network_query → page.close()] →
+큐 종료 후 context/browser/playwright 종료" 구조를 구현한다.
+`__init__(*, collected_at, session_factory=None, settle_ms=5000)`,
+`__enter__`(session_factory() 결과를 `__enter__`해 `self._session` 보관),
+`collect_query(job, per_query_limit)`(run_collection_plan이 요구하는 2인자
+시그니처를 만족하는 bound method), `__exit__`(session의 `__exit__`를
+그대로 위임). `session_factory`가 없으면 `BrowserSession`
+(`src.pc.browser_session`)과 `DiagnosticConfig.safe_default()`
+(`src.pc.config`)를 참고한 기본 factory를 지연 import로 구성하지만, 이
+함수는 `NetworkBrowserCollector.__enter__`가 실제로 호출될 때만 실행되므로
+정의/참조만으로는 Playwright가 시작되지 않는다 - 이번 단계 테스트는 항상
+fake session_factory를 주입해 이 기본 경로 자체를 실행하지 않았다.
+BrowserSession의 실제 속성(`__enter__`가 반환하는 self, `.context`,
+Playwright `BrowserContext.new_page()`)만 사용했고 존재하지 않는 속성은
+가정하지 않았다.
+
+## 쿼리별 page 생성·종료 방식
+`collect_query`는 매 호출마다 `self._session.context.new_page()`로 새
+page를 만들어 `collect_network_query(page, job, per_query_limit,
+collected_at=..., settle_ms=...)`에 넘기고, `try/finally`의 `finally`에서
+`page.close()`를 best-effort(`try/except`)로 호출한다. `collect_network_query`
+의 반환값은 `return`으로 이미 확정된 뒤 `finally`가 실행되므로, `close()`가
+예외를 던져도(이미 닫힌 page, Target closed 등) 그 예외가 원래 반환값을
+덮어쓰지 않는다(Python의 `try/finally` 의미상 `finally` 내부에서 예외를
+삼켜야 `try`의 `return`이 보존된다는 점을 이용). 브라우저/context는 큐
+전체에서 재시작하지 않으며, CAPTCHA/429/navigation_error가 발생해도 이
+클래스 자체는 재시도나 context 재시작을 시도하지 않는다(안전 중단 판단은
+여전히 `run_collection_plan`의 책임).
+
+## fake 생명주기 테스트
+`tests/test_pc_network_browser_collector.py`에 `FakeLifecyclePage`/
+`FakeLifecycleContext`/`FakeLifecycleSession`(BrowserSession과 동일한
+컨텍스트 매니저 + `.context` 계약만 흉내)을 추가하고,
+`network_browser_collector.collect_network_query`를 모듈 속성 monkeypatch로
+교체해 실제 응답 관찰 없이 호출 인자만 기록하도록 했다(요청서 8절 "함수
+주입 또는 monkeypatch 가능한 작은 경계" 반영). 6개 필수 테스트: (1)
+browser/context 공유(session_factory·session.__enter__ 1회만 호출) / (2)
+쿼리별 page 생성(collect_query 3회 → new_page 3회) / (3) 쿼리별 page
+종료(생성된 각 page가 정확히 1회 close) / (4) collect_network_query 전달
+인자 검증(job/per_query_limit/collected_at/settle_ms/page) / (5) page close
+best-effort(close() 예외가 나도 원래 결과 유지) / (6) context manager
+teardown(정상 종료·collect_query 중 예외 발생 종료 모두 session `__exit__`
+호출 + page close 보장).
+
+## 신규/회귀 테스트 결과
+- `python -m py_compile src/pc/network_pipeline.py src/pc/network_browser_collector.py tests/test_pc_network_pipeline.py tests/test_pc_network_browser_collector.py` PASS.
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(기존 7건 + navigation_error/should_continue 신규 5건).
+- `tests/test_pc_network_browser_collector.py` 19건 전부 PASS(기존 13건 + 생명주기 신규 6건).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, collect_pc_full 미변경 확인).
+
+## UI·Excel·live 배선 여부
+**전부 하지 않음.** `src/ui.py`/`src/exporter.py`/`src/pc/pipeline.py`/
+`src/pc/safety.py`/기존 detail·list·basic·premium 경로 무수정. target_count
+UI 추가 없음, Network/List 기본 엔진 전환 없음, Excel 저장 배선 없음, SAFE-1
+UI 연결 없음. 실제 BrowserSession/Playwright/네이버 접속 없음, app.py/UI/
+build/EXE 실행 없음.
+
+## 다음 WIRE-2B-2 작업
+- `NetworkBrowserCollector` + `run_collection_plan`을 fake 조합으로 엔드투엔드
+  연결 검증(여전히 UI 미배선) - 이번 WIRE-2B-1은 두 계약을 각각 독립적으로만
+  검증했고 아직 함께 실행해보지 않았다.
+- navigation_error 발생 시 상위(향후 UI)가 사용자에게 어떤 메시지/재시도
+  안내를 보여줄지 설계(이번 단계는 orchestrator가 중단만 하고 안내 문구는
+  다루지 않음).
+- UI에 `target_count` 필드 추가 + `_run_network_pipeline` worker에서
+  `NetworkBrowserCollector`를 fake로 배선(여전히 live 아님)은 그 다음
+  단계(WIRE-2B-2 이후)로 유지.
+
+# 2026-07-14 ARCH-300C WIRE-2B-1B 기본 BrowserSession 어댑터 계약 검증(live 없음)
+
+## 배경
+WIRE-2B-1의 `NetworkBrowserCollector` 생명주기 테스트는 전부
+`session_factory`를 직접 주입한 `FakeLifecycleSession`(BrowserSession과
+`.context`/컨텍스트 매니저 계약만 흉내내며 `.page` 속성은 아예 없음) 기준
+이었다. 실제 제품 배선 시 쓰일 `_default_session_factory()`가 실제
+`BrowserSession`(browser/context와 함께 초기 page도 미리 만들어 두는 구조)과
+정확히 호환되는지는 검증하지 않은 상태였다. 이번 단계는 이 간극만 채웠다 -
+실제 Playwright는 여전히 실행하지 않고, `src.pc.browser_session.BrowserSession`
+클래스 자체를 monkeypatch한 fake로만 검증했다.
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`: `NetworkBrowserCollector.__enter__`에
+  `_close_initial_page_if_present()` 호출 추가(신규 메서드), docstring에
+  BrowserSession의 초기 page 처리 정책 명시. `browser_session.py`는 무수정.
+- `tests/test_pc_network_browser_collector.py`: `FakeBrowserSessionLike`,
+  `_run_with_fake_browser_session()` 헬퍼, 기본 factory 계약 검증 신규 5건
+  추가.
+
+## BrowserSession 실제 속성/생명주기(재확인, 임의 가정 없음)
+`BrowserSession.__enter__()`는 `self._playwright`/`self.browser`/
+`self.context`/`self.page`를 순서대로 만들며, **`self.page = self.context.
+new_page()`로 초기 page 1개를 미리 만들어 둔다**(다른 호출부인
+detail_scraper 등이 바로 `session.page.goto(...)`를 쓰는 용도). `__enter__`는
+`self`(BrowserSession 인스턴스 자신)를 반환한다. `__exit__`는 `_teardown()`을
+호출해 `self.context.close()` → `self.browser.close()` → `self._playwright.
+stop()` 순서로(각각 best-effort try/except) 정리하고 `self.page`를 포함한
+모든 속성을 `None`으로 되돌린다 - `context.close()`가 그 안의 모든 page(초기
+page 포함)를 함께 정리하므로, 초기 page를 별도로 닫지 않아도 teardown
+시점에는 결국 정리된다.
+
+## _default_session_factory 호환 여부
+호환된다. `_default_session_factory()`는 `BrowserSession(DiagnosticConfig.
+safe_default())`를 반환하며, `NetworkBrowserCollector.__enter__`가 이를
+`__enter__()`하면 실제 BrowserSession과 동일하게 `.context`/`.page`를 가진
+객체가 반환된다. `NetworkBrowserCollector.collect_query`는 이미
+`self._session.context.new_page()`만 사용하고 있어(WIRE-2B-1에서부터)
+`.page`를 오용하는 버그는 애초에 없었다 - 다만 `.page`가 큐 실행 내내
+방치되는 문제만 있었다.
+
+## 초기 page 처리 정책
+"가능한 방향 A"(BrowserSession을 그대로 감싸되 초기 page는 수집용으로
+재사용하지 않고, 처리 정책을 명확히 함)를 채택했다.
+`NetworkBrowserCollector.__enter__`에 `_close_initial_page_if_present()`를
+추가해, session 진입 직후 `getattr(self._session, "page", None)`으로 초기
+page를 확인하고 있으면 best-effort(`try/except`)로 즉시 닫는다. session
+객체에 `.page` 속성이 없으면(WIRE-2B-1의 FakeLifecycleSession 등) 아무 것도
+하지 않으므로 기존 19건(2B-1 시점)에는 영향이 없다. 닫기에 실패해도
+BrowserSession._teardown()의 `context.close()`가 결국 정리하므로 안전하다
+(이중 방어). `browser_session.py`는 이 정책을 위해 전혀 수정하지 않았다
+(요청대로 대규모 변경 없이 `network_browser_collector.py` 내부에서만 처리).
+
+## 쿼리별 page와 초기 page의 관계
+초기 page(`session.page`)와 쿼리별 page(`session.context.new_page()`로 매
+쿼리마다 새로 생성)는 서로 다른 객체이며 절대 섞이지 않는다. 초기 page는
+`__enter__` 시점에 1회만 존재하고 즉시 닫히며, 이후 각 `collect_query` 호출은
+독립적으로 새 page를 만들고 그 쿼리가 끝나면 닫는다 - 초기 page가 "누적"되는
+경우는 구조적으로 없다(session_factory/session.__enter__ 자체가 큐 전체에서
+1회만 호출되므로 초기 page도 정확히 1개만 생긴다).
+
+## monkeypatch 기반 기본 factory 테스트 결과
+`FakeBrowserSessionLike`(BrowserSession과 동일하게 `__init__(diagnostic_
+config)`, `__enter__`에서 `.context`+`.page` 보유, `__exit__` 계약을 흉내)를
+`src.pc.browser_session.BrowserSession` 모듈 속성에 monkeypatch해
+`NetworkBrowserCollector(collected_at=...)`를 `session_factory` 없이(=기본
+factory 경로) 실행했다. `tests/test_pc_network_browser_collector.py` 5건
+신규 추가, 전부 PASS:
+1. 기본 factory 경로: session_factory 미지정 시 `BrowserSession`(monkeypatch)이
+   정확히 1회 생성·진입됨(실제 Playwright 없음).
+2. 공유 context 접근: `session.context.new_page()`로 만든 page가 그대로
+   `collect_network_query`에 전달됨(존재하지 않는 속성 가정 없음).
+3. 초기 page 처리: `session.page`는 수집용으로 재사용되지 않고 `__enter__`에서
+   정확히 1회 닫힘.
+4. 쿼리별 page: `collect_query` 2회 → `new_page` 2회, 각 쿼리 page는 1회씩
+   close, 초기 page와 완전히 분리됨(`session.page not in` 쿼리 page 목록).
+5. teardown(기본 factory 경로): 정상 종료·`collect_query` 중 예외 발생 종료
+   모두 `session.__exit__`가 정확히 1회 호출됨.
+
+## 기존 회귀 결과
+- `python -m py_compile src/pc/network_browser_collector.py tests/test_pc_network_browser_collector.py` PASS.
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(기존 19건 + 신규 5건).
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향).
+
+## 추가 코드 변경 여부
+`src/pc/network_browser_collector.py`에 `_close_initial_page_if_present()`
+메서드 1개 추가 + `__enter__`에서 호출 1줄 + docstring 보강만 했다.
+`src/pc/browser_session.py`는 요청대로 무수정. UI/target_count/Excel 저장
+배선은 이번에도 하지 않았다. 실제 Playwright/네이버 접속 없음, app.py/UI/
+build/EXE 실행 없음.
