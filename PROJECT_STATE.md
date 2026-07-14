@@ -1901,4 +1901,145 @@ UI-CLEANUP-1C에서 여러 구 선택 + 세부구역 실제 쿼리 반영을 완
 
 ## 다음 작업
 - 긴 설명(쿼리 수 증가에 따른 시간/보안 확인 배경, 300개 처리 기준 상세)은 [안내·정책] 탭 정식 문구 작성 시 반영.
+
+# 2026-07-14 ARCH-300C WIRE-1 순수 orchestrator 구현(live 없음)
+
+## 배경
+ARCH-300C-PRODUCT-WIRING-PLAN 설계 완료 후, 제품 기본 수집 엔진을 Network/List
+관찰 엔진으로 전환하기 위한 첫 단계로 "실제 제품 배선 없는 순수 orchestrator"만
+먼저 구현했다. 기존 PC 상세 수집(collect_pc_full 등)은 전혀 건드리지 않았고,
+네이버 live 접속/Playwright/브라우저/app.py/UI 실행/build/EXE는 이번 단계에서
+모두 하지 않았다.
+
+## 변경 파일
+- 신규 `src/pc/network_pipeline.py`: `run_collection_plan()` 순수 orchestrator.
+- `src/ui.py`: `build_collection_queries()`에 `source_city`/`source_district`/
+  `source_subregion`/`source_layer` 내부 메타만 추가(기존 region/keyword/query
+  키·값, UI 레이아웃/탭/문구는 변경 없음).
+- 신규 `tests/test_pc_network_pipeline.py`: fake collect_query 기반 7개 케이스.
+- `tests/test_ui_query_builder.py`: source_* 메타 검증 케이스 2개 추가, 기존
+  케이스 D는 반환 dict 키 수가 늘어난 것에 맞춰 정확 일치(`==`) 대신 필요한
+  필드(region/keyword/query)만 값 비교하도록 조정.
+
+## network_pipeline.py 구현 내용 / 반환 구조
+`run_collection_plan(jobs, *, per_query_limit, target_count, collected_at,
+collect_query, on_partial_save=None, on_security_block=None, seen=None)`이
+jobs를 순서대로 순회하며 `collect_query(job, per_query_limit)`를 호출한다.
+반환 dict: `rows`, `executed_query_count`, `skipped_query_count`, `stop_reason`
+(`"target_reached"`/`"queue_exhausted"`/`"security_blocked"`/`"status_429"`/
+`"empty_jobs"`), `before_trim_count`, `final_count`, `security_blocked`,
+`status_429_seen`.
+
+## dedup 처리 방식
+`network_list_scraper.dedup_rows()`를 그대로 재사용(신규 재구현 없음). `seen`
+집합을 전체 jobs에 걸쳐 공유하며(호출자가 넘기지 않으면 새로 생성), place_id
+기준(없으면 업체명 기준) 중복을 제거한다.
+
+## target_count 처리 방식
+`network_list_scraper.should_stop_for_target()`을 재사용해 dedup 누적 rows가
+target_count 이상이면 그 쿼리까지 처리한 뒤 `target_reached`로 중단하고,
+rows를 `rows[:target_count]`로 trim한다. target_count가 None/0 이하면 target
+중단을 비활성화(기존 `should_stop_for_target`의 방어 정책과 동일).
+
+## per_query_limit 처리 방식
+collect_query에 그대로 전달하는 것 외에, 반환된 rows가 per_query_limit보다
+많으면 dedup 이전에 `rows[:per_query_limit]`로 한 번 더 방어적으로 cap한다.
+
+## safety stop 처리 방식
+`active_captcha_detected` 또는 `status_429_seen`이 True면 해당 쿼리까지의
+rows를 포함해 즉시 중단한다. `src/pc/safety.py`는 수정하지 않고 `SafetyReason
+.CAPTCHA_OR_SECURITY_BLOCK`만 재사용해 `SimpleNamespace` decision을 만들어
+`on_security_block` 콜백을 best-effort(예외 무시)로 1회 호출한다(pipeline.py의
+`collect_pc_full`과 동일한 try/except 패턴). CAPTCHA 우회/자동 해결은 시도하지
+않음. 이 경우에만 `on_partial_save`도 best-effort로 호출한다.
+
+## build_collection_queries source_* 메타 추가
+기존 반환 필드(region/keyword/query)는 그대로 두고 `source_city`,
+`source_district`, `source_subregion`, `source_layer`
+(`"legal_dong"`/`"landmark"`/`"fallback"`/`"unknown"`)를 추가했다.
+`district_selections` entry에 선택적으로 `legal_dongs`/`landmarks` 원본 목록을
+함께 넘기면 그 목록 기준으로 `legal_dong`/`landmark`를 분류하고, 넘기지 않으면
+(기존 호출부인 `_build_collection_queries` 인스턴스 메서드는 아직 이 목록을
+분리 전달하지 않음) `unknown`으로 분류한다 - 실제 UI 인스턴스 메서드 배선은
+이번 WIRE-1 범위 밖이며 후속 단계로 남겨둔다.
+
+## 테스트 결과
+- `python -m py_compile src/pc/network_pipeline.py src/ui.py tests/test_pc_network_pipeline.py tests/test_ui_query_builder.py` PASS.
+- `tests/test_pc_network_pipeline.py` 7건 전부 PASS(queue_exhausted/global dedup/target_reached/per_query_limit/active_captcha_detected/status_429_seen/empty_jobs).
+- `tests/test_ui_query_builder.py` 8건 전부 PASS(기존 6건 + source_* 메타 신규 2건).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, collect_pc_full 경로 미수정 확인).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향, dedup_rows/should_stop_for_target 재사용 확인).
+
+## live/Playwright/app.py/build 실행 여부
+**전부 실행 안 함.** 네이버 live 접속 없음, Playwright/브라우저 실행 없음,
+app.py/UI 실행 없음, build/EXE 실행 없음. fake collect_query와 pure function
+테스트만 수행했다.
+
+## 다음 단계 제안
+- WIRE-2(실제 제품 배선/live 검증) 전에 LEGAL_NOTICE/README/안내·정책 문구
+  재정리가 필요(이번 계획서 확정 사항).
+- `_build_collection_queries` 인스턴스 메서드가 `legal_dongs`/`landmarks`를
+  분리 전달하도록 배선하면 실제 UI 경로에서도 source_layer가
+  legal_dong/landmark로 정확히 분류됨(현재는 unknown으로 남음) - 이 배선
+  자체는 별도 승인 후 진행.
+- 실제 live collect_query 구현(Network/List 관찰 기반)과 collect_pc_full 대체
+  배선은 이후 WIRE 단계에서 별도 Plan으로 진행.
 - 실제 창을 띄워 스크롤 체감 개선 여부를 육안으로 확인 필요(이번 요청 범위상 미수행).
+
+# 2026-07-14 ARCH-300C WIRE-1B 실제 UI 쿼리 경로 source_layer 메타 배선
+
+## 배경
+WIRE-1에서 `build_collection_queries()` 순수 함수는 legal_dongs/landmarks가
+전달되면 source_layer를 정확히 분류하지만, 실제 UI 인스턴스 메서드
+`_build_collection_queries()`는 이 두 목록을 분리 전달하지 않아 실제 화면
+경로에서는 source_layer가 항상 "unknown"으로 남는 문제가 있었다. 이번
+WIRE-1B는 그 배선만 보완했다(수집 엔진/network_pipeline 연결은 계속 하지
+않음).
+
+## 변경 파일
+- `src/ui.py`: `_build_collection_queries()` 인스턴스 메서드가
+  `district_selections` entry에 `legal_dongs`/`landmarks`를 함께 전달하도록
+  보완. `build_collection_queries()` 함수 docstring을 "인스턴스 메서드는 분리
+  전달하지 않음" → "WIRE-1B로 분리 전달하여 실제 화면에서는 unknown이
+  발생하지 않음"으로 갱신.
+- `tests/test_ui_query_builder.py`: 실제 UI 인스턴스 경로(legal_dongs 2개 +
+  landmarks 1개 + fallback 구 1개 혼합)를 재현하는 케이스 1개 추가.
+
+## 실제 UI 경로에서 layer를 판별하는 방식
+`get_selected_subregions()`가 이미 구별로
+`{"legal_dongs": [...], "landmarks": [...]}`를 분리해 반환하고 있었다.
+기존 `_build_collection_queries()`는 이 두 리스트를 `subregions = legal_dongs
++ landmarks`로 합쳐서 `selected_subregions`에만 담아 순수 함수에 넘겼는데,
+이번에 `legal_dongs`/`landmarks` 원본 리스트도 함께 `district_selections`
+entry에 담아 넘기도록 2줄만 추가했다(새 상태/캐시 없음, 기존
+`self._subdivision_layers`/`self.region_selection_vars`/
+`get_selected_subregions()` 그대로 재사용).
+
+## legal_dong/landmark/fallback 결과 예시
+강동구(법정동 천호동/길동 + 역상권 천호역 선택) + 송파구(세부구역 데이터
+없음)인 경우:
+- "서울특별시 강동구 천호동 카페" → source_layer="legal_dong"
+- "서울특별시 강동구 길동 카페" → source_layer="legal_dong"
+- "서울특별시 강동구 천호역 카페" → source_layer="landmark"
+- "서울특별시 송파구 카페" → source_layer="fallback"
+unknown은 발생하지 않음(테스트로 확인).
+
+## 쿼리 순서와 개수 영향 여부
+**영향 없음.** `selected_subregions` 계산 로직(legal_dongs + landmarks 순서,
+fallback 조건, 빈 세부구역 시 제외)은 전혀 변경하지 않았고, 순수 함수
+`build_collection_queries()`의 쿼리 생성/dedup/순서 로직도 WIRE-1B에서는
+건드리지 않았다. UI 레이아웃/체크박스 동작도 변경 없음.
+
+## 테스트 결과
+- `python -m py_compile src/ui.py tests/test_ui_query_builder.py` PASS.
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(기존 8건 + 실제 UI 경로 재현 신규 1건, unknown 미발생 확인 포함).
+- `tests/test_pc_network_pipeline.py` 7건 전부 PASS(무영향, orchestrator 미변경 확인).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, collect_pc_full 미변경 확인).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+
+## live/Playwright/app.py/build 실행 여부
+**전부 실행 안 함.** 네이버 live 접속 없음, Playwright/브라우저 실행 없음, app.py/UI 실행 없음, build/EXE 실행 없음. 수집 엔진 배선(network_pipeline 실행 연결)도 하지 않음.
+
+## 다음 단계 제안
+- WIRE-2(실제 제품 배선/live 검증) 전 LEGAL_NOTICE/README/안내·정책 문구 재정리 필요(기존 계획 유지).
+- 실제 live collect_query 구현과 collect_pc_full 대체 배선은 이후 WIRE 단계에서 별도 Plan으로 진행.

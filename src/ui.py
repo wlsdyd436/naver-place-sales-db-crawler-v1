@@ -91,30 +91,68 @@ def build_collection_queries(city: str, district_selections: list[dict], keyword
     하기 때문). True이고 목록이 있으면 세부구역마다 "{city} {district}
     {subregion} {keyword}" 쿼리를 만든다.
 
+    entry는 선택적으로 "legal_dongs": [str, ...] / "landmarks": [str, ...]
+    (region_data.load_region_layers/get_selected_subregions과 동일한 이름의
+    원본 목록)를 함께 넘길 수 있다. selected_subregions의 각 항목이 이 중
+    어느 목록에 속하는지에 따라 아래 source_layer를 분류한다. 넘기지 않으면
+    (기존 테스트 등 하위 호환 호출) "unknown"으로 분류한다 - 실제 UI 인스턴스
+    메서드(_build_collection_queries, ARCH-300C WIRE-1B)는 이 두 목록을 분리
+    전달하므로 실제 화면에서 생성되는 job은 legal_dong/landmark/fallback으로만
+    분류되고 unknown은 발생하지 않는다.
+
     반환은 `_run_queue_pipeline`이 그대로 받을 수 있는 job 형태
-    [{"region": ..., "keyword": keyword, "query": ...}, ...]다 - 여러 구
-    선택을 반영하면서도 파이프라인 자체는 건드리지 않기 위함이다. 중복
-    쿼리는 제거하되 처음 등장한 순서는 유지한다.
+    [{"region": ..., "keyword": keyword, "query": ...}, ...]에 내부 메타
+    source_city/source_district/source_subregion/source_layer를 추가한
+    것이다 - 기존 region/keyword/query 키와 값은 그대로 유지되며, 이
+    source_* 필드들은 dedup/orchestrator 진단용일 뿐 Excel에는 노출되지
+    않는다(exporter가 MERGED_COLUMNS로만 투영). source_layer 후보:
+    "legal_dong" / "landmark" / "fallback"(세부구역 데이터 없는 구) /
+    "unknown"(legal_dongs/landmarks 미전달 시). 중복 쿼리는 제거하되 처음
+    등장한 순서는 유지한다.
     """
     jobs: list[dict] = []
     seen_queries: set = set()
     for entry in district_selections:
         district = entry["district"]
         if entry.get("has_subregion_data"):
+            legal_dongs = set(entry.get("legal_dongs") or [])
+            landmarks = set(entry.get("landmarks") or [])
             for subregion in entry.get("selected_subregions") or []:
                 region_label = f"{city} {district} {subregion}"
                 query = f"{region_label} {keyword}"
                 if query in seen_queries:
                     continue
                 seen_queries.add(query)
-                jobs.append({"region": region_label, "keyword": keyword, "query": query})
+                if subregion in legal_dongs:
+                    source_layer = "legal_dong"
+                elif subregion in landmarks:
+                    source_layer = "landmark"
+                else:
+                    source_layer = "unknown"
+                jobs.append({
+                    "region": region_label,
+                    "keyword": keyword,
+                    "query": query,
+                    "source_city": city,
+                    "source_district": district,
+                    "source_subregion": subregion,
+                    "source_layer": source_layer,
+                })
         else:
             region_label = f"{city} {district}"
             query = f"{region_label} {keyword}"
             if query in seen_queries:
                 continue
             seen_queries.add(query)
-            jobs.append({"region": region_label, "keyword": keyword, "query": query})
+            jobs.append({
+                "region": region_label,
+                "keyword": keyword,
+                "query": query,
+                "source_city": city,
+                "source_district": district,
+                "source_subregion": "",
+                "source_layer": "fallback",
+            })
     return jobs
 
 
@@ -796,13 +834,19 @@ class SalesDbCrawlerApp(ctk.CTk):
             layers = self._subdivision_layers.get(district, {})
             has_data = auto_subdivide and bool(layers.get("legal_dongs") or layers.get("landmarks"))
             subregions: list[str] = []
+            legal_dongs: list[str] = []
+            landmarks: list[str] = []
             if has_data:
                 entry = selected_subregions.get(district, {"legal_dongs": [], "landmarks": []})
-                subregions = entry["legal_dongs"] + entry["landmarks"]
+                legal_dongs = entry["legal_dongs"]
+                landmarks = entry["landmarks"]
+                subregions = legal_dongs + landmarks
             district_selections.append({
                 "district": district,
                 "has_subregion_data": has_data,
                 "selected_subregions": subregions,
+                "legal_dongs": legal_dongs,
+                "landmarks": landmarks,
             })
         return build_collection_queries(city, district_selections, keyword)
 
