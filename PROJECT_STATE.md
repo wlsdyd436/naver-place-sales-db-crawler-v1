@@ -2043,3 +2043,193 @@ fallback 조건, 빈 세부구역 시 제외)은 전혀 변경하지 않았고, 
 ## 다음 단계 제안
 - WIRE-2(실제 제품 배선/live 검증) 전 LEGAL_NOTICE/README/안내·정책 문구 재정리 필요(기존 계획 유지).
 - 실제 live collect_query 구현과 collect_pc_full 대체 배선은 이후 WIRE 단계에서 별도 Plan으로 진행.
+
+# 2026-07-14 ARCH-300C WIRE-2A 쿼리 단위 Network 응답 관찰 함수 구현(live 없음)
+
+## 배경
+WIRE-2-PRODUCT-WIRING-PLAN 설계에 따라, 실제 제품 배선(UI 연결/기본 엔진 전환)
+전에 "쿼리 1개를 처리하는 Network 응답 관찰 계층"만 먼저 구현했다. 브라우저/
+context/page의 생성·소유·teardown 책임은 이번 단계에 없으며(WIRE-2B에서
+BrowserSession 기반 context manager로 구현 예정), UI 연결·target_count UI
+추가·기본 엔진 전환·run_collection_plan과의 실제 연결·문서 수정도 이번
+단계 범위 밖이다. 네이버 live 접속, Playwright 실행 없음.
+
+## 변경 파일
+- 신규 `src/pc/network_browser_collector.py`: `collect_network_query()` +
+  내부 helper(`_QueryObservationContext`, `_make_response_handler`,
+  `_probe_captcha_state`).
+- 신규 `tests/test_pc_network_browser_collector.py`: FakePage/FakeResponse/
+  FakeLocator 기반 12개 테스트.
+
+## collect_network_query 인터페이스
+`collect_network_query(page, job, per_query_limit, *, collected_at,
+settle_ms=5000) -> dict`. 이미 생성된 page(또는 FakePage)를 전달받아 쿼리
+1개만 처리한다. 반환: `rows`, `active_captcha_detected`, `status_429_seen`,
+`candidate_response_count`, `raw_item_count`, `local_unique_count`,
+`parse_error_count`, `timeout`.
+
+## listener 등록·해제 방식
+`page.on("response", handler)`를 함수 시작 시 1회 등록하고, `try/finally`의
+`finally`에서 `page.off("response", handler)`로 반드시 해제한다(정상/예외
+경로 모두). handler는 status==429 확인, `is_candidate_response`로 후보
+판정, 후보 response 객체 저장, `candidate_response_count` 증가만 수행하고
+`response.json()`은 호출하지 않는다(콜백 블로킹 최소화 + parse_error_count
+명확한 집계를 위해 settle 종료 후 별도로 파싱).
+
+## 쿼리별 응답 격리 방식
+전역/클래스 공용 상태를 두지 않고, 매 호출마다 새 `_QueryObservationContext`
+인스턴스를 만들어 handler 클로저가 그 인스턴스에만 기록한다. 함수가 끝나면
+context와 handler 모두 버려지므로 다음 쿼리(다음 `collect_network_query`
+호출)와 절대 섞이지 않는다. WIRE-2B부터는 페이지 자체도 쿼리마다 새로
+생성/종료될 예정이라 이중으로 격리된다.
+
+## 후보 응답 concat 및 local dedup 방식
+settle 종료 후 저장된 모든 후보 response를 순회하며 `response.json()` →
+`_extract_list_items()`로 items를 뽑아 `raw_items`에 concat한다(각 단계
+예외는 `parse_error_count`만 증가시키고 다음 후보로 계속). 각 item을
+`_map_item_to_row(item, collected_at, source_query=job["query"])`로
+매핑한 뒤, `_map_item_to_row`가 지원하지 않는 `source_city`/
+`source_district`/`source_subregion`/`source_layer`는 매핑된 row dict에
+job에서 그대로 복사해 추가한다(network_list_scraper.py 무수정). 이후 쿼리
+내부 로컬 `seen`(함수 호출마다 새로 생성, 전역 아님)으로 `dedup_rows()`를
+적용한다 - 전역 dedup은 이 함수의 책임이 아니라 WIRE-1
+`run_collection_plan`의 책임이다.
+
+## per_query_limit 적용 순서
+정확히 `raw_items → mapped_rows(+source_* 메타 부여) → local dedup
+(dedup_rows) → rows[:per_query_limit]` 순서로 적용했다. 로컬 dedup을 먼저
+수행하므로 같은 쿼리 내 중복 응답이 상한 자리를 차지하지 않는다
+(`local_unique_count`는 cap 적용 전 값을 그대로 노출해 두 값을 구분할 수
+있게 했다).
+
+## CAPTCHA DOM probe 및 active/passive 분류
+`_probe_captcha_state(page)`가 PoC-7의 `_probe_captcha_presence`와 동일한
+방식으로 `browser_session._CAPTCHA_PROBE_SELECTORS`(읽기 전용 재사용)를
+순회해 marker 존재/가시성/bounding box 면적을 관찰한다. 클릭을 전혀 하지
+않으므로 `click_intercepted_message`는 항상 빈 문자열이다. 이 결과를 그대로
+`classify_captcha_signal()`(읽기 전용 재사용, 재구현 없음)에 넘겨
+`active_captcha_detected`를 판정한다 - marker가 DOM에 존재한다는 사실
+만으로는 active로 단정하지 않고(오탐 방지), visible+면적>0일 때만 active로
+판정하는 기존 정책을 그대로 따른다.
+
+## 429/timeout/0건/parse error 처리
+- **HTTP 429**: 후보 URL 여부와 무관하게 모든 response에서 `status==429`
+  확인 → `status_429_seen=True`.
+- **goto timeout**: `page.goto()` 예외 시 `BrowserSession.goto`와 동일한
+  태도로 예외를 삼키고 현재 DOM으로 계속 진행하되, `goto_timed_out=True`로
+  기록 → 최종 `timeout=True`.
+- **settle 종료까지 후보 응답 0개**: `candidate_response_count==0`이면
+  `timeout=True`(goto 성공 여부와 무관).
+- **후보 응답은 있으나 items=0**: `candidate_response_count>0`이면
+  `timeout=False`로 유지하고 `rows=[]`만 반환 - "정상적인 검색 결과 0건"과
+  "관찰 실패(timeout)"을 명확히 구분했다.
+- **response.json()/파싱 실패**: 해당 후보만 건너뛰고 `parse_error_count`를
+  증가시키며 나머지 후보는 계속 처리한다(함수 전체 크래시 없음).
+- 위 어떤 분기에서도 CAPTCHA 우회/자동 해결/재시도/DOM 조작을 시도하지
+  않는다. collector는 플래그만 반환하며, 중단 여부 판단은 상위
+  orchestrator(`run_collection_plan`)의 책임으로 남겨뒀다.
+
+## FakePage 테스트 목록과 결과
+`tests/test_pc_network_browser_collector.py` 12건 전부 PASS: listener 등록·
+해제(1회씩, 잔여 없음) / 복수 candidate concat / local dedup 후 1건만 남음 /
+per_query_limit이 local dedup 이후 정확히 cap / active CAPTCHA(visible+면적
+>0) / passive marker(hidden→active=False) / HTTP 429(비후보 응답에서도 감지)
+/ goto timeout(timeout=True, rows=[], CAPTCHA 아님) / candidate 0개(timeout=
+True) / 검색결과 0건(timeout=False, rows=[]) / parse error(크래시 없이 나머지
+후보 계속 처리) / source_* 메타(job의 source_city/district/subregion/layer/
+query가 row에 유지).
+
+## 기존 테스트 회귀 결과
+- `python -m py_compile src/pc/network_browser_collector.py tests/test_pc_network_browser_collector.py` PASS.
+- `tests/test_pc_network_pipeline.py` 7건 전부 PASS(무영향, orchestrator 무수정 확인).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향, is_candidate_response/_extract_list_items/_map_item_to_row/dedup_rows/classify_captcha_signal 재구현 없이 재사용 확인).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+
+## live/Playwright/app.py/UI/build 실행 여부
+**전부 실행 안 함.** 네이버 live 접속 없음, Playwright 실행 없음(FakePage만 사용), app.py/UI 실행 없음, build/EXE 실행 없음.
+
+## 다음 단계(WIRE-2B)
+- `BrowserSession` 기반으로 브라우저/context를 실제 소유하는 context manager(`NetworkBrowserCollector`) 구현, 쿼리마다 page를 새로 생성/종료.
+- UI에 `target_count` 필드 추가 + 신규 `_run_network_pipeline` worker로 fake collector 배선(아직 live 아님).
+- `run_collection_plan`에 `should_continue`(사용자 중지) 옵션 추가 여부는 별도 승인 후 결정.
+- WIRE-2C(부분 저장/Excel 통합)·WIRE-2D(문서 동시 정합성 수정)는 그 이후 단계.
+
+# 2026-07-14 ARCH-300C WIRE-2A-B navigation timeout과 일반 오류 분리(live 없음)
+
+## 배경
+WIRE-2A의 `collect_network_query()`가 `page.goto()`에서 발생한 모든 예외를
+`timeout=True`로 뭉뚱그려 분류하고 있었다. 실제 Playwright 실행에서는
+TimeoutError(느린 로드) 외에도 page/context/browser가 이미 닫힘(Target
+closed), 브라우저 실행 장애, 그 외 일반 navigation 오류가 발생할 수 있는데,
+이들을 timeout으로 숨기면 원인 진단이 불가능해진다. 이번 단계는 이 분류만
+보완했다. `run_collection_plan`/UI는 여전히 무수정이며, 상위 orchestrator의
+중단 정책 추가나 재시도 로직도 이번 범위에 없다.
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`: `PlaywrightTimeoutError` import 추가,
+  `page.goto()` 예외 처리를 `PlaywrightTimeoutError`(timeout)와 그 외
+  `Exception`(navigation_error) 두 갈래로 분리. `finally`의 `page.off()` 호출도
+  best-effort(`try/except`)로 방어.
+- `tests/test_pc_network_browser_collector.py`: 기존 `check_goto_timeout`을
+  실제 `PlaywrightTimeoutError`를 사용하도록 수정, 신규
+  `check_goto_navigation_error_is_not_timeout` 테스트 추가.
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## TimeoutError를 식별하는 방식
+`from playwright.sync_api import TimeoutError as PlaywrightTimeoutError`를
+`browser_session.py`와 동일하게 import해서 `except PlaywrightTimeoutError:`로
+명시적으로만 잡는다. 이 경우에만 "느린 로드"로 간주해 관용적으로 흡수하고
+(`goto_timed_out=True`), 이후 settle 대기·후보 파싱·CAPTCHA probe를 그대로
+계속 진행한다(`BrowserSession.goto`와 동일하게 현재 DOM으로 계속 진행 -
+CAPTCHA와 무관).
+
+## 일반 navigation 오류 처리 방식
+`PlaywrightTimeoutError`가 아닌 그 외 모든 예외(Target closed, 브라우저 실행
+장애, 일반 navigation 오류 등)는 `except Exception as exc:`에서
+`navigation_error=True`, `navigation_error_message=f"{type(exc).__name__}:
+{exc}"`로 기록한다. 이 경우 페이지 상태를 더 이상 신뢰할 수 없다고 보고
+**settle 대기·후보 응답 파싱·CAPTCHA probe를 전부 건너뛰고 즉시 반환**한다
+(닫힌 page에 `wait_for_timeout`/`locator`를 호출하면 추가 예외가 발생할
+위험이 있기 때문). 반환은 `rows=[]`, `active_captcha_detected=False`,
+`timeout=False`로 고정해 CAPTCHA나 429로 오분류되지 않게 했다. 재시도는
+하지 않으며, 재시도/복구 정책은 상위 계층(WIRE-2B 이후)의 책임으로 문서화
+했다(docstring에 명시). `finally`의 `page.off("response", handler)`도
+page/context가 이미 닫힌 상태일 수 있으므로 `try/except`로 감싸 best-effort
+로 처리한다.
+
+## 반환 필드 변경
+반환 dict에 `navigation_error`(bool)와 `navigation_error_message`(str) 2개
+필드를 추가했다. 기존 필드(`rows`/`active_captcha_detected`/
+`status_429_seen`/`candidate_response_count`/`raw_item_count`/
+`local_unique_count`/`parse_error_count`/`timeout`)는 이름·의미 모두
+변경하지 않았다 - PlaywrightTimeoutError 경로는 여전히 `timeout=True`,
+`navigation_error=False`로 기존 WIRE-2A 동작과 동일하다.
+
+## 신규 테스트 결과
+`tests/test_pc_network_browser_collector.py` 13건 전부 PASS(기존 12건 - 단
+`check_goto_timeout`은 실제 `PlaywrightTimeoutError`를 사용하도록 갱신 - +
+신규 1건):
+- `check_goto_timeout`: `PlaywrightTimeoutError` 발생 시 `timeout=True`,
+  `navigation_error=False`, `rows=[]`, CAPTCHA 아님.
+- `check_goto_navigation_error_is_not_timeout`(신규): 일반 `Exception`
+  ("Target closed" 메시지) 발생 시 `timeout=False`, `navigation_error=True`,
+  `navigation_error_message` 비어있지 않음, `rows=[]`, CAPTCHA/429로
+  오분류되지 않음.
+
+## 전체 회귀 결과
+- `python -m py_compile src/pc/network_browser_collector.py tests/test_pc_network_browser_collector.py` PASS.
+- `tests/test_pc_network_browser_collector.py` 13건 전부 PASS.
+- `tests/test_pc_network_pipeline.py` 7건 전부 PASS(무영향).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+
+## live/Playwright/app.py/UI/build 실행 여부
+**전부 실행 안 함.** 실제 Playwright/네이버 접속 없음(FakePage와 playwright
+패키지의 `TimeoutError` 클래스만 import해 예외 타입 비교에 사용), app.py/UI
+실행 없음, build/EXE 실행 없음.
+
+## 다음 단계
+- WIRE-2B에서 `NetworkBrowserCollector`(실제 브라우저 소유)를 구현할 때,
+  이번에 추가한 `navigation_error` 신호를 상위에서 어떻게 다룰지(재시도 없이
+  즉시 다음 쿼리로 넘어갈지, 큐 자체를 안전 중단할지)를 별도로 설계해야
+  한다 - 이번 단계는 "구분만" 했고 "그 이후 정책"은 결정하지 않았다.
