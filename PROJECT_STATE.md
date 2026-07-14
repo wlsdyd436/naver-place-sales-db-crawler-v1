@@ -2811,3 +2811,344 @@ column in columns}` 투영이 내부 필드를 자동으로 걸러낸다 - expor
   배선(legacy는 fallback으로 보존).
 - README/LEGAL_NOTICE/안내·정책 탭 정합성 수정(WIRE-2D, POLICY-ALIGN-1
   감사 결과 반영) - 기본 엔진이 실제로 바뀌기 전까지는 보류 유지.
+
+---
+
+# 2026-07-14 ARCH-300C WIRE-2C-2 Network/List 기본 엔진 전환(live 없음)
+
+## 배경
+WIRE-2C-1까지는 `_run_network_pipeline`(Excel 저장 포함)이 완성됐지만
+`start_crawl`은 여전히 legacy(`_run_queue_pipeline`, basic/premium)를
+실행했고 `limit_var` 기본값은 300, `target_count_entry`는 disabled였다.
+이번 단계는 Network/List를 실제 기본 실행 경로로 전환하고, per_query_limit/
+target_count를 `start_crawl`에서 실제로 검증해 Network worker thread에
+연결했다. legacy 경로는 삭제하지 않고 내부 상수로만 되돌릴 수 있는 롤백
+경로로 보존했다.
+
+## 변경 파일
+- `src/ui.py`:
+  - `_DEFAULT_PER_QUERY_LIMIT`을 "30"으로 재변경(target_count "300" 유지),
+    신규 `_DEFAULT_COLLECTION_ENGINE = "network"` 내부 상수 추가(UI 노출 없음).
+  - `_build_global_target_count_section`: `target_count_entry`의
+    `state="disabled"`와 "새 수집 엔진 연결 후 적용됩니다." 안내 문구 제거(활성화).
+  - `_build_filter_section`: `new_open_checkbox`에 `state="disabled"` 추가,
+    설명 문구를 "현재 기본 수집에서는 새로오픈 필터를 지원하지 않습니다."로 교체.
+  - `_set_left_panel_state`: target_count_entry 강제 disabled 방어 코드 제거,
+    new_open_checkbox 강제 disabled 방어 코드로 교체(좌측 패널이 normal로
+    복구돼도 새로오픈 체크박스만은 계속 disabled 유지).
+  - `start_crawl`을 얇은 dispatcher로 재작성 - `_DEFAULT_COLLECTION_ENGINE`
+    값에 따라 신규 `_start_network_crawl`(기본값) 또는 `_start_legacy_crawl`
+    (WIRE-2C-1까지의 start_crawl 본문을 그대로 옮긴 내부 롤백 경로, 검증
+    순서/동작 무변경)로 위임.
+  - 신규 `_start_network_crawl`: 키워드/per_query_limit(`_parse_positive_int`)/
+    target_count(`_parse_positive_int`)/저장 경로/지역 선택을 검증한 뒤
+    새로오픈 필터를 False로 정규화하고, `make_timestamped_output_path`로
+    저장 경로를 확정하고, `stop_event.clear()` → 실행 중 UI 상태 적용 →
+    `_run_network_pipeline_worker`를 대상으로 하는 Thread를 시작한다.
+  - 신규 `_run_network_pipeline_worker`: `_run_network_pipeline` 호출을
+    try/except로 감싸 collector/orchestrator의 예상 밖 예외만 방어(짧은
+    오류 로그 + "수집 중 오류가 발생했습니다." 상태 문구)하고, finally에서
+    기존 `set_running(False)` 복구 helper를 그대로 재사용한다. exporter
+    실패는 `_run_network_pipeline`/`_export_network_result`가 이미
+    처리하므로 여기서 다시 다루지 않는다(이중 처리 금지).
+- `tests/test_ui_network_wiring.py`: 구조 변경으로 깨진 4개 테스트 갱신
+  - `check_legacy_path_untouched`: `_start_legacy_crawl` 소스가 여전히
+    `_run_queue_pipeline`만 호출하는지, 기본 엔진이 "network"인지로 검증
+    방식 갱신.
+  - `check_legacy_default_per_query_limit_preserved` →
+    `check_default_values_for_network_engine`으로 개명, 기대값을
+    PER_QUERY_LIMIT=30/TARGET_COUNT=300으로 갱신.
+  - `check_target_count_input_disabled_with_guidance` →
+    `check_target_count_input_enabled_no_stale_guidance`로 개명, disabled/
+    안내 문구가 없어야 한다는 반대 방향 검증으로 갱신.
+  - `check_run_network_pipeline_ignores_target_count_disabled_state` →
+    `check_run_network_pipeline_passes_target_count_through`로 개명(설명
+    갱신, `_run_network_pipeline` 자체의 target_count 전달 계약은 무변경).
+- 신규 `tests/test_ui_network_start.py`: `start_crawl`/`_start_network_crawl`/
+  `_start_legacy_crawl`/`_run_network_pipeline_worker`를 검증하는 12개
+  standalone 테스트(§신규 테스트 결과).
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## 기본 엔진 전환 방식
+`_DEFAULT_COLLECTION_ENGINE`(모듈 상수, UI 노출 없음)이 "network"(기본값)면
+`_start_network_crawl`, "legacy"면 `_start_legacy_crawl`을 실행한다.
+`start_crawl` 자체는 이 두 갈래로 위임만 하는 얇은 dispatcher이고
+button command 시그니처(`self`, 인자 없음)는 그대로다. legacy 경로는
+코드를 전혀 수정하지 않고 그대로 옮겼으므로(`_start_legacy_crawl`) 기존
+검증 순서·동작에 회귀가 없다 - `_DEFAULT_COLLECTION_ENGINE`을 "legacy"로
+바꾸는 것만으로 되돌릴 수 있는 내부 롤백 지점이다.
+
+## per_query_limit/target_count 기본값과 검증
+`_DEFAULT_PER_QUERY_LIMIT`="30", `_DEFAULT_TARGET_COUNT`="300". Network가
+기본 엔진이 되면서 WIRE-2B-2A에서 300으로 되돌렸던 이유(legacy가
+limit_var를 유일한 수집 개수 입력으로 그대로 쓰던 문제)가 해소되어 30을
+다시 적용했다. `_start_network_crawl`이 `_parse_positive_int`로 두 값을
+각각 검증하고, 비정수/0/음수면 로그+안내 후 즉시 실행을 차단한다(Thread
+생성 자체가 발생하지 않음 - `check_invalid_per_query_limit_blocks_execution`/
+`check_invalid_target_count_blocks_execution`으로 확인). target_count <
+per_query_limit, per_query_limit < target_count 조합 모두 허용하며(서로
+독립된 양의 정수), 잘못된 값을 임의 기본값으로 보정해 실행하지 않는다.
+
+## start_crawl → Network worker 흐름
+요청서 §5 그대로: 입력 검증 → `_build_collection_queries()`로 query_queue
+생성(0건이면 차단) → 새로오픈 필터 False 정규화 → 저장 경로 확정
+(`make_timestamped_output_path`) → `stop_event.clear()` → `set_running(True)`
+등 실행 중 UI 상태 적용 → `_run_network_pipeline_worker`를 target으로 하는
+Thread 시작(`query_queue, per_query_limit, target_count, output_path` 전달).
+저장 폴더 생성은 별도로 하지 않는다 - `export_places_to_excel`이 이미
+`output_file.parent.mkdir()`을 수행하고, rows가 0건이면 저장 자체를
+하지 않으므로(§WIRE-2C-1) 미리 폴더를 만들어 두면 오히려 "저장할 결과가
+없습니다" 상황에서도 빈 폴더가 남는 부작용이 생길 수 있어 만들지 않는다.
+
+## worker 정상·예외 종료 UI 복구
+`_run_network_pipeline_worker`가 `_run_network_pipeline` 호출을
+try/except/finally로 감싼다. try에서 잡는 예외는 collector/orchestrator가
+결과 dict조차 반환하지 못한 예상 밖 오류뿐이다(exporter 실패는 이미
+result 메타로 처리되므로 여기서 다시 다루지 않음 - 이중 처리 금지).
+예외 발생 시 로그에는 "예상하지 못한 오류: ..."만 짧게 남기고 상태에는
+"수집 중 오류가 발생했습니다."만 표시하며 "저장했습니다/저장 완료" 같은
+성공 문구는 어떤 경우에도 나오지 않는다. finally는 정상/예외 종료 양쪽
+모두에서 기존 `set_running(False)` 복구 helper(내부적으로
+`self.after(0, ...)`로 `btn_start`/좌측 패널 상태를 되돌림)를 정확히 1회
+호출한다 - `_run_queue_pipeline`의 finally와 동일한 원칙이다.
+
+## 새로오픈 필터 처리
+Network/List 매핑은 새로오픈여부를 신뢰성 있게 제공하지 않으므로,
+`new_open_checkbox`를 생성 시점부터 `state="disabled"`로 두고 설명 문구를
+"현재 기본 수집에서는 새로오픈 필터를 지원하지 않습니다."로 바꿨다.
+`_set_left_panel_state`가 좌측 패널을 normal로 복구할 때도
+new_open_checkbox만은 항상 disabled로 재설정하는 방어 코드를 추가해,
+체크된 상태로 disabled되어 "적용된 것"으로 오해하는 상황을 막는다.
+`_start_network_crawl`은 실행 직전에 `new_open_only_var.set(False)`로
+한 번 더 정규화한다(체크박스 초기값도 항상 False). legacy 변수/필터 코드,
+상세 클릭 fallback은 전혀 건드리지 않았고, 확인되지 않은 목록 필드로
+새로오픈을 추정하는 로직도 추가하지 않았다.
+
+## target_count UI 활성화
+`target_count_entry`에서 `state="disabled"`와 낡은 안내 문구를 제거했다.
+`_set_left_panel_state`에는 더 이상 target_count_entry 관련 특례가 없으므로
+다른 입력(Entry)과 동일하게 수집 시작 시 disabled, 완료 후 normal로
+자연스럽게 전환된다(source 검사로 확인 - `check_target_count_entry_enabled_and_restored_normal`).
+새로오픈 체크박스만 유일하게 이 일반 규칙에서 예외로 남는다.
+
+## legacy 롤백 경로
+`_run_queue_pipeline`/`_collect_premium_query`/`_collect_basic_query`/
+`_collect_premium_query_legacy`는 전부 무수정 보존됐다. `_start_legacy_crawl`
+은 WIRE-2C-1까지의 start_crawl 본문을 그대로 옮긴 것이라 검증 순서·동작에
+변화가 없다. `_DEFAULT_COLLECTION_ENGINE`을 "legacy"로 바꾸면 `start_crawl`
+이 다시 `_start_legacy_crawl`(→ `_run_queue_pipeline`)로 위임한다는 것을
+`check_legacy_rollback_path_reachable_via_internal_constant`가 fake
+threading으로 실제 legacy crawler 실행 없이 확인했다. 사용자 화면에는
+엔진 선택 UI를 노출하지 않는다.
+
+## 신규 테스트 결과
+- `tests/test_ui_network_start.py`(신규) 12건 전부 PASS: 기본 상수(30/300/
+  network) / target_count 활성화(disabled·낡은 안내 문구 없음 + 좌측 패널
+  특례 없음) / 정상 start_crawl(Network worker 선택, query_queue/
+  per_query_limit=30/target_count=300/output_path 정확 전달, legacy worker
+  미호출) / per_query_limit 오류(0/-5/abc) 실행 차단 / target_count 오류
+  (0/-5/abc) 실행 차단 / query_queue 0건 실행 차단 / stop_event 사전
+  clear() / set_running(True)가 thread.start()보다 먼저 호출(순서 확인) /
+  worker 정상 종료 시 set_running(False) 1회 호출 / worker 예상 밖 예외 시
+  UI 복구 + 성공 문구 없음 + 짧은 오류 안내 / 새로오픈 필터 disabled+안내+
+  강제 유지+False 정규화 / legacy 롤백 경로(내부 상수 전환 시 실제
+  legacy crawler 실행 없이 `_run_queue_pipeline` 선택 확인).
+- `tests/test_ui_network_wiring.py` 갱신된 4건 포함 19건 전부 PASS(나머지
+  15건은 WIRE-2C-1 그대로 무변경 재확인).
+
+## 전체 회귀 결과
+- `python -m py_compile src/ui.py tests/test_ui_network_wiring.py tests/test_ui_network_export.py tests/test_ui_network_start.py` PASS.
+- `tests/test_ui_network_start.py` 12건 전부 PASS.
+- `tests/test_ui_network_wiring.py` 19건 전부 PASS.
+- `tests/test_ui_network_export.py` 7건 전부 PASS(무수정 파일, 무영향 재확인).
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향, `network_pipeline.py` 무수정).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향, `network_browser_collector.py` 무수정).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, legacy premium/basic 경로 무변경 재확인).
+
+## live/Playwright/네이버/app.py/UI/build/EXE 실행 여부
+**전부 실행 안 함.** 모든 신규/갱신 테스트는 `threading.Thread`를
+`ui.threading` 네임스페이스 안에서만 fake로 교체(stdlib `threading` 모듈
+자체는 무수정)하고, `_run_network_pipeline`/collector/orchestrator는
+여전히 fake다. 실제 Playwright/브라우저/네이버 접속, app.py 실행, 실제
+Tk 창, build/EXE 실행은 전혀 없다.
+
+## 다음 WIRE-2D 작업(수정 예정 문서)
+- README.md, LEGAL_NOTICE.md, 안내·정책 탭: 기본 엔진이 Network/List로
+  바뀌었고 새로오픈 필터가 비활성화됐다는 사실을 반영(POLICY-ALIGN-1 감사
+  결과 반영). 이번 WIRE-2C-2에서는 문서를 수정하지 않았으므로, 지금
+  시점에는 문서와 실제 동작이 잠시 어긋나 있다 - WIRE-2D 완료 전까지는
+  git add/commit을 하지 않고 WIRE-2C-2 + WIRE-2D를 한 커밋으로 묶을 예정.
+
+---
+
+# 2026-07-14 ARCH-300C WIRE-2D README·법적 고지·안내 정책 정합성(live 없음, 코드 동작 무변경)
+
+## 배경
+WIRE-2C-2까지 Network/List가 실제 기본 실행 경로가 됐지만, README/
+LEGAL_NOTICE/안내·정책 탭은 여전히 옛 `빠른 수집(모바일)`/`상세 수집(PC)`
+수집모드 라디오 기준으로 작성되어 있었다(POLICY-ALIGN-1 감사에서 이미
+지적된 정합성 문제). 이번 단계는 코드 동작을 전혀 바꾸지 않고, 문서와
+UI 안내 문구를 현재 Network/List 기본 엔진의 실제 동작(전역 dedup, 목표
+미달 가능, CAPTCHA/429 비우회+부분 저장, 0건 미생성, 새로오픈 필터 미지원,
+직접 HTTP 호출 없음)에 맞춰 정정했다.
+
+## 변경 파일
+- `README.md`: 섹션 1(핵심 방향)~3(결과물)을 Network/List 흐름 기준으로
+  재작성(옛 수집모드 라디오/basic·premium 설명 제거), 신규 섹션 "4. 수집
+  개수와 중단·저장 정책" 추가(per_query_limit=30/target_count=300 구분,
+  stop_reason별 저장 표, 0건 미생성, exporter 실패 시 저장 안 될 수 있음),
+  프로젝트 구조에 `network_*.py` 3개 파일 추가 및 레거시 파일 "내부 롤백
+  경로" 표기, 실행 방법/주의사항 문구 갱신(수집모드 선택 문구 제거,
+  target_count/새로오픈 비활성화 안내 추가), "공식 네이버 제품·제휴 제품
+  아님" 고지 추가, 저장 경로 타임스탬프 형식을 실제 코드
+  (`make_timestamped_output_path`, `%Y%m%d_%H%M`, 초 단위 없음)에 맞게 수정.
+- `LEGAL_NOTICE.md`: 기존 날짜 기반 append-only 구조(4번 2026-06-04→5번
+  2026-07-06)를 그대로 유지하며 신규 "6. Network/List 경로 반영
+  (2026-07-14 추가)" 섹션을 추가하고, 5번 섹션 끝에 "제5호(수집 규모)는
+  6번으로 갱신됨" 승계 포인터를 추가. 과거 섹션(4번의 "10건 이내" 등)은
+  역사적 기록으로 전혀 수정하지 않았다(§아래 "낡은 표현 처리 방식" 참고).
+- `src/ui.py`: `_build_policy_tab()`만 수정 - 기존 placeholder 5개 카드 중
+  "수집 기준 안내"/"보안 확인 및 부분 저장 안내"/"사용자 주의사항"을 실제
+  문구가 있는 "1. 수집 방식"/"2. 수집 개수"/"3. 안전 중단"/"4. 데이터 제공
+  범위"/"5. 이용 책임" 5개 카드로 교체하고, "유지보수/A/S 안내"·"라이선스
+  안내"는 기존과 동일하게 placeholder로 유지(개발 마지막 단계 별도 태스크,
+  이번 범위 아님). 기존 카드·스크롤 레이아웃 구조는 그대로 재사용했고,
+  다른 메서드는 전혀 건드리지 않았다.
+- 신규 `tests/test_ui_policy_text.py`: README/LEGAL_NOTICE/안내·정책 탭
+  문구를 텍스트/소스 기반으로 검증하는 13개 테스트(§아래).
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## 낡은 표현 처리 방식(사용자 확인 완료)
+work order는 LEGAL_NOTICE의 "10건 이내" 표현 "제거"를 요청했지만, 이
+프로젝트의 전역 문서화 규칙(`documentation.md`)은 "변경 이력을 누적하는
+문서는 날짜 기반으로 새 섹션만 추가하고 과거 기록은 수정하지 않는다"고
+명시하며, LEGAL_NOTICE.md는 이미 스스로 이 append-only 패턴(4→5 섹션 승계)
+을 따르고 있어 규칙 충돌이 있었다. AskUserQuestion으로 확인한 결과 "과거
+섹션 보존 + 최신 섹션만 검증"으로 진행하기로 확정했다 - 4번 섹션의 "10건
+이내"는 역사적 기록으로 그대로 남기고, 최신 섹션(6번)에는 그 표현이 전혀
+등장하지 않으며 "위 제4항에 기재된 과거의 소량 기준은 더 이상 적용되지
+않습니다"로 대체 서술했다. `check_legal_notice_current_section_no_stale_limit`
+테스트가 "마지막 '## ' 섹션"만 잘라 그 안에 "10건 이내"가 없는지 확인한다.
+
+## README 주요 변경
+- 섹션 1: 지역+키워드 선택 → 검색 조합 생성 → 브라우저가 검색 과정에서
+  정상적으로 수신한 응답 처리 → Excel 저장 흐름으로 재작성. "별도의 HTTP
+  클라이언트로 네이버 엔드포인트를 직접 호출하는 구조는 사용하지 않습니다"
+  명시. 레거시 엔진은 "내부 롤백 경로로 보존되어 있으나 현재 기본 실행
+  경로는 아님"으로 한 줄 언급만 유지(더 이상 선택 가능한 기능처럼 서술하지
+  않음).
+- 섹션 2: 11컬럼을 단일 세트로 통합(빠른/상세 이원화 서술 제거).
+  업체명/업종/리뷰수/주소/대표전화/플레이스 URL/수집일은 검색 목록 응답
+  값 그대로(값 없으면 빈칸), 홈페이지/인스타/블로그는 도메인 분류 값(없으면
+  빈칸), **새로오픈여부는 현재 항상 빈칸**임을 명시(실제 코드
+  `network_list_scraper._map_item_to_row`의 `"새로오픈여부": ""` 하드코딩
+  확인 후 기술).
+- 섹션 3: 0건이면 Excel 파일을 만들지 않는다는 문장을 맨 앞에 명시, 저장
+  경로 타임스탬프 형식 수정, `원본_모바일`/`원본_PC`가 "항상 헤더만 있는
+  빈 시트"임을 명시(exporter에 mobile/pc 인자로 항상 빈 리스트가 전달됨).
+- 신규 섹션 4: per_query_limit(30)/target_count(300) 표 구분, stop_reason별
+  저장 정책 표(target_reached/queue_exhausted/security_blocked/status_429/
+  navigation_error/user_stopped 전부 "결과 있으면 저장"), "항상 부분
+  저장된다"는 표현은 쓰지 않고 "결과가 1건 이상 있을 때만 저장" 명시,
+  exporter 자체 오류 시 저장되지 않을 수 있음을 과장 없이 안내.
+
+## LEGAL_NOTICE 주요 변경
+신규 섹션 6(Network/List 경로 반영): 목록 응답 관찰 방식 + 직접 HTTP 호출
+없음, per_query_limit/target_count 기준 수집 규모(과거 "10건 이내" 기준
+대체), CAPTCHA/429 비우회, 데이터 정확성·완전성 미보장, "네이버 공식·제휴
+제품 아님", 사용자 준수 의무. 기존 섹션 1~5(공개정보 수집 원칙, 개인정보
+미수집, 면책조항, 과거 V1/PC 경로 기록)는 전혀 수정하지 않았다. 법적
+확정/보장 표현("합법을 보장합니다" 등)은 기존에도 없었고 이번에도 추가하지
+않았다(`check_legal_notice_no_legal_guarantee_wording`로 확인).
+
+## 안내·정책 탭 변경
+`_build_policy_tab()`의 placeholder 5개 중 3개를 실제 문구가 있는 5개
+섹션(수집 방식/수집 개수/안전 중단/데이터 제공 범위/이용 책임)으로
+교체했다. 상단 안내 문구를 "이 영역은 정식 배포 전 최종 안내 문구를 작성할
+예정입니다"에서 "핵심 수집 정책을 요약합니다. 자세한 내용은 README.md/
+LEGAL_NOTICE.md를 확인하세요"로 바꿨다. "유지보수/A/S 안내"·"라이선스
+안내"는 그대로 placeholder 유지(1PC 라이선스 인증, 결제/고객센터/계정
+기능은 여전히 별도 태스크). 기존 카드·스크롤 프레임 구조와 레이아웃은
+재설계하지 않고 그대로 재사용했다.
+
+## 수집 방식 설명
+"검색 결과 목록 화면에서 브라우저가 검색 과정 중 정상적으로 수신한 응답을
+처리합니다. 별도의 HTTP 클라이언트로 네이버 엔드포인트를 직접 호출하는
+구조는 사용하지 않습니다"로 README/LEGAL_NOTICE/안내·정책 탭 3곳에 동일하게
+반영했다(`network_browser_collector.py`가 `page.goto()` + response listener
+방식만 쓰고 `requests`/`httpx`/`urllib.request` 등을 전혀 import하지 않음을
+grep으로 재확인 후 기술).
+
+## 수집량·목표 미달 설명
+검색 조합당 수집 상한(30)과 전체 목표 저장 개수(300)를 표로 명확히
+구분했다. "300개 보장"이라는 표현은 어디에도 긍정 주장 형태로 쓰지 않았고,
+오히려 "'300개 보장'을 의미하지 않습니다"처럼 명시적으로 부인하는
+문장으로만 등장한다(`check_forbidden_hype_phrases_absent`가 부정 문맥은
+오탐으로 걸러내고 긍정 주장 형태만 위반으로 잡도록 설계됨).
+
+## 중단·부분 저장 정책
+target_reached/queue_exhausted(목표 미달 가능)/security_blocked/status_429/
+navigation_error/user_stopped 6가지 stop_reason 모두 "결과가 있으면 저장"
+표로 정리했다(`src/pc/network_pipeline.py`/`src/ui.py::_export_network_result`
+실제 동작과 대조 확인, 두 파일 모두 무수정). "항상 부분 저장된다"는 표현은
+쓰지 않았고, 결과 0건이면 어떤 stop_reason이든 저장하지 않는다는 조건을
+분리해 명시했다. exporter 자체 오류(디스크 쓰기 실패 등) 시 저장되지 않을
+수 있다는 점도 과장 없이 한 줄로 안내했다.
+
+## 새로오픈 및 필드 공백 정책
+새로오픈 필터가 현재 비활성화 상태이며 새로오픈여부 열은 항상 빈칸임을
+README/LEGAL_NOTICE/안내·정책 탭에 일관되게 명시했다. 홈페이지/인스타/
+블로그/전화 등도 검색 응답에 값이 없으면 빈칸일 수 있음을 함께 안내했다.
+
+## 공식 제품·법적 보장 표현 검토
+"본 프로그램은 네이버 공식 제품이거나 네이버와 제휴한 제품이 아닙니다"를
+README 섹션 1과 LEGAL_NOTICE 섹션 6에 추가했다. LEGAL_NOTICE 전체를
+재확인한 결과 "합법을 보장합니다"/"이용약관 위반이 아닙니다"/"법적 문제가
+없습니다"/"네이버가 허용했습니다" 등 금지된 법적 확정 표현은 기존에도
+없었고 이번에도 추가하지 않았다.
+
+## 참고(코드 변경 아님, 개발 기록용 관찰)
+`src/pc/network_list_scraper.py::_build_place_url`은 응답에 명시적 URL
+필드가 없으면 `https://pcmap.place.naver.com/place/{place_id}/home`로
+플레이스 URL을 best-effort 구성하며, 함수 자체 docstring이 "PoC 단계의
+임시 구성 - 실사용 전 검증 필요"라고 명시한다(업종별 세그먼트가 실제로는
+다를 수 있음, live 재검증 안 됨). 이번 WIRE-2D는 코드를 수정하지 않았고
+README에는 "플레이스 URL"이라고만 표기해 이 PoC 단계 세부사항까지는
+노출하지 않았다 - 이후 live 검증 단계에서 실제로 유효한 리다이렉트인지
+확인이 필요하다는 사실만 이 기록에 남긴다.
+
+## 신규 문서 테스트 결과
+`tests/test_ui_policy_text.py`(신규) 13건 전부 PASS: README에 Network/List
+흐름 설명 존재 / per_query_limit=30·target_count=300 구분 / 목표 미달 가능
+문구 / CAPTCHA·429 우회 없음 / 0건 파일 미생성 / 새로오픈 필터 미지원 /
+필드 공백 가능 / 별도 HTTP 클라이언트 직접 호출 없음 / 공식·제휴 제품 아님
+고지 / LEGAL_NOTICE 최신 섹션에 낡은 "10건 이내" 없음(과거 섹션은 보존) /
+LEGAL_NOTICE에 법적 확정 보장 표현 없음 / UI 안내·정책 탭 핵심 문구(5개
+섹션 제목 + 우회 없음/직접 호출 없음) 존재 / README·LEGAL_NOTICE에 과장·
+보장성 금지 표현이 긍정 주장 형태로는 없음(부정 문맥 오탐 방지).
+
+## 전체 회귀 결과
+- `python -m py_compile src/ui.py tests/test_ui_network_wiring.py tests/test_ui_network_export.py tests/test_ui_network_start.py tests/test_ui_policy_text.py` PASS.
+- `tests/test_ui_policy_text.py` 13건 전부 PASS.
+- `tests/test_ui_network_start.py` 12건 전부 PASS(무영향, `_build_policy_tab`
+  외 다른 메서드 무수정 재확인).
+- `tests/test_ui_network_wiring.py` 19건 전부 PASS(무영향).
+- `tests/test_ui_network_export.py` 7건 전부 PASS(무영향).
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향, 파일 무수정).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향, 파일 무수정).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, legacy 경로 무변경 재확인).
+
+## live/Playwright/네이버/app.py/UI/build/EXE 실행 여부
+**전부 실행 안 함.** 이번 단계는 텍스트 파일(README/LEGAL_NOTICE) 읽기/
+쓰기와 `src/ui.py`의 `_build_policy_tab()` 문자열 리터럴 수정, 그리고
+`inspect.getsource()`/파일 텍스트 기반 검증만 수행했다. 실제 Playwright/
+브라우저/네이버 접속, app.py 실행, 실제 Tk 창, build/EXE 실행은 전혀 없다.
+live 10/50/300 제품 검증은 아직 미실행 상태로 남아있다.
+
+## 커밋 관련
+WIRE-2C-2(엔진 전환)와 WIRE-2D(문서 정합성)를 검토 후 한 커밋으로 묶을
+예정이므로, 이번 단계에서도 git add/commit을 하지 않았다.

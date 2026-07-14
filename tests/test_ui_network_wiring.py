@@ -527,6 +527,11 @@ def check_parse_positive_int_validation(reporter: ValidationReporter) -> None:
 
 
 def check_legacy_path_untouched(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-2: start_crawl은 이제 _DEFAULT_COLLECTION_ENGINE에
+    따라 _start_network_crawl(기본값)/_start_legacy_crawl(내부 롤백)로만
+    위임하는 얇은 dispatcher다. legacy 메서드(_run_queue_pipeline 등)는
+    전부 보존되고, _start_legacy_crawl은 여전히 _run_queue_pipeline만
+    호출하며 _run_network_pipeline은 호출하지 않는다."""
     import inspect
 
     has_methods = (
@@ -535,56 +540,60 @@ def check_legacy_path_untouched(reporter: ValidationReporter) -> None:
         and hasattr(ui.SalesDbCrawlerApp, "_collect_basic_query")
         and hasattr(ui.SalesDbCrawlerApp, "_collect_premium_query_legacy")
         and hasattr(ui.SalesDbCrawlerApp, "_run_network_pipeline")
+        and hasattr(ui.SalesDbCrawlerApp, "_start_legacy_crawl")
+        and hasattr(ui.SalesDbCrawlerApp, "_start_network_crawl")
     )
-    start_crawl_source = inspect.getsource(ui.SalesDbCrawlerApp.start_crawl)
-    still_legacy_default = (
-        "self._run_queue_pipeline" in start_crawl_source
-        and "self._run_network_pipeline" not in start_crawl_source
+    legacy_source = inspect.getsource(ui.SalesDbCrawlerApp._start_legacy_crawl)
+    legacy_preserved = (
+        "self._run_queue_pipeline" in legacy_source
+        and "self._run_network_pipeline" not in legacy_source
     )
+    network_is_default = ui._DEFAULT_COLLECTION_ENGINE == "network"
 
-    if has_methods and still_legacy_default:
-        reporter.pass_("기존 legacy 경로 무영향: _run_queue_pipeline/_collect_premium_query 등 보존, start_crawl 기본 실행 경로는 여전히 legacy")
+    if has_methods and legacy_preserved and network_is_default:
+        reporter.pass_("legacy 경로 보존 + 기본 엔진 전환: _run_queue_pipeline 등 legacy 메서드 보존, _start_legacy_crawl은 여전히 _run_queue_pipeline만 호출, 기본 엔진은 network")
     else:
-        reporter.fail(f"legacy 경로 무영향 결과가 예상과 다름: has_methods={has_methods}, still_legacy_default={still_legacy_default}")
+        reporter.fail(f"legacy 경로 보존 결과가 예상과 다름: has_methods={has_methods}, legacy_preserved={legacy_preserved}, network_is_default={network_is_default}")
 
 
-def check_legacy_default_per_query_limit_preserved(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2B-2A/2C-1: start_crawl이 여전히 legacy를 실행하는 동안
-    limit_var의 화면 기본값은 300으로 유지되어야 한다."""
-    ok = ui._DEFAULT_PER_QUERY_LIMIT == "300" and ui._DEFAULT_TARGET_COUNT == "300"
+def check_default_values_for_network_engine(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-2: Network/List가 기본 실행 경로가 되면서
+    per_query_limit 기본값이 30으로 다시 바뀌어야 한다(target_count는
+    300 그대로)."""
+    ok = ui._DEFAULT_PER_QUERY_LIMIT == "30" and ui._DEFAULT_TARGET_COUNT == "300"
     if ok:
-        reporter.pass_("legacy 기본값 보존: _DEFAULT_PER_QUERY_LIMIT=300, _DEFAULT_TARGET_COUNT=300 유지")
+        reporter.pass_("Network 기본값 전환: _DEFAULT_PER_QUERY_LIMIT=30, _DEFAULT_TARGET_COUNT=300")
     else:
         reporter.fail(
             f"기본값 결과가 예상과 다름: PER_QUERY_LIMIT={ui._DEFAULT_PER_QUERY_LIMIT}, TARGET_COUNT={ui._DEFAULT_TARGET_COUNT}"
         )
 
 
-def check_target_count_input_disabled_with_guidance(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2B-2A: target_count_var는 아직 start_crawl에 연결되지
-    않았으므로, 입력 위젯은 disabled 상태로 생성되고 "새 수집 엔진 연결 후
-    적용됩니다." 안내 문구가 함께 표시되어야 한다. 실제 Tk 위젯을 만들지
-    않고(헤드리스 테스트) 위젯 생성 소스 코드로 확인한다(check_legacy_path_untouched
-    와 동일한 검증 방식).
+def check_target_count_input_enabled_no_stale_guidance(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-2: target_count_var가 이제 _start_network_crawl에서
+    실제로 읽히므로, 입력 위젯은 더 이상 disabled로 생성되지 않고 "새 수집
+    엔진 연결 후 적용됩니다." 같은 낡은 안내 문구도 남아있지 않아야 한다.
+    실제 Tk 위젯을 만들지 않고(헤드리스 테스트) 위젯 생성 소스 코드로
+    확인한다(check_legacy_path_untouched와 동일한 검증 방식).
     """
     import inspect
 
     source = inspect.getsource(ui.SalesDbCrawlerApp._build_global_target_count_section)
     ok = (
-        'state="disabled"' in source
+        'state="disabled"' not in source
         and "target_count_entry" in source
-        and "새 수집 엔진 연결 후 적용됩니다." in source
+        and "새 수집 엔진 연결 후 적용됩니다." not in source
     )
     if ok:
-        reporter.pass_("target_count 준비 상태: 입력 위젯 disabled 생성 + 안내 문구 존재")
+        reporter.pass_("target_count 활성화: 입력 위젯이 disabled 없이 생성되고 낡은 안내 문구가 제거됨")
     else:
-        reporter.fail(f"target_count 준비 상태 결과가 예상과 다름: source에 disabled/안내 문구 포함 여부 확인 실패\n{source}")
+        reporter.fail(f"target_count 활성화 결과가 예상과 다름: source에서 disabled/낡은 안내 문구 제거 확인 실패\n{source}")
 
 
-def check_run_network_pipeline_ignores_target_count_disabled_state(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2B-2A: target_count 입력이 화면에서 비활성화되어도
-    _run_network_pipeline 자체는 전달받은 target_count를 그대로
-    orchestrator에 넘겨야 한다(fake wiring 구조 무영향 확인)."""
+def check_run_network_pipeline_passes_target_count_through(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-2: _run_network_pipeline 자체는 여전히 전달받은
+    target_count를 그대로 orchestrator에 넘긴다(worker 계약 자체는 이번
+    단계에서 변경하지 않았음을 재확인)."""
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
     result = _base_result(stop_reason="target_reached", final_count=3, rows=_fake_rows(3))
@@ -597,7 +606,7 @@ def check_run_network_pipeline_ignores_target_count_disabled_state(reporter: Val
 
     ok = calls and calls[0]["target_count"] == 300
     if ok:
-        reporter.pass_("Network worker 무영향: target_count=300이 UI 비활성화와 무관하게 orchestrator에 그대로 전달됨")
+        reporter.pass_("Network worker 계약 무변경: target_count=300이 orchestrator에 그대로 전달됨")
     else:
         reporter.fail(f"Network worker 결과가 예상과 다름: calls={calls}")
 
@@ -621,9 +630,9 @@ def main() -> int:
     check_should_continue_reflects_stop_event(reporter)
     check_parse_positive_int_validation(reporter)
     check_legacy_path_untouched(reporter)
-    check_legacy_default_per_query_limit_preserved(reporter)
-    check_target_count_input_disabled_with_guidance(reporter)
-    check_run_network_pipeline_ignores_target_count_disabled_state(reporter)
+    check_default_values_for_network_engine(reporter)
+    check_target_count_input_enabled_no_stale_guidance(reporter)
+    check_run_network_pipeline_passes_target_count_through(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

@@ -80,16 +80,21 @@ _OUTER_PAD_Y = (14, 14)
 # 고정하고, 남는 폭은 오른쪽 수집 현황/로그 패널이 전부 가져가게 한다.
 _LEFT_PANEL_MIN_WIDTH = 420
 
-# ARCH-300C WIRE-2B-2A: per_query_limit(검색 조합당 수집 상한, limit_var)의
-# "진짜" 권장 기본값은 target_count와 분리된 의미(조합 하나에서 과도하게
-# 긁어오지 않는 상한)로는 30이 맞지만, 그 기본값은 Network/List가 기본
-# 실행 경로가 된 뒤(WIRE-2C)에만 바꾼다. 지금은 start_crawl이 여전히
-# legacy _run_queue_pipeline을 실행하고 limit_var를 legacy의 유일한 "수집
-# 개수" 입력으로 그대로 쓰기 때문에, 화면 기본값만 30으로 바꿔도 legacy
-# 기본 수집량이 300건 상당에서 30건 상당으로 줄어드는 실질적 회귀가
-# 된다(WIRE-2B-2에서 실제로 발생했던 문제) - 그래서 300으로 되돌린다.
-_DEFAULT_PER_QUERY_LIMIT = "300"
+# ARCH-300C WIRE-2C-2: Network/List가 기본 실행 경로가 되면서(§start_crawl,
+# _DEFAULT_COLLECTION_ENGINE) per_query_limit(검색 조합당 수집 상한, limit_var)의
+# "진짜" 권장 기본값 30을 다시 적용한다 - WIRE-2B-2A에서 300으로 되돌린 이유
+# (legacy _run_queue_pipeline이 limit_var를 유일한 "수집 개수" 입력으로 그대로
+# 쓰던 문제)는 legacy가 더 이상 기본 실행 경로가 아니게 되면서 해소됐다.
+# legacy 경로(_start_legacy_crawl, _DEFAULT_COLLECTION_ENGINE="legacy"로 내부
+# 전환 시에만 진입)는 이 기본값 변경과 무관하게 여전히 존재한다.
+_DEFAULT_PER_QUERY_LIMIT = "30"
 _DEFAULT_TARGET_COUNT = "300"
+
+# ARCH-300C WIRE-2C-2: 기본 수집 엔진을 고르는 내부 전환 지점이다. 사용자
+# 화면에는 엔진 선택 UI를 노출하지 않는다 - "network"가 기본 실행 경로이고,
+# "legacy"는 문제 발생 시 코드 수정으로만 되돌릴 수 있는 내부 롤백 경로다
+# (§start_crawl/_start_legacy_crawl/_start_network_crawl).
+_DEFAULT_COLLECTION_ENGINE = "network"
 
 def _parse_positive_int(raw: str) -> int | None:
     """문자열을 양의 정수로 파싱한다(WIRE-2B-2: per_query_limit/target_count
@@ -217,26 +222,20 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         self.selected_city_var = ctk.StringVar(value="서울특별시")
         self.keyword_input_var = ctk.StringVar(value="카페")
-        # UI-CLEANUP-1D-B 정합성 점검(이후 ARCH-300C WIRE-2B-2로 갱신): 이 값은
-        # legacy 경로(basic/premium, _run_queue_pipeline)에서는 여전히 (1) 전체
-        # 최종 저장 목표가 아니라 (2) 각 검색 조합(쿼리) 하나당 상한
-        # (per_query_limit)으로만 쓰인다 - legacy 파이프라인에는 쿼리 간
-        # place_id dedup이 연결되어 있지 않기 때문이다(그대로 유지, 이번
-        # 단계에서 legacy 경로는 수정하지 않는다). 신규 Network/List 경로
-        # (§_run_network_pipeline)에서는 이 값이 진짜 per_query_limit 의미로
-        # run_collection_plan에 전달되고, 전체 목표는 별도
-        # target_count_var(§_build_global_target_count_section)가 담당한다.
+        # ARCH-300C WIRE-2C-2: 기본 실행 경로가 Network/List(_start_network_crawl)
+        # 로 바뀌면서 이 값은 진짜 per_query_limit 의미(검색 조합 하나당 상한,
+        # run_collection_plan에 그대로 전달)로 쓰인다. legacy 경로
+        # (_start_legacy_crawl, 내부 롤백 시에만 진입)에서는 기존과 동일하게
+        # 각 검색 조합(쿼리) 하나당 상한으로만 쓰이고 쿼리 간 dedup은 없다.
         self.limit_var = ctk.StringVar(value=_DEFAULT_PER_QUERY_LIMIT)
         # ARCH-300C WIRE-2B-2: 전역 place_id dedup 이후 최종 저장할 목표
         # 개수(target_count). run_collection_plan(WIRE-1)이 이 값에 도달하면
         # 남은 검색 조합을 실행하지 않고 조기 종료한다(실제 orchestrator 동작과
         # 일치 - "300개 보장"이 아니라 "도달 시 남은 조합 중단"). legacy 경로
         # (_run_queue_pipeline)는 이 값을 사용하지 않는다.
-        # WIRE-2B-2A: start_crawl이 아직 이 값을 읽지 않으므로(Network/List
-        # 미배선), 사용자가 값을 바꿔도 지금은 실제로 아무 효과가 없다 - 그래서
-        # 입력 위젯 자체를 임시로 비활성화한다(§_build_global_target_count_section).
-        # _run_network_pipeline은 이 값을 계속 정상적으로 사용한다(fake wiring
-        # 테스트로 검증됨) - 비활성화는 화면(legacy 진입점)에서만 적용된다.
+        # WIRE-2C-2: Network/List가 기본 실행 경로가 되면서 이 값을 실제로
+        # start_crawl(_start_network_crawl)이 읽고 검증한다(§_parse_positive_int)
+        # - 입력 위젯 활성화(§_build_global_target_count_section).
         self.target_count_var = ctk.StringVar(value=_DEFAULT_TARGET_COUNT)
         # 수집모드 선택 UI는 제거하지만, 내부적으로는 기존 PC 상세 수집 경로
         # (premium)를 그대로 기본값으로 사용한다(엔진 코드는 삭제하지 않음).
@@ -471,11 +470,16 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 블로그는 이제 기본 수집 컬럼으로 항상 가져오므로 "있는 업체만" 필터가
         # 더 이상 필요하지 않다. 단, 엑셀 결과의 홈페이지/인스타/블로그 컬럼
         # 자체는 그대로 유지한다(exporter.MERGED_COLUMNS 변경 없음).
-        self.new_open_checkbox = ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var)
+        # ARCH-300C WIRE-2C-2: Network/List 매핑에서는 새로오픈여부를 신뢰성
+        # 있게 제공하지 않으므로(§_start_network_crawl에서 항상 False로
+        # 정규화), 기본 실행 경로에서 동작하는 필터처럼 보이지 않도록 체크박스를
+        # disabled로 두고 안내 문구를 보여준다 - 체크된 상태로 disabled되면
+        # "적용된 것"으로 오해할 수 있어 초기값도 항상 False다(§new_open_only_var).
+        self.new_open_checkbox = ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var, state="disabled")
         self.new_open_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             filter_frame,
-            text="체크 시 새로오픈 업체만 저장합니다.\n체크 해제 시 전체 업체를 포함합니다.",
+            text="현재 기본 수집에서는 새로오픈 필터를 지원하지 않습니다.",
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
 
@@ -513,22 +517,19 @@ class SalesDbCrawlerApp(ctk.CTk):
     def _build_global_target_count_section(self):
         # ARCH-300C WIRE-2B-2: 검색 조합당 상한(§_build_target_count_section,
         # per_query_limit)과는 별개로, 전역 dedup 이후 최종 저장할 목표
-        # 개수(target_count)를 입력받는다. 아직 Network/List 경로가 기본
-        # 실행 경로가 아니므로(§_run_network_pipeline, §start_crawl) 이 값은
-        # legacy 경로(basic/premium)에서는 쓰이지 않는다 - 다만 UI 필드 자체는
-        # 미리 준비해 둔다. run_collection_plan이 실제로 "목표 도달 시 남은
-        # 검색 조합 중단"을 구현하고 있으므로 그 문구만 사용하고, "300개
-        # 보장"처럼 과장된 표현은 쓰지 않는다.
-        # WIRE-2B-2A: start_crawl이 아직 이 값을 읽지 않으므로, 사용자가
-        # 입력해도 지금은 아무 효과가 없다 - 동작하는 옵션처럼 오해하지
-        # 않도록 입력 위젯을 비활성화(disabled)해 둔다. 활성화 및 start_crawl
-        # 연결은 WIRE-2C(Network/List 기본 전환)에서 진행한다.
+        # 개수(target_count)를 입력받는다. run_collection_plan이 실제로 "목표
+        # 도달 시 남은 검색 조합 중단"을 구현하고 있으므로 그 문구만 사용하고,
+        # "300개 보장"처럼 과장된 표현은 쓰지 않는다.
+        # WIRE-2C-2: Network/List가 기본 실행 경로가 되어 start_crawl
+        # (_start_network_crawl)이 이 값을 실제로 읽고 검증하므로 입력 위젯을
+        # 활성화한다(WIRE-2B-2A 당시의 임시 disabled 안내 문구는 더 이상
+        # 사실이 아니므로 제거했다).
         ctk.CTkLabel(self.left_panel, text="6. 전체 목표 저장 개수", font=ctk.CTkFont(size=14, weight="bold")).grid(row=10, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
         global_target_frame = ctk.CTkFrame(self.left_panel)
         global_target_frame.grid(row=11, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
         global_target_frame.grid_columnconfigure(0, weight=1)
 
-        self.target_count_entry = ctk.CTkEntry(global_target_frame, textvariable=self.target_count_var, width=100, state="disabled")
+        self.target_count_entry = ctk.CTkEntry(global_target_frame, textvariable=self.target_count_var, width=100)
         self.target_count_entry.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             global_target_frame,
@@ -537,11 +538,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 "업종·지역 및 검색 결과에 따라 목표 개수에 미달할 수 있습니다."
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
-        ctk.CTkLabel(
-            global_target_frame, text="새 수집 엔진 연결 후 적용됩니다.",
-            anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
-        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
@@ -644,11 +641,13 @@ class SalesDbCrawlerApp(ctk.CTk):
             ctk.CTkLabel(card, text=example, justify="left", anchor="w", text_color="gray").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_policy_tab(self):
-        # [안내·정책] 탭은 이번 단계에서 "자리"만 만든다 - 최종 판매/유지보수/
-        # 라이선스 정책 문구는 개발이 끝난 뒤 확정해서 다시 쓸 예정이므로,
-        # 지금 길게 확정된 법률 문서처럼 작성하지 않는다. 1PC 라이선스 인증,
-        # 결제/고객센터/계정 기능은 여기서 구현하지 않는다(개발 마지막 단계의
-        # 별도 태스크).
+        # ARCH-300C WIRE-2D: [안내·정책] 탭에 실제 동작과 일치하는 핵심 정책을
+        # 요약해 채운다(POLICY-ALIGN-1 감사 결과 반영). 장문의 README/
+        # LEGAL_NOTICE 전체를 옮기지 않고 핵심 문장만 담는다 - 자세한 내용은
+        # README.md/LEGAL_NOTICE.md를 참고하도록 안내한다. 유지보수/A/S,
+        # 라이선스 안내(1PC 인증, 결제/고객센터/계정 기능 등)는 여전히 개발
+        # 마지막 단계의 별도 태스크이므로 placeholder를 유지한다. 기존
+        # 카드·스크롤 레이아웃 구조는 그대로 재사용한다.
         self.policy_tab.grid_rowconfigure(0, weight=1)
         self.policy_tab.grid_columnconfigure(0, weight=1)
 
@@ -658,23 +657,57 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         ctk.CTkLabel(container, text="안내·정책", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w", pady=(4, 4))
         ctk.CTkLabel(
-            container, text="이 영역은 정식 배포 전 최종 안내 문구를 작성할 예정입니다.",
+            container, text="핵심 수집 정책을 요약합니다. 자세한 내용은 README.md/LEGAL_NOTICE.md를 확인하세요.",
             anchor="w", text_color="gray",
         ).grid(row=1, column=0, sticky="w", pady=(0, 16))
 
+        policy_sections = [
+            (
+                "1. 수집 방식",
+                "검색 결과 목록 화면에서 브라우저가 검색 과정 중 정상적으로 수신한 응답을 처리합니다.\n"
+                "별도의 HTTP 클라이언트로 네이버 엔드포인트를 직접 호출하는 구조는 사용하지 않습니다.",
+            ),
+            (
+                "2. 수집 개수",
+                "검색 조합당 수집 상한(기본 30)과 전체 목표 저장 개수(기본 300)는 서로 다른 값입니다.\n"
+                "전체 목표 저장 개수는 최대 목표값이며 보장값이 아니고, 검색 결과에 따라 미달할 수 있습니다.",
+            ),
+            (
+                "3. 안전 중단",
+                "CAPTCHA(보안 확인)·요청 제한(429)이 감지되면 우회하지 않고 즉시 중단합니다.\n"
+                "중단 시점까지 수집된 결과가 있으면 저장하고, 결과가 없으면 저장하지 않습니다.",
+            ),
+            (
+                "4. 데이터 제공 범위",
+                "업체별로 홈페이지·인스타·블로그·전화 등 일부 필드가 검색 응답에 없으면 빈칸일 수 있습니다.\n"
+                "새로오픈 업체만 수집 필터는 현재 지원하지 않습니다(항상 비활성화).",
+            ),
+            (
+                "5. 이용 책임",
+                "수집 결과의 사용 목적과 개인정보·영업 활용에 대한 책임은 사용자에게 있습니다.\n"
+                "본 프로그램은 네이버 공식 제품이거나 네이버와 제휴한 제품이 아닙니다.",
+            ),
+        ]
+        row = 2
+        for title, body in policy_sections:
+            card = ctk.CTkFrame(container)
+            card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+            card.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+            ctk.CTkLabel(card, text=body, justify="left", anchor="w", text_color="gray").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+            row += 1
+
         placeholder_sections = [
-            "수집 기준 안내",
-            "보안 확인 및 부분 저장 안내",
             "유지보수 / A/S 안내",
             "라이선스 안내",
-            "사용자 주의사항",
         ]
-        for index, title in enumerate(placeholder_sections, start=2):
+        for title in placeholder_sections:
             card = ctk.CTkFrame(container)
-            card.grid(row=index, column=0, sticky="ew", pady=(0, 10))
+            card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
             card.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
             ctk.CTkLabel(card, text="정식 배포 전 작성 예정", anchor="w", text_color="gray").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+            row += 1
 
     def _on_city_changed(self, _city: str):
         self._reload_district_data()
@@ -969,11 +1002,11 @@ class SalesDbCrawlerApp(ctk.CTk):
         for widget in self._iter_children(self.left_panel):
             if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkEntry, ctk.CTkRadioButton, ctk.CTkOptionMenu)):
                 widget.configure(state=state)
-        # WIRE-2B-2A: target_count_entry는 아직 legacy 실행(start_crawl)에
-        # 연결되지 않았으므로, 수집 시작/종료로 좌측 패널 상태가 바뀌어도
-        # 항상 비활성 상태를 유지한다(WIRE-2C에서 활성화 예정).
-        if hasattr(self, "target_count_entry"):
-            self.target_count_entry.configure(state="disabled")
+        # ARCH-300C WIRE-2C-2: 새로오픈 체크박스는 Network 기본 경로에서
+        # 신뢰성 있게 지원되지 않으므로(§_build_filter_section), 좌측 패널이
+        # normal로 복구되어도 다시 활성화되지 않도록 항상 disabled를 유지한다.
+        if hasattr(self, "new_open_checkbox"):
+            self.new_open_checkbox.configure(state="disabled")
 
     def _iter_children(self, parent):
         for child in parent.winfo_children():
@@ -1130,6 +1163,23 @@ class SalesDbCrawlerApp(ctk.CTk):
         return None
 
     def start_crawl(self):
+        """ARCH-300C WIRE-2C-2: 기본 실행 경로를 고르는 진입점.
+
+        `_DEFAULT_COLLECTION_ENGINE`(내부 상수, UI 노출 없음)이 "network"면
+        `_start_network_crawl`(기본값), "legacy"면 `_start_legacy_crawl`(내부
+        롤백 경로)로 위임한다. 두 경로 모두 이 메서드가 button command로
+        연결된 시그니처(self, 인자 없음)를 그대로 유지한다.
+        """
+        if _DEFAULT_COLLECTION_ENGINE == "legacy":
+            self._start_legacy_crawl()
+        else:
+            self._start_network_crawl()
+
+    def _start_legacy_crawl(self):
+        # ARCH-300C WIRE-2C-2: WIRE-2C-1까지의 start_crawl 본문을 그대로
+        # 옮긴 것이다(검증 순서/동작 무변경) - _run_queue_pipeline(basic/premium)
+        # 을 실행하는 내부 롤백 경로이며, _DEFAULT_COLLECTION_ENGINE="legacy"로
+        # 바꿔야만 진입한다.
         raw_keyword = self.keyword_input_var.get()
         output_path = self.output_path_var.get().strip()
         mode = self.mode_var.get()
@@ -1208,6 +1258,119 @@ class SalesDbCrawlerApp(ctk.CTk):
             args=(query_queue, limit, output_path, mode, new_open_only, review_min, review_max),
             daemon=True,
         ).start()
+
+    def _start_network_crawl(self):
+        """ARCH-300C WIRE-2C-2: Network/List 기본 실행 경로.
+
+        흐름(요청서 §5 그대로): 입력 검증(키워드/per_query_limit/target_count/
+        저장 경로/지역) → query_queue 생성 → stop_event.clear() → 실행 중 UI
+        상태 적용 → Network worker thread 시작(`_run_network_pipeline_worker`
+        경유 → `_run_network_pipeline`). 저장 정책(stop_reason별 저장, 0건
+        미저장, exporter 실패 처리)은 WIRE-2C-1의 `_run_network_pipeline`/
+        `_export_network_result`/`_network_stop_message`를 그대로 재사용하고
+        이번 단계에서 다시 손대지 않는다.
+        """
+        raw_keyword = self.keyword_input_var.get()
+        output_path = self.output_path_var.get().strip()
+
+        if not self.get_selected_districts():
+            self.log("[ui] 실패: 구를 1개 이상 선택하세요")
+            return
+
+        keyword_error = self._validate_single_keyword(raw_keyword)
+        if keyword_error:
+            self.log(f"[ui] 실패: {keyword_error}")
+            self.show_error("키워드 입력 오류", keyword_error)
+            return
+
+        keyword = raw_keyword.strip()
+        if not keyword:
+            self.log("[ui] 실패: 키워드를 입력하세요")
+            return
+
+        per_query_limit = _parse_positive_int(self.limit_var.get())
+        if per_query_limit is None:
+            message = "검색 조합당 수집 상한은 양의 정수여야 합니다."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("입력 오류", message)
+            return
+
+        target_count = _parse_positive_int(self.target_count_var.get())
+        if target_count is None:
+            message = "전체 목표 저장 개수는 양의 정수여야 합니다."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("입력 오류", message)
+            return
+
+        if not output_path:
+            self.log("[ui] 실패: 저장 경로가 비어 있습니다")
+            return
+
+        query_queue = self._build_collection_queries()
+        if not query_queue:
+            message = "수집할 지역 또는 동/상권이 선택되지 않았습니다.\n최소 1개 이상의 구 또는 세부구역을 선택해주세요."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("지역/세부구역 선택 오류", message)
+            return
+
+        # 새로오픈 필터는 Network 기본 경로에서 신뢰성 있게 지원되지 않으므로
+        # (§_build_filter_section) 체크박스 상태와 무관하게 항상 False로
+        # 정규화한다 - 체크된 상태로 disabled되어 적용된 것처럼 오해하지
+        # 않도록 하는 방어다.
+        self.new_open_only_var.set(False)
+
+        # 저장 폴더 생성은 export_places_to_excel이 이미 담당한다(§src/exporter.py
+        # output_file.parent.mkdir) - rows가 0건이면 저장 자체를 하지 않으므로
+        # (§_export_network_result) 여기서 미리 폴더를 만들지 않는다.
+        saved_output_path = self.make_timestamped_output_path(output_path, "network")
+
+        self._reset_eta_state(len(query_queue))
+        self._reset_collection_stats()
+        self.pause_event.clear()
+        self.btn_pause.configure(text="일시정지")
+        self.stop_event.clear()
+        self.set_running(True)
+        self.set_status(f"검색 조합 {len(query_queue)}건 수집 대기 중")
+        self.progress_bar.set(0)
+        self.progress_percent_var.set(f"0/{len(query_queue)}")
+        self.eta_var.set("예상 남은 시간: 계산 중...")
+        self.last_output_path = saved_output_path
+
+        self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
+        self.log(f"[ui] 선택 구={', '.join(self.get_selected_districts())}")
+        self.log(f"[ui] 키워드={keyword}")
+        self.log(f"[ui] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
+        self.log(f"[ui] 저장 경로={saved_output_path}")
+
+        threading.Thread(
+            target=self._run_network_pipeline_worker,
+            args=(query_queue, per_query_limit, target_count, saved_output_path),
+            daemon=True,
+        ).start()
+
+    def _run_network_pipeline_worker(self, query_queue: list[dict], per_query_limit: int, target_count: int, output_path: str):
+        """ARCH-300C WIRE-2C-2: `_run_network_pipeline` 호출을 감싸는 최종
+        방어선 + UI 상태 복구 지점.
+
+        여기서 잡는 예외는 collector/orchestrator가 결과 dict조차 반환하지
+        못한 예상 밖 오류뿐이다(예: Playwright 시작 자체가 실패) - exporter
+        실패는 `_run_network_pipeline`/`_export_network_result`가 이미
+        result 메타(export_error)로 처리하므로 여기서 다시 다루지 않는다
+        (이중 처리 금지). 정상/예외 종료 어느 쪽이든 finally에서 기존
+        `set_running(False)`(내부적으로 self.after(0, ...) 사용)로 좌측
+        패널/시작 버튼을 복구한다 - `_run_queue_pipeline`의 finally와 동일한
+        원칙이다.
+        """
+        try:
+            self._run_network_pipeline(query_queue, per_query_limit, target_count, output_path)
+        except Exception as exc:
+            self.log(f"[ui][network] 예상하지 못한 오류: {exc}")
+            self.set_status("수집 중 오류가 발생했습니다.")
+        finally:
+            if self.stop_event.is_set():
+                self.after(0, self.eta_var.set, "예상 남은 시간: 중단됨")
+                self.after(0, self._cancel_eta_timer)
+            self.set_running(False)
 
     def _set_queue_progress(self, completed: int, total: int):
         progress = completed / total if total else 0
