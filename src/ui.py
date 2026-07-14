@@ -91,20 +91,6 @@ _LEFT_PANEL_MIN_WIDTH = 420
 _DEFAULT_PER_QUERY_LIMIT = "300"
 _DEFAULT_TARGET_COUNT = "300"
 
-# ARCH-300C WIRE-2B-2: run_collection_plan의 stop_reason별 사용자 로그/상태
-# 문구. queue_exhausted는 목표 미달 여부에 따라 동적으로 달라지므로 이
-# dict에는 넣지 않고 _network_stop_message에서 별도 처리한다. 아직 Excel
-# 저장이 연결되지 않았으므로 어떤 문구도 "저장했습니다"를 포함하지 않는다.
-_NETWORK_STOP_REASON_MESSAGES = {
-    "target_reached": "전체 목표 개수에 도달했습니다.",
-    "security_blocked": "보안 확인이 감지되어 수집을 중단했습니다.",
-    "status_429": "요청 제한이 감지되어 수집을 중단했습니다.",
-    "navigation_error": "브라우저 페이지 오류로 수집을 중단했습니다.",
-    "user_stopped": "사용자가 수집을 중단했습니다.",
-    "empty_jobs": "실행할 검색 조합이 없습니다.",
-}
-
-
 def _parse_positive_int(raw: str) -> int | None:
     """문자열을 양의 정수로 파싱한다(WIRE-2B-2: per_query_limit/target_count
     공용 입력 검증 helper, Tk 불필요).
@@ -1433,23 +1419,73 @@ class SalesDbCrawlerApp(ctk.CTk):
         self._run_queue_pipeline(query_queue, limit, output_path, mode)
 
     def _network_stop_message(self, result: dict, target_count: int) -> str:
-        """stop_reason별 로그/상태 문구를 만든다(ARCH-300C WIRE-2B-2).
+        """저장 결과까지 반영한 최종 상태 문구를 만든다(ARCH-300C WIRE-2C-1).
 
-        아직 Excel 저장이 연결되지 않았으므로 "저장했습니다" 표현은 쓰지
-        않는다. navigation_error는 CAPTCHA/보안 확인과 다른 원인이므로 별도
-        문구를 쓰고, 상세 메시지(navigation_error_message)는 여기서 노출하지
-        않는다(호출자가 로그에 짧게만 남긴다). queue_exhausted는 목표
-        미달 여부에 따라 문구를 분기한다("300개 보장"이라 말하지 않는다).
+        우선순위: 저장 실패(export_error) > 저장할 rows 없음(exported=False,
+        export_error=False) > stop_reason별 완료/부분 저장 문구. "저장했습니다"는
+        실제 저장이 성공(exported=True)했을 때만 쓴다 - export 실패 시 기존
+        완료 문구만 보여 성공으로 오인시키지 않기 위해 가장 먼저 검사한다.
+        navigation_error_message 전체는 여기서도 노출하지 않는다(로그 전용).
         """
+        if result.get("export_error"):
+            return "수집 결과를 Excel로 저장하지 못했습니다."
+        if not result.get("exported"):
+            return "저장할 결과가 없습니다."
+
+        final_count = result.get("final_count", 0)
         stop_reason = result.get("stop_reason")
+        if stop_reason == "target_reached":
+            return f"전체 목표 개수에 도달했습니다. {final_count}개를 저장했습니다."
         if stop_reason == "queue_exhausted":
-            final_count = result.get("final_count", 0)
             if target_count and final_count < target_count:
-                return f"선택한 지역 수집이 완료되었습니다. (목표 미달: {final_count}/{target_count})"
-            return "선택한 지역 수집이 완료되었습니다."
-        return _NETWORK_STOP_REASON_MESSAGES.get(
-            stop_reason, f"수집이 종료되었습니다. (stop_reason={stop_reason})"
-        )
+                return f"선택한 지역 수집이 완료되었습니다. 목표에는 미달했으며 {final_count}개를 저장했습니다."
+            return f"선택한 지역 수집이 완료되었습니다. {final_count}개를 저장했습니다."
+        if stop_reason == "security_blocked":
+            return f"보안 확인이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+        if stop_reason == "status_429":
+            return f"요청 제한이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+        if stop_reason == "navigation_error":
+            return f"브라우저 페이지 오류로 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+        if stop_reason == "user_stopped":
+            return f"사용자가 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+        return f"수집이 종료되었습니다. {final_count}개를 저장했습니다. (stop_reason={stop_reason})"
+
+    def _export_network_result(self, result: dict, output_path: str, excel_exporter) -> dict:
+        """orchestrator 결과의 rows를 Excel로 저장하는 단일 지점(ARCH-300C WIRE-2C-1).
+
+        저장은 이 메서드 한 곳에서만, 최대 1회 발생한다 - run_collection_plan에는
+        on_partial_save를 넘기지 않으므로 중간 저장과 종료 후 저장이 겹치는
+        이중 저장은 구조적으로 발생하지 않는다. rows가 비어 있으면(0건) 근거
+        없는 빈 Excel 파일을 남기지 않기 위해 excel_exporter를 아예 호출하지
+        않는다. result는 orchestrator가 반환한 원본 dict를 그대로 변형하지
+        않도록 복사해서 사용한다.
+        """
+        result = dict(result)
+        rows = result.get("rows") or []
+
+        if not rows:
+            result.update(exported=False, export_path="", export_error=False, export_error_message="")
+            self.log("[ui][network] 저장할 결과가 없어 Excel 저장을 건너뜁니다.")
+            return result
+
+        try:
+            # mobile/pc 원본 인자는 Network/List 경로에 해당 소스가 없으므로 빈
+            # 리스트로 전달한다 - exporter는 3시트 구조를 그대로 유지하되
+            # 원본_모바일/원본_PC는 헤더만 있는 빈 시트가 된다(exporter 무수정).
+            saved_path = excel_exporter(rows, [], [], output_path)
+            result.update(
+                exported=True, export_path=str(saved_path or output_path),
+                export_error=False, export_error_message="",
+            )
+            self.log(f"[ui][network] Excel 저장 완료: {result['export_path']} ({len(rows)}건)")
+        except Exception as exc:
+            # traceback/전체 경로를 사용자 상태 라벨에 노출하지 않는다 - 로그에만
+            # 짧게 남기고, 실패를 성공으로 오인하지 않도록 exported=False로 둔다.
+            message = f"{type(exc).__name__}: {exc}"[:200]
+            result.update(exported=False, export_path="", export_error=True, export_error_message=message)
+            self.log(f"[ui][network] Excel 저장 실패: {message}")
+
+        return result
 
     def _run_network_pipeline(
         self,
@@ -1460,29 +1496,31 @@ class SalesDbCrawlerApp(ctk.CTk):
         *,
         collector_factory=NetworkBrowserCollector,
         orchestrator=run_collection_plan,
+        excel_exporter=export_places_to_excel,
     ) -> dict:
-        """ARCH-300C WIRE-2B-2: Network/List 제품 흐름 worker(no-live 배선 검증용).
+        """ARCH-300C WIRE-2C-1: Network/List 제품 흐름 worker + Excel 저장 연결.
 
-        collector_factory/orchestrator는 의존성 주입 지점이다 - 기본값은
-        실제 NetworkBrowserCollector/run_collection_plan을 가리키지만, 이
-        메서드를 직접 실제로 호출(=Playwright 시작)할지는 전적으로 호출자가
-        무엇을 넘기느냐에 달려 있다(정의/기본값 참조만으로는 아무 것도
-        실행되지 않는다 - NetworkBrowserCollector.__enter__가 실제로 호출될
-        때만 Playwright가 시작된다). 이번 단계 테스트는 항상 fake를 주입해
-        실제 브라우저를 켜지 않는다.
+        collector_factory/orchestrator/excel_exporter는 의존성 주입 지점이다 -
+        기본값은 실제 NetworkBrowserCollector/run_collection_plan/
+        export_places_to_excel을 가리키지만, 기본값 참조만으로는 Playwright
+        시작도 파일 저장도 발생하지 않는다(실제로 호출될 때만 부작용이
+        생긴다). 이번 단계 테스트는 항상 fake를 주입해 실제 브라우저/파일
+        저장을 실행하지 않는다.
 
-        output_path는 이번 단계에서 실제 저장에 사용하지 않는다(Excel 저장/
-        SAFE-1 최종 통합은 WIRE-2C). 이 worker의 책임은 collected_at 생성 →
-        collector 생성 → run_collection_plan 호출 → 결과를 로그/상태에
-        반영하는 것까지다. "저장했습니다"/최종 완료 모달은 여기서 띄우지
-        않는다. legacy 경로(_run_queue_pipeline, basic/premium)는 이 메서드와
-        무관하게 그대로 동작한다.
+        저장은 collector(브라우저/session/context)가 완전히 종료된 뒤
+        `_export_network_result`에서만 수행한다 - 브라우저 자원 정리와 파일
+        저장은 실패 원인이 서로 다르므로 같은 try 블록에 섞지 않는다. 이
+        worker의 책임은 collected_at 생성 → collector 생성 → run_collection_plan
+        호출 → collector 종료 → rows 확인 후 Excel 저장(0건이면 건너뜀) →
+        결과를 로그/상태에 반영 → result 반환까지다. legacy 경로
+        (_run_queue_pipeline, basic/premium)는 이 메서드와 무관하게 그대로
+        동작한다. target_count UI 활성화·start_crawl 실제 연결은 WIRE-2C-2에서
+        진행한다(이번 단계는 이 worker 자체만 다룬다).
         """
         collected_at = datetime.now().strftime("%Y-%m-%d")
         total = len(query_queue)
         self.log(f"[ui][network] Queue 생성 완료: {total}건")
         self.log(f"[ui][network] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
-        self.log(f"[ui][network] 저장 경로(참고용, 이번 단계는 실제 저장 없음)={output_path}")
 
         with collector_factory(collected_at=collected_at) as collector:
             result = orchestrator(
@@ -1503,6 +1541,8 @@ class SalesDbCrawlerApp(ctk.CTk):
         if result.get("navigation_error"):
             nav_message = (result.get("navigation_error_message") or "")[:120]
             self.log(f"[ui][network] navigation_error 상세(로그 전용): {nav_message}")
+
+        result = self._export_network_result(result, output_path, excel_exporter)
 
         self.set_status(self._network_stop_message(result, target_count))
         return result

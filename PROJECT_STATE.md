@@ -2663,3 +2663,151 @@ WIRE-2C에서 Network/List를 기본 실행 경로로 전환할 때 함께 처�
 `target_count_entry` 활성화 및 `start_crawl` 실제 연결, `_run_network_pipeline`
 결과의 Excel 저장/SAFE-1 통합, README/LEGAL_NOTICE/안내·정책 탭 정합성
 수정(WIRE-2D).
+
+# 2026-07-14 ARCH-300C WIRE-2C-1 Excel 저장·부분 저장 통합(live 없음, 기본 엔진 전환 없음)
+
+## 배경
+`_run_network_pipeline`이 orchestrator 결과를 로그/상태에만 반영하고 실제
+Excel 저장은 하지 않던 상태(WIRE-2B-2/2A)에서, 이번 단계는 `export_places_to_excel`
+을 단일 저장 지점으로 연결했다. 정상 완료뿐 아니라 CAPTCHA/429/사용자
+중단/브라우저 오류로 중단된 경우에도 그때까지 수집된 rows를 보존해야 한다는
+원칙(SAFE-1과 동일)을 Network/List 경로에도 적용했다. `start_crawl` 기본
+실행 경로는 여전히 legacy이고, target_count 입력은 여전히 disabled이며,
+`limit_var` 기본값도 300 그대로다 - 기본 엔진 전환은 WIRE-2C-2로 보류했다.
+
+## 변경 파일
+- `src/ui.py`: `_run_network_pipeline`에 `excel_exporter=export_places_to_excel`
+  의존성 주입 인자 추가, collector 종료 후 신규 `_export_network_result()`
+  단일 저장 지점 호출, `_network_stop_message()`를 저장 결과(exported/
+  export_error) 반영하도록 재작성, 이제 쓰이지 않는 `_NETWORK_STOP_REASON_MESSAGES`
+  상수 제거.
+- `tests/test_ui_network_wiring.py`: `FakeExporter`/`_fake_rows` 추가, 기존
+  테스트를 rows가 실제로 채워지도록 갱신하고 새 문구·저장 메타 검증 추가,
+  신규 검증 6건(저장 인자/이중 저장 방지/0건/exporter 예외 등) 추가.
+- 신규 `tests/test_ui_network_export.py`: 실제 `export_places_to_excel`을
+  `tempfile.TemporaryDirectory()` 안에서 실행하는 통합 테스트 7건.
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## _run_network_pipeline → export_places_to_excel 연결
+흐름(요청서 §3 그대로): collector context 진입 → `run_collection_plan` 실행 →
+collector context 종료(`with` 블록 탈출, 브라우저/session/context 정리 완료) →
+`result["rows"]` 확인 → rows가 있으면 `excel_exporter(rows, [], [],
+output_path)` 실행 → 저장 성공/실패 메타를 `result`에 추가 → 로그/상태 갱신 →
+`result` 반환. Excel 저장은 브라우저 자원이 전혀 남아있지 않은 상태에서만
+수행되도록 `with collector_factory(...) as collector:` 블록 **밖**에서
+호출한다(브라우저 정리 실패와 파일 저장 실패는 원인이 다르므로 같은 try에
+섞지 않는다는 요청서 §3 원칙을 그대로 반영).
+
+## 단일 저장 지점 및 이중 저장 방지
+저장은 신규 `_export_network_result()` 한 곳에서만 발생하며, `run_collection_plan`
+호출 시 `on_partial_save`를 전달하지 않는다(기존에도 전달하지 않았음 -
+`check_no_double_save_for_security_and_429` 테스트로 `calls[0].get(
+"on_partial_save") is None`을 직접 확인). 따라서 security_blocked/status_429
+에서 orchestrator 내부의 부분 저장 콜백과 이 worker의 종료 후 저장이 겹쳐
+두 번 저장되는 경로 자체가 존재하지 않는다 - 두 stop_reason 모두
+`FakeExporter.calls`가 정확히 1임을 테스트로 재확인했다.
+
+## stop_reason별 저장 정책
+요청서 §5 그대로: `target_reached`/`queue_exhausted`/`security_blocked`/
+`status_429`/`navigation_error`/`user_stopped`는 rows가 1개 이상이면 전부
+저장 대상이다(이전 쿼리까지의 정상 결과 보존). `empty_jobs`와, 위 stop_reason
+이어도 rows가 실제로 비어 있는 경우(navigation_error가 첫 쿼리에서 발생,
+security_blocked인데 그 전까지 아무 것도 못 모음, 정상 실행했지만 최종
+0건 등)는 전부 저장하지 않는다 - `rows` 리스트 자체의 비어있음만으로 이
+분기를 결정하므로 stop_reason을 개별로 화이트리스트/블랙리스트하지 않는
+단일 조건(`if not rows:`)으로 요청서의 두 목록을 그대로 만족시킨다.
+
+## 0건 처리
+`_export_network_result`에서 `rows`가 비어 있으면 `excel_exporter`를 아예
+호출하지 않는다(→ `export_places_to_excel`이 호출되지 않으므로 파일도
+생성되지 않음 - `output_file.parent.mkdir()`조차 실행되지 않는다). 반환
+메타는 `exported=False`, `export_path=""`, `export_error=False`,
+`export_error_message=""`이며 상태 문구는 "저장할 결과가 없습니다."이다.
+`check_zero_rows_no_export_no_file_creation`(fake exporter)과
+`check_zero_rows_no_file_created`(실제 exporter, 임시 디렉터리)로 이중 확인했다.
+
+## exporter 실패 처리
+`excel_exporter` 호출을 `try/except Exception`으로 감싸고, 실패 시
+`exported=False`, `export_error=True`, `export_error_message`에
+`f"{type(exc).__name__}: {exc}"`를 200자로 잘라 기록한다. 사용자 상태
+문구는 항상 "수집 결과를 Excel로 저장하지 못했습니다."로 고정되며(어떤
+stop_reason이었든 우선순위 최상위), 전체 traceback이나 경로는 상태 라벨에
+노출하지 않고 로그에만 짧게 남긴다. `_network_stop_message`가 `export_error`
+를 최우선으로 검사하므로, 저장이 실패해도 "완료/저장했습니다" 문구가 잘못
+표시될 수 없다(`check_exporter_exception_marks_export_error`로 확인).
+
+## result export 메타
+`_export_network_result`가 `result = dict(result)`로 orchestrator 원본을
+복사한 뒤 `exported`/`export_path`/`export_error`/`export_error_message`
+4개 필드를 추가해 반환한다(요청서 §7 권장 구조 그대로). 원본 dict는
+변형하지 않는다.
+
+## Excel 11컬럼·내부 메타 미노출 검증
+`export_places_to_excel`/`MERGED_COLUMNS`는 무수정으로 재사용했다(시그니처:
+`export_places_to_excel(merged_data, mobile_data, pc_data, output_path) ->
+str`, 시트명 "통합_결과"/"원본_모바일"/"원본_PC"). Network/List row(제품
+11컬럼 + place_id/source_city/source_district/source_subregion/
+source_layer/source_query 내부 필드 포함)를 그대로 `merged_data` 인자로
+넘겨도, 기존 `_rows_with_columns()`의 `{column: row.get(column, "") for
+column in columns}` 투영이 내부 필드를 자동으로 걸러낸다 - exporter를
+전혀 건드리지 않고도 미노출이 보장됨을 `tests/test_ui_network_export.py`의
+`check_internal_meta_fields_not_in_excel`이 실제 저장된 헤더를 읽어 확인했다.
+
+## 기존 3시트 구조 유지 여부
+**유지됨.** mobile/pc 인자에 항상 `[]`를 전달하므로 `원본_모바일`/`원본_PC`
+시트는 헤더만 있고 데이터 행이 0개인 상태로 그대로 생성된다(3시트 구조
+자체는 변경 없음) - `check_empty_original_sheets`로 실제 워크북을 열어
+`max_row == 1`(헤더만)임을 확인했다.
+
+## 신규 테스트 결과
+- `tests/test_ui_network_wiring.py` 19건 전부 PASS(fake exporter 기반):
+  인자 전달(rows=0→exporter 미호출 확인 포함) / collector 생명주기 / 저장
+  인자 정확성(merged=rows/mobile=[]/pc=[]/output_path) / target_reached
+  저장 성공 문구("N개를 저장했습니다.") / queue_exhausted 미달 저장 문구 /
+  navigation_error 부분 저장(CAPTCHA 문구 금지 재확인) / user_stopped 부분
+  저장 / security_blocked 부분 저장(on_security_block 유지 확인) /
+  status_429 부분 저장 / 이중 저장 방지(on_partial_save 미사용 + exporter
+  1회) / rows 0건(exporter 미호출) / empty_jobs(exporter 미호출) / exporter
+  예외(exported=False/export_error=True, 성공 문구 없음) / should_continue /
+  입력 검증 helper / legacy 경로 무영향 / legacy 기본값 보존 / target_count
+  disabled+안내 문구 / Network worker가 target_count 그대로 전달.
+- `tests/test_ui_network_export.py`(신규, 실제 exporter+tempfile) 7건 전부
+  PASS: 파일 생성 / 최종 행 수=final_count 일치 / 헤더=MERGED_COLUMNS 11개
+  정확히 일치 / 내부 메타(place_id/source_*) 헤더 미노출 / 원본_모바일·
+  원본_PC 빈 시트(헤더만) / target trim된 rows 수만큼 정확히 저장 / 0건 시
+  파일 미생성. 생성된 임시 xlsx는 `tempfile.TemporaryDirectory()` 컨텍스트
+  종료 시 자동 삭제됨.
+
+## 전체 회귀 결과
+- `python -m py_compile src/ui.py tests/test_ui_network_wiring.py tests/test_ui_network_export.py` PASS.
+- `tests/test_ui_network_wiring.py` 19건 전부 PASS.
+- `tests/test_ui_network_export.py` 7건 전부 PASS.
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향, `network_pipeline.py` 무수정).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향, `network_browser_collector.py` 무수정).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, legacy premium/basic 경로 무변경 재확인).
+
+## legacy 기본 경로·UI 상태 유지 여부
+**전부 유지됨(무수정).** `start_crawl` 기본 실행 경로는 여전히
+`self._run_queue_pipeline`(legacy). `_DEFAULT_PER_QUERY_LIMIT`/`limit_var`
+기본값 "300" 그대로. `target_count_entry`는 여전히 `disabled` + "새 수집
+엔진 연결 후 적용됩니다." 안내 유지. `_run_queue_pipeline`/`_collect_premium_query`
+/`_collect_basic_query`/basic·premium 엔진은 무수정.
+
+## live/Playwright/네이버/app.py/UI/build/EXE 실행 여부
+**전부 실행 안 함.** `tests/test_ui_network_export.py`가 실제 `export_places_to_excel`
+과 `openpyxl.load_workbook`으로 파일 IO를 수행하지만, 이는 로컬 임시 디렉터리
+(`tempfile.TemporaryDirectory()`) 안에서만 발생하고 collector/orchestrator는
+여전히 fake다 - 실제 Playwright/브라우저/네이버 접속은 전혀 없다. app.py/UI
+창/build/EXE 실행도 없다.
+
+## 다음 WIRE-2C-2 작업
+- `target_count_entry` 활성화 + `start_crawl`에서 `_parse_positive_int`로
+  실제 파싱해 Network worker에 연결.
+- `_DEFAULT_PER_QUERY_LIMIT`을 30으로 재변경(Network/List가 기본 경로가
+  되는 시점과 함께).
+- `start_crawl`의 기본 실행 경로를 Network/List로 전환하는 결정 및 실제
+  배선(legacy는 fallback으로 보존).
+- README/LEGAL_NOTICE/안내·정책 탭 정합성 수정(WIRE-2D, POLICY-ALIGN-1
+  감사 결과 반영) - 기본 엔진이 실제로 바뀌기 전까지는 보류 유지.

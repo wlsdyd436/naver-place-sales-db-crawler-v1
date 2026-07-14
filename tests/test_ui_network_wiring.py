@@ -3,9 +3,11 @@ import sys
 import threading
 
 
-# ARCH-300C WIRE-2B-2: src.ui._run_network_pipeline 검증용 standalone 스크립트
-# (실제 CTk 창/Tk mainloop/Playwright/네이버 없음). collector_factory/orchestrator를
-# fake로 주입해 UI 작업 큐가 run_collection_plan에 어떻게 연결되는지만 검증한다.
+# ARCH-300C WIRE-2B-2/2C-1: src.ui._run_network_pipeline 검증용 standalone
+# 스크립트(실제 CTk 창/Tk mainloop/Playwright/네이버/실제 파일 저장 없음).
+# collector_factory/orchestrator/excel_exporter를 fake로 주입해 UI 작업 큐가
+# run_collection_plan + Excel 저장에 어떻게 연결되는지만 검증한다. 실제
+# .xlsx 파일을 만드는 통합 검증은 tests/test_ui_network_export.py가 담당한다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -88,6 +90,31 @@ class FakeCollectorFactory:
         return instance
 
 
+class FakeExporter:
+    """export_places_to_excel과 동일한 시그니처(merged, mobile, pc, output_path)만
+    흉내내는 fake. 실제 파일을 전혀 만들지 않는다."""
+
+    def __init__(self, *, raise_error: Exception | None = None, return_path: str | None = None):
+        self.calls: list = []
+        self._raise_error = raise_error
+        self._return_path = return_path
+
+    def __call__(self, merged_data, mobile_data, pc_data, output_path):
+        self.calls.append({
+            "merged_data": merged_data,
+            "mobile_data": mobile_data,
+            "pc_data": pc_data,
+            "output_path": output_path,
+        })
+        if self._raise_error is not None:
+            raise self._raise_error
+        return self._return_path or output_path
+
+
+def _fake_rows(n: int) -> list:
+    return [{"place_id": str(i), "업체명": f"업체{i}"} for i in range(n)]
+
+
 def _make_fake_orchestrator(result: dict):
     calls: list = []
 
@@ -118,13 +145,14 @@ def _base_result(**overrides) -> dict:
 def check_run_network_pipeline_passes_expected_arguments(reporter: ValidationReporter) -> None:
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
+    exporter = FakeExporter()
     result = _base_result(stop_reason="queue_exhausted", final_count=3, executed_query_count=2)
     fake_orchestrator, calls = _make_fake_orchestrator(result)
     query_queue = [{"query": "q1"}, {"query": "q2"}]
 
     returned = app._run_network_pipeline(
         query_queue, 30, 300, "output/naver_place_network_db.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
     if not calls:
@@ -132,6 +160,7 @@ def check_run_network_pipeline_passes_expected_arguments(reporter: ValidationRep
         return
     call = calls[0]
     collector = factory.instances[0]
+    expected = dict(result, exported=False, export_path="", export_error=False, export_error_message="")
     ok = (
         call["jobs"] == query_queue
         and call["per_query_limit"] == 30
@@ -140,12 +169,13 @@ def check_run_network_pipeline_passes_expected_arguments(reporter: ValidationRep
         and call["collect_query"] == collector.collect_query
         and callable(call["should_continue"])
         and call["on_security_block"] == app._note_security_block
-        and returned == result
+        and returned == expected
+        and exporter.calls == []
     )
     if ok:
-        reporter.pass_("인자 전달: query_queue/per_query_limit/target_count/collected_at/collect_query/should_continue/on_security_block이 정확히 전달됨")
+        reporter.pass_("인자 전달: query_queue/per_query_limit/target_count/collected_at/collect_query/should_continue/on_security_block이 정확히 전달됨(rows=0이라 exporter 미호출)")
     else:
-        reporter.fail(f"인자 전달 결과가 예상과 다름: call={call}")
+        reporter.fail(f"인자 전달 결과가 예상과 다름: call={call}, returned={returned}")
 
 
 def check_collector_lifecycle(reporter: ValidationReporter) -> None:
@@ -156,7 +186,7 @@ def check_collector_lifecycle(reporter: ValidationReporter) -> None:
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
     )
 
     collector = factory.instances[0] if factory.instances else None
@@ -172,117 +202,293 @@ def check_collector_lifecycle(reporter: ValidationReporter) -> None:
         reporter.fail(f"collector 생명주기 결과가 예상과 다름: factory.calls={factory.calls}, collector={collector}")
 
 
-def check_target_reached_reflected_in_status(reporter: ValidationReporter) -> None:
+def check_export_called_with_correct_arguments(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-1: rows가 있으면 exporter에
+    (merged=result rows, mobile=[], pc=[], output_path)로 정확히 1회 호출된다."""
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
-    result = _base_result(stop_reason="target_reached", final_count=300, executed_query_count=17, skipped_query_count=7)
+    exporter = FakeExporter()
+    rows = _fake_rows(3)
+    result = _base_result(stop_reason="queue_exhausted", final_count=3, rows=rows)
     fake_orchestrator, _ = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "output/naver_place_network_db.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        len(exporter.calls) == 1
+        and exporter.calls[0]["merged_data"] == rows
+        and exporter.calls[0]["mobile_data"] == []
+        and exporter.calls[0]["pc_data"] == []
+        and exporter.calls[0]["output_path"] == "output/naver_place_network_db.xlsx"
+    )
+    if ok:
+        reporter.pass_("정상 저장 인자: merged=rows/mobile=[]/pc=[]/output_path가 정확히 전달되고 exporter 1회 호출됨")
+    else:
+        reporter.fail(f"정상 저장 인자 결과가 예상과 다름: calls={exporter.calls}")
+
+
+def check_target_reached_reflected_in_status(reporter: ValidationReporter) -> None:
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _fake_rows(3)
+    result = _base_result(stop_reason="target_reached", final_count=3, rows=rows, executed_query_count=17, skipped_query_count=7)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
     ok = (
         statuses
-        and statuses[-1] == "전체 목표 개수에 도달했습니다."
-        and any("final_count=300" in message for message in logs)
+        and statuses[-1] == "전체 목표 개수에 도달했습니다. 3개를 저장했습니다."
+        and any("final_count=3" in message for message in logs)
+        and returned["exported"] is True
+        and returned["export_path"] == "out.xlsx"
+        and len(exporter.calls) == 1
     )
     if ok:
-        reporter.pass_("target_reached: 상태 문구와 final_count가 로그에 반영됨")
+        reporter.pass_("target_reached: 저장 성공 문구(N개를 저장했습니다.) + exported=True + exporter 1회 호출")
     else:
-        reporter.fail(f"target_reached 결과가 예상과 다름: statuses={statuses}, logs={logs}")
+        reporter.fail(f"target_reached 결과가 예상과 다름: statuses={statuses}, logs={logs}, returned={returned}")
 
 
 def check_queue_exhausted_under_target_shows_shortfall(reporter: ValidationReporter) -> None:
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
-    result = _base_result(stop_reason="queue_exhausted", final_count=50, executed_query_count=4)
+    exporter = FakeExporter()
+    rows = _fake_rows(50)
+    result = _base_result(stop_reason="queue_exhausted", final_count=50, rows=rows, executed_query_count=4)
     fake_orchestrator, _ = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
-    ok = statuses and statuses[-1] == "선택한 지역 수집이 완료되었습니다. (목표 미달: 50/300)"
+    ok = statuses and statuses[-1] == "선택한 지역 수집이 완료되었습니다. 목표에는 미달했으며 50개를 저장했습니다."
     if ok:
-        reporter.pass_("queue_exhausted(목표 미달): 50/300 미달 문구가 상태에 반영됨")
+        reporter.pass_("queue_exhausted(목표 미달): 미달 + 저장 개수 문구가 상태에 반영됨")
     else:
         reporter.fail(f"queue_exhausted 목표 미달 결과가 예상과 다름: statuses={statuses}")
 
 
-def check_navigation_error_shows_browser_error_not_captcha(reporter: ValidationReporter) -> None:
+def check_navigation_error_partial_save_not_captcha(reporter: ValidationReporter) -> None:
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
+    exporter = FakeExporter()
     long_message = "TargetClosedError: " + ("x" * 300)
+    rows = _fake_rows(1)
     result = _base_result(
-        stop_reason="navigation_error", final_count=1,
+        stop_reason="navigation_error", final_count=1, rows=rows,
         navigation_error=True, navigation_error_message=long_message,
     )
     fake_orchestrator, _ = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
     ok = (
         statuses
-        and statuses[-1] == "브라우저 페이지 오류로 수집을 중단했습니다."
+        and statuses[-1] == "브라우저 페이지 오류로 수집을 중단했습니다. 현재까지 1개를 저장했습니다."
         and "보안" not in statuses[-1]
         and "CAPTCHA" not in statuses[-1]
         and not any(long_message in message for message in logs)
         and any("navigation_error 상세" in message for message in logs)
+        and len(exporter.calls) == 1
     )
     if ok:
-        reporter.pass_("navigation_error: 브라우저 오류 문구(보안 확인 아님) + 전체 메시지는 사용자 상태에 노출되지 않음")
+        reporter.pass_("navigation_error 부분 저장: 브라우저 오류 문구(보안 확인 아님) + 이전 쿼리 rows 저장 + 전체 메시지 미노출")
     else:
         reporter.fail(f"navigation_error 결과가 예상과 다름: statuses={statuses}, logs={logs}")
 
 
-def check_user_stopped_shows_user_stop_message(reporter: ValidationReporter) -> None:
+def check_user_stopped_partial_save(reporter: ValidationReporter) -> None:
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
-    result = _base_result(stop_reason="user_stopped", final_count=1, executed_query_count=1, skipped_query_count=1)
+    exporter = FakeExporter()
+    rows = _fake_rows(1)
+    result = _base_result(stop_reason="user_stopped", final_count=1, rows=rows, executed_query_count=1, skipped_query_count=1)
     fake_orchestrator, _ = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
         [{"query": "q1"}, {"query": "q2"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
-    ok = statuses and statuses[-1] == "사용자가 수집을 중단했습니다."
+    ok = (
+        statuses
+        and statuses[-1] == "사용자가 수집을 중단했습니다. 현재까지 1개를 저장했습니다."
+        and len(exporter.calls) == 1
+    )
     if ok:
-        reporter.pass_("user_stopped: 사용자 중단 문구가 상태에 반영됨")
+        reporter.pass_("user_stopped 부분 저장: 이전 rows가 저장되고 사용자 중단 문구가 반영됨")
     else:
         reporter.fail(f"user_stopped 결과가 예상과 다름: statuses={statuses}")
 
 
-def check_security_blocked_callback_and_no_save_wording(reporter: ValidationReporter) -> None:
+def check_security_blocked_partial_save(reporter: ValidationReporter) -> None:
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
-    result = _base_result(
-        stop_reason="security_blocked", final_count=2, security_blocked=True,
-    )
+    exporter = FakeExporter()
+    rows = _fake_rows(2)
+    result = _base_result(stop_reason="security_blocked", final_count=2, rows=rows, security_blocked=True)
     fake_orchestrator, calls = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
     )
 
     call = calls[0] if calls else {}
     ok = (
         call.get("on_security_block") == app._note_security_block
         and statuses
-        and statuses[-1] == "보안 확인이 감지되어 수집을 중단했습니다."
-        and not any(("저장했습니다" in m) or ("저장 완료" in m) for m in logs + statuses)
+        and statuses[-1] == "보안 확인이 감지되어 수집을 중단했습니다. 현재까지 2개를 저장했습니다."
+        and len(exporter.calls) == 1
     )
     if ok:
-        reporter.pass_("security_blocked: on_security_block 콜백 전달 확인, 아직 저장 관련 문구는 없음")
+        reporter.pass_("security_blocked 부분 저장: on_security_block 콜백 전달 + 이전 rows 1회 저장 + 부분 저장 문구")
     else:
-        reporter.fail(f"security_blocked 결과가 예상과 다름: call={call}, statuses={statuses}, logs={logs}")
+        reporter.fail(f"security_blocked 결과가 예상과 다름: call={call}, statuses={statuses}, exporter.calls={exporter.calls}")
+
+
+def check_status_429_partial_save(reporter: ValidationReporter) -> None:
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _fake_rows(4)
+    result = _base_result(stop_reason="status_429", final_count=4, rows=rows, status_429_seen=True, security_blocked=True)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        statuses
+        and statuses[-1] == "요청 제한이 감지되어 수집을 중단했습니다. 현재까지 4개를 저장했습니다."
+        and len(exporter.calls) == 1
+    )
+    if ok:
+        reporter.pass_("status_429 부분 저장: 이전 rows가 1회 저장되고 요청 제한 문구가 반영됨")
+    else:
+        reporter.fail(f"status_429 결과가 예상과 다름: statuses={statuses}, exporter.calls={exporter.calls}")
+
+
+def check_no_double_save_for_security_and_429(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-1: on_partial_save 콜백과 종료 후 저장을 동시에 쓰지
+    않으므로, security_blocked/status_429에서도 exporter는 정확히 1회만
+    호출되어야 한다(이중 저장 방지)."""
+    for stop_reason, extra in (
+        ("security_blocked", {"security_blocked": True}),
+        ("status_429", {"status_429_seen": True, "security_blocked": True}),
+    ):
+        app, logs, statuses = _make_app()
+        factory = FakeCollectorFactory()
+        exporter = FakeExporter()
+        rows = _fake_rows(2)
+        result = _base_result(stop_reason=stop_reason, final_count=2, rows=rows, **extra)
+        fake_orchestrator, calls = _make_fake_orchestrator(result)
+
+        app._run_network_pipeline(
+            [{"query": "q1"}], 30, 300, "out.xlsx",
+            collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        )
+
+        if calls[0].get("on_partial_save") is not None:
+            reporter.fail(f"{stop_reason}: run_collection_plan에 on_partial_save가 전달됨(이중 저장 위험)")
+            return
+        if len(exporter.calls) != 1:
+            reporter.fail(f"{stop_reason}: exporter 호출 횟수가 1이 아님({len(exporter.calls)})")
+            return
+
+    reporter.pass_("이중 저장 방지: security_blocked/status_429 모두 on_partial_save 미사용 + exporter 정확히 1회 호출")
+
+
+def check_zero_rows_no_export_no_file_creation(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-1: 정상 실행했지만 최종 결과가 0건이면 exporter를
+    호출하지 않고, "저장할 결과가 없습니다." 문구를 사용한다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    result = _base_result(stop_reason="queue_exhausted", final_count=0, rows=[])
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        exporter.calls == []
+        and returned["exported"] is False
+        and returned["export_error"] is False
+        and returned["export_path"] == ""
+        and statuses
+        and statuses[-1] == "저장할 결과가 없습니다."
+    )
+    if ok:
+        reporter.pass_("rows 0건: exporter 0회 호출, 파일 생성 시도 없음, '저장할 결과가 없습니다.' 문구")
+    else:
+        reporter.fail(f"rows 0건 결과가 예상과 다름: exporter.calls={exporter.calls}, returned={returned}, statuses={statuses}")
+
+
+def check_empty_jobs_no_export(reporter: ValidationReporter) -> None:
+    """empty_jobs도 rows가 없으므로 동일하게 저장하지 않는다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    result = _base_result(stop_reason="empty_jobs", final_count=0, rows=[])
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = exporter.calls == [] and statuses and statuses[-1] == "저장할 결과가 없습니다."
+    if ok:
+        reporter.pass_("empty_jobs: exporter 미호출, '저장할 결과가 없습니다.' 문구")
+    else:
+        reporter.fail(f"empty_jobs 결과가 예상과 다름: exporter.calls={exporter.calls}, statuses={statuses}")
+
+
+def check_exporter_exception_marks_export_error(reporter: ValidationReporter) -> None:
+    """ARCH-300C WIRE-2C-1: exporter가 예외를 던지면 exported=False,
+    export_error=True로 기록하고, 성공 문구를 절대 보여주지 않는다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter(raise_error=RuntimeError("disk full"))
+    rows = _fake_rows(2)
+    result = _base_result(stop_reason="queue_exhausted", final_count=2, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        len(exporter.calls) == 1
+        and returned["exported"] is False
+        and returned["export_error"] is True
+        and "disk full" in returned["export_error_message"]
+        and statuses
+        and statuses[-1] == "수집 결과를 Excel로 저장하지 못했습니다."
+        and not any("저장했습니다" in m for m in statuses)
+    )
+    if ok:
+        reporter.pass_("exporter 예외: exported=False/export_error=True 기록, 성공 문구 없음, worker가 저장 성공으로 오인하지 않음")
+    else:
+        reporter.fail(f"exporter 예외 결과가 예상과 다름: returned={returned}, statuses={statuses}")
 
 
 def check_should_continue_reflects_stop_event(reporter: ValidationReporter) -> None:
@@ -293,7 +499,7 @@ def check_should_continue_reflects_stop_event(reporter: ValidationReporter) -> N
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
     )
 
     should_continue = calls[0]["should_continue"]
@@ -343,9 +549,8 @@ def check_legacy_path_untouched(reporter: ValidationReporter) -> None:
 
 
 def check_legacy_default_per_query_limit_preserved(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2B-2A: start_crawl이 여전히 legacy를 실행하는 동안
-    limit_var의 화면 기본값은 300으로 유지되어야 한다(WIRE-2B-2에서 30으로
-    바뀌었던 것을 되돌린 회귀 수정 확인)."""
+    """ARCH-300C WIRE-2B-2A/2C-1: start_crawl이 여전히 legacy를 실행하는 동안
+    limit_var의 화면 기본값은 300으로 유지되어야 한다."""
     ok = ui._DEFAULT_PER_QUERY_LIMIT == "300" and ui._DEFAULT_TARGET_COUNT == "300"
     if ok:
         reporter.pass_("legacy 기본값 보존: _DEFAULT_PER_QUERY_LIMIT=300, _DEFAULT_TARGET_COUNT=300 유지")
@@ -382,12 +587,12 @@ def check_run_network_pipeline_ignores_target_count_disabled_state(reporter: Val
     orchestrator에 넘겨야 한다(fake wiring 구조 무영향 확인)."""
     app, logs, statuses = _make_app()
     factory = FakeCollectorFactory()
-    result = _base_result(stop_reason="target_reached", final_count=300)
+    result = _base_result(stop_reason="target_reached", final_count=3, rows=_fake_rows(3))
     fake_orchestrator, calls = _make_fake_orchestrator(result)
 
     app._run_network_pipeline(
         [{"query": "q1"}], 30, 300, "out.xlsx",
-        collector_factory=factory, orchestrator=fake_orchestrator,
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
     )
 
     ok = calls and calls[0]["target_count"] == 300
@@ -402,11 +607,17 @@ def main() -> int:
 
     check_run_network_pipeline_passes_expected_arguments(reporter)
     check_collector_lifecycle(reporter)
+    check_export_called_with_correct_arguments(reporter)
     check_target_reached_reflected_in_status(reporter)
     check_queue_exhausted_under_target_shows_shortfall(reporter)
-    check_navigation_error_shows_browser_error_not_captcha(reporter)
-    check_user_stopped_shows_user_stop_message(reporter)
-    check_security_blocked_callback_and_no_save_wording(reporter)
+    check_navigation_error_partial_save_not_captcha(reporter)
+    check_user_stopped_partial_save(reporter)
+    check_security_blocked_partial_save(reporter)
+    check_status_429_partial_save(reporter)
+    check_no_double_save_for_security_and_429(reporter)
+    check_zero_rows_no_export_no_file_creation(reporter)
+    check_empty_jobs_no_export(reporter)
+    check_exporter_exception_marks_export_error(reporter)
     check_should_continue_reflects_stop_event(reporter)
     check_parse_positive_int_validation(reporter)
     check_legacy_path_untouched(reporter)
