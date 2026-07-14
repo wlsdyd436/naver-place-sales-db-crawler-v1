@@ -21,6 +21,8 @@ from src.parser import parse_places
 from src.pc_crawler import crawl_places_pc
 from src.pc.config import DiagnosticConfig
 from src.pc.detail_scraper import build_full_collector
+from src.pc.network_browser_collector import NetworkBrowserCollector
+from src.pc.network_pipeline import run_collection_plan
 from src.pc.pipeline import collect_pc_full
 from src.pc.region_data import load_region_layers
 
@@ -77,6 +79,47 @@ _OUTER_PAD_Y = (14, 14)
 # minsize를 줘서 창을 줄여도 왼쪽 패널이 이 폭 아래로는 줄어들지 않게
 # 고정하고, 남는 폭은 오른쪽 수집 현황/로그 패널이 전부 가져가게 한다.
 _LEFT_PANEL_MIN_WIDTH = 420
+
+# ARCH-300C WIRE-2B-2A: per_query_limit(검색 조합당 수집 상한, limit_var)의
+# "진짜" 권장 기본값은 target_count와 분리된 의미(조합 하나에서 과도하게
+# 긁어오지 않는 상한)로는 30이 맞지만, 그 기본값은 Network/List가 기본
+# 실행 경로가 된 뒤(WIRE-2C)에만 바꾼다. 지금은 start_crawl이 여전히
+# legacy _run_queue_pipeline을 실행하고 limit_var를 legacy의 유일한 "수집
+# 개수" 입력으로 그대로 쓰기 때문에, 화면 기본값만 30으로 바꿔도 legacy
+# 기본 수집량이 300건 상당에서 30건 상당으로 줄어드는 실질적 회귀가
+# 된다(WIRE-2B-2에서 실제로 발생했던 문제) - 그래서 300으로 되돌린다.
+_DEFAULT_PER_QUERY_LIMIT = "300"
+_DEFAULT_TARGET_COUNT = "300"
+
+# ARCH-300C WIRE-2B-2: run_collection_plan의 stop_reason별 사용자 로그/상태
+# 문구. queue_exhausted는 목표 미달 여부에 따라 동적으로 달라지므로 이
+# dict에는 넣지 않고 _network_stop_message에서 별도 처리한다. 아직 Excel
+# 저장이 연결되지 않았으므로 어떤 문구도 "저장했습니다"를 포함하지 않는다.
+_NETWORK_STOP_REASON_MESSAGES = {
+    "target_reached": "전체 목표 개수에 도달했습니다.",
+    "security_blocked": "보안 확인이 감지되어 수집을 중단했습니다.",
+    "status_429": "요청 제한이 감지되어 수집을 중단했습니다.",
+    "navigation_error": "브라우저 페이지 오류로 수집을 중단했습니다.",
+    "user_stopped": "사용자가 수집을 중단했습니다.",
+    "empty_jobs": "실행할 검색 조합이 없습니다.",
+}
+
+
+def _parse_positive_int(raw: str) -> int | None:
+    """문자열을 양의 정수로 파싱한다(WIRE-2B-2: per_query_limit/target_count
+    공용 입력 검증 helper, Tk 불필요).
+
+    비어있음/공백/비정수/0/음수는 전부 None을 반환한다(예외를 던지지 않음 -
+    호출자가 None 여부로 차단 여부를 판단하고, 필드별 로그 메시지는 호출자가
+    작성한다).
+    """
+    try:
+        value = int((raw or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 def build_collection_queries(city: str, district_selections: list[dict], keyword: str) -> list[dict]:
@@ -188,19 +231,27 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         self.selected_city_var = ctk.StringVar(value="서울특별시")
         self.keyword_input_var = ctk.StringVar(value="카페")
-        # UI-CLEANUP-1D-B 정합성 점검: "목표 수집 개수"라는 이름과 달리, 이 값은
-        # 현재 코드에서 (1) 전체 최종 저장 목표(target_count)가 아니라 (2) 각
-        # 검색 조합(쿼리) 하나당 상한(per_query_limit)으로 그대로 전달된다
-        # (start_crawl -> _run_queue_pipeline -> _collect_premium_query/
-        # _collect_basic_query가 이 값을 매 쿼리마다 limit 인자로 재사용).
-        # 여러 구/세부구역을 선택해 쿼리가 N개가 되면, 쿼리 간 place_id dedup이
-        # 프로덕션 파이프라인에 아직 연결되지 않아(ARCH-300C 실험 코드에만
-        # dedup_rows/seen 존재, PROJECT_STATE.md 참고) 최종 저장 건수가 이
-        # 값보다 훨씬 많아질 수 있다 - "목표=최종 합산 상한"이 아니라 "검색
-        # 조합 1개당 상한"에 더 가깝다. 이번 단계에서는 정확한 전체 목표
-        # 강제(조기 종료/trim)를 억지로 구현하지 않고, UI 문구를
-        # 실제 동작에 맞게 정리했다(§_build_target_count_section).
-        self.limit_var = ctk.StringVar(value="300")
+        # UI-CLEANUP-1D-B 정합성 점검(이후 ARCH-300C WIRE-2B-2로 갱신): 이 값은
+        # legacy 경로(basic/premium, _run_queue_pipeline)에서는 여전히 (1) 전체
+        # 최종 저장 목표가 아니라 (2) 각 검색 조합(쿼리) 하나당 상한
+        # (per_query_limit)으로만 쓰인다 - legacy 파이프라인에는 쿼리 간
+        # place_id dedup이 연결되어 있지 않기 때문이다(그대로 유지, 이번
+        # 단계에서 legacy 경로는 수정하지 않는다). 신규 Network/List 경로
+        # (§_run_network_pipeline)에서는 이 값이 진짜 per_query_limit 의미로
+        # run_collection_plan에 전달되고, 전체 목표는 별도
+        # target_count_var(§_build_global_target_count_section)가 담당한다.
+        self.limit_var = ctk.StringVar(value=_DEFAULT_PER_QUERY_LIMIT)
+        # ARCH-300C WIRE-2B-2: 전역 place_id dedup 이후 최종 저장할 목표
+        # 개수(target_count). run_collection_plan(WIRE-1)이 이 값에 도달하면
+        # 남은 검색 조합을 실행하지 않고 조기 종료한다(실제 orchestrator 동작과
+        # 일치 - "300개 보장"이 아니라 "도달 시 남은 조합 중단"). legacy 경로
+        # (_run_queue_pipeline)는 이 값을 사용하지 않는다.
+        # WIRE-2B-2A: start_crawl이 아직 이 값을 읽지 않으므로(Network/List
+        # 미배선), 사용자가 값을 바꿔도 지금은 실제로 아무 효과가 없다 - 그래서
+        # 입력 위젯 자체를 임시로 비활성화한다(§_build_global_target_count_section).
+        # _run_network_pipeline은 이 값을 계속 정상적으로 사용한다(fake wiring
+        # 테스트로 검증됨) - 비활성화는 화면(legacy 진입점)에서만 적용된다.
+        self.target_count_var = ctk.StringVar(value=_DEFAULT_TARGET_COUNT)
         # 수집모드 선택 UI는 제거하지만, 내부적으로는 기존 PC 상세 수집 경로
         # (premium)를 그대로 기본값으로 사용한다(엔진 코드는 삭제하지 않음).
         self.mode_var = ctk.StringVar(value="premium")
@@ -291,6 +342,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         self._build_keyword_section()
         self._build_filter_section()
         self._build_target_count_section()
+        self._build_global_target_count_section()
         self._build_dashboard_section()
         self._build_control_section()
         self._build_log_section()
@@ -471,6 +523,39 @@ class SalesDbCrawlerApp(ctk.CTk):
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+
+    def _build_global_target_count_section(self):
+        # ARCH-300C WIRE-2B-2: 검색 조합당 상한(§_build_target_count_section,
+        # per_query_limit)과는 별개로, 전역 dedup 이후 최종 저장할 목표
+        # 개수(target_count)를 입력받는다. 아직 Network/List 경로가 기본
+        # 실행 경로가 아니므로(§_run_network_pipeline, §start_crawl) 이 값은
+        # legacy 경로(basic/premium)에서는 쓰이지 않는다 - 다만 UI 필드 자체는
+        # 미리 준비해 둔다. run_collection_plan이 실제로 "목표 도달 시 남은
+        # 검색 조합 중단"을 구현하고 있으므로 그 문구만 사용하고, "300개
+        # 보장"처럼 과장된 표현은 쓰지 않는다.
+        # WIRE-2B-2A: start_crawl이 아직 이 값을 읽지 않으므로, 사용자가
+        # 입력해도 지금은 아무 효과가 없다 - 동작하는 옵션처럼 오해하지
+        # 않도록 입력 위젯을 비활성화(disabled)해 둔다. 활성화 및 start_crawl
+        # 연결은 WIRE-2C(Network/List 기본 전환)에서 진행한다.
+        ctk.CTkLabel(self.left_panel, text="6. 전체 목표 저장 개수", font=ctk.CTkFont(size=14, weight="bold")).grid(row=10, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        global_target_frame = ctk.CTkFrame(self.left_panel)
+        global_target_frame.grid(row=11, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        global_target_frame.grid_columnconfigure(0, weight=1)
+
+        self.target_count_entry = ctk.CTkEntry(global_target_frame, textvariable=self.target_count_var, width=100, state="disabled")
+        self.target_count_entry.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(
+            global_target_frame,
+            text=(
+                "중복 제거 후 최종 저장할 목표 개수입니다.\n"
+                "업종·지역 및 검색 결과에 따라 목표 개수에 미달할 수 있습니다."
+            ),
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+        ctk.CTkLabel(
+            global_target_frame, text="새 수집 엔진 연결 후 적용됩니다.",
+            anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
@@ -898,6 +983,11 @@ class SalesDbCrawlerApp(ctk.CTk):
         for widget in self._iter_children(self.left_panel):
             if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkEntry, ctk.CTkRadioButton, ctk.CTkOptionMenu)):
                 widget.configure(state=state)
+        # WIRE-2B-2A: target_count_entry는 아직 legacy 실행(start_crawl)에
+        # 연결되지 않았으므로, 수집 시작/종료로 좌측 패널 상태가 바뀌어도
+        # 항상 비활성 상태를 유지한다(WIRE-2C에서 활성화 예정).
+        if hasattr(self, "target_count_entry"):
+            self.target_count_entry.configure(state="disabled")
 
     def _iter_children(self, parent):
         for child in parent.winfo_children():
@@ -1341,6 +1431,81 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 기존 단일 Query 실행 호환용 래퍼입니다. 실제 V2 UI는 Queue 파이프라인을 사용합니다.
         query_queue = [{"region": keyword, "keyword": "", "query": keyword}]
         self._run_queue_pipeline(query_queue, limit, output_path, mode)
+
+    def _network_stop_message(self, result: dict, target_count: int) -> str:
+        """stop_reason별 로그/상태 문구를 만든다(ARCH-300C WIRE-2B-2).
+
+        아직 Excel 저장이 연결되지 않았으므로 "저장했습니다" 표현은 쓰지
+        않는다. navigation_error는 CAPTCHA/보안 확인과 다른 원인이므로 별도
+        문구를 쓰고, 상세 메시지(navigation_error_message)는 여기서 노출하지
+        않는다(호출자가 로그에 짧게만 남긴다). queue_exhausted는 목표
+        미달 여부에 따라 문구를 분기한다("300개 보장"이라 말하지 않는다).
+        """
+        stop_reason = result.get("stop_reason")
+        if stop_reason == "queue_exhausted":
+            final_count = result.get("final_count", 0)
+            if target_count and final_count < target_count:
+                return f"선택한 지역 수집이 완료되었습니다. (목표 미달: {final_count}/{target_count})"
+            return "선택한 지역 수집이 완료되었습니다."
+        return _NETWORK_STOP_REASON_MESSAGES.get(
+            stop_reason, f"수집이 종료되었습니다. (stop_reason={stop_reason})"
+        )
+
+    def _run_network_pipeline(
+        self,
+        query_queue: list[dict],
+        per_query_limit: int,
+        target_count: int,
+        output_path: str,
+        *,
+        collector_factory=NetworkBrowserCollector,
+        orchestrator=run_collection_plan,
+    ) -> dict:
+        """ARCH-300C WIRE-2B-2: Network/List 제품 흐름 worker(no-live 배선 검증용).
+
+        collector_factory/orchestrator는 의존성 주입 지점이다 - 기본값은
+        실제 NetworkBrowserCollector/run_collection_plan을 가리키지만, 이
+        메서드를 직접 실제로 호출(=Playwright 시작)할지는 전적으로 호출자가
+        무엇을 넘기느냐에 달려 있다(정의/기본값 참조만으로는 아무 것도
+        실행되지 않는다 - NetworkBrowserCollector.__enter__가 실제로 호출될
+        때만 Playwright가 시작된다). 이번 단계 테스트는 항상 fake를 주입해
+        실제 브라우저를 켜지 않는다.
+
+        output_path는 이번 단계에서 실제 저장에 사용하지 않는다(Excel 저장/
+        SAFE-1 최종 통합은 WIRE-2C). 이 worker의 책임은 collected_at 생성 →
+        collector 생성 → run_collection_plan 호출 → 결과를 로그/상태에
+        반영하는 것까지다. "저장했습니다"/최종 완료 모달은 여기서 띄우지
+        않는다. legacy 경로(_run_queue_pipeline, basic/premium)는 이 메서드와
+        무관하게 그대로 동작한다.
+        """
+        collected_at = datetime.now().strftime("%Y-%m-%d")
+        total = len(query_queue)
+        self.log(f"[ui][network] Queue 생성 완료: {total}건")
+        self.log(f"[ui][network] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
+        self.log(f"[ui][network] 저장 경로(참고용, 이번 단계는 실제 저장 없음)={output_path}")
+
+        with collector_factory(collected_at=collected_at) as collector:
+            result = orchestrator(
+                query_queue,
+                per_query_limit=per_query_limit,
+                target_count=target_count,
+                collected_at=collected_at,
+                collect_query=collector.collect_query,
+                should_continue=lambda: not self.stop_event.is_set(),
+                on_security_block=self._note_security_block,
+            )
+
+        self.log(
+            f"[ui][network] stop_reason={result.get('stop_reason')}, "
+            f"executed={result.get('executed_query_count')}, skipped={result.get('skipped_query_count')}, "
+            f"final_count={result.get('final_count')}"
+        )
+        if result.get("navigation_error"):
+            nav_message = (result.get("navigation_error_message") or "")[:120]
+            self.log(f"[ui][network] navigation_error 상세(로그 전용): {nav_message}")
+
+        self.set_status(self._network_stop_message(result, target_count))
+        return result
 
     def open_output_folder(self):
         output_dir = Path("output")

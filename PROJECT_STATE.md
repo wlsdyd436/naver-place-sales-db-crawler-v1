@@ -2458,3 +2458,208 @@ factory 경로) 실행했다. `tests/test_pc_network_browser_collector.py` 5건
 `src/pc/browser_session.py`는 요청대로 무수정. UI/target_count/Excel 저장
 배선은 이번에도 하지 않았다. 실제 Playwright/네이버 접속 없음, app.py/UI/
 build/EXE 실행 없음.
+
+# 2026-07-14 ARCH-300C WIRE-2B-2 target_count UI + fake 제품 실행 배선(live 없음)
+
+## 배경
+WIRE-2B-1/1B로 orchestrator(navigation_error/should_continue)와 브라우저
+생명주기(NetworkBrowserCollector) 계약이 모두 준비된 뒤, 이번 단계는 (1)
+UI에 전체 목표 저장 개수(target_count)를 검색 조합당 상한(per_query_limit)과
+분리해 추가하고, (2) UI 작업 큐를 run_collection_plan에 연결하는 신규 worker
+`_run_network_pipeline`을 fake collector/orchestrator로만 검증했다. 기존
+legacy(basic/premium, `_run_queue_pipeline`) 경로는 전혀 수정하지 않았고,
+`start_crawl`의 기본 실행 경로도 여전히 legacy다. Excel 저장/SAFE-1 최종
+통합(WIRE-2C)과 Network/List 기본 전환은 이번 범위에 없다.
+
+## 변경 파일
+- `src/ui.py`: `target_count_var` 신규 상태, `_parse_positive_int()`(모듈
+  레벨 순수 검증 helper), `_build_global_target_count_section()`(신규 UI
+  섹션), `_run_network_pipeline()`(신규 worker), `_network_stop_message()`
+  (stop_reason별 문구 helper), `_NETWORK_STOP_REASON_MESSAGES` 상수,
+  `NetworkBrowserCollector`/`run_collection_plan` import 추가.
+  `limit_var` 기본값을 "300" → "30"으로 변경(§아래 회귀 위험 참고).
+- 신규 `tests/test_ui_network_wiring.py`: fake collector_factory/orchestrator
+  기반 10건.
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## target_count UI 구성
+왼쪽 패널에 기존 "5. 검색 조합당 수집 상한"(row 8-9, `limit_var`) 섹션은
+그대로 두고, 그 아래 "6. 전체 목표 저장 개수"(row 10-11, `target_count_var`,
+기본값 "300")를 신규 추가했다. 설명 문구: "중복 제거 후 최종 저장할 목표
+개수입니다. 업종·지역 및 검색 결과에 따라 목표 개수에 미달할 수 있습니다."
+- "300개 보장" 등 과장 표현은 쓰지 않았다. 기존 왼쪽 패널 스크롤(
+`CTkScrollableFrame`)/여백 상수(`_SECTION_TITLE_PADY`/`_SECTION_BODY_PADY`)
+를 그대로 재사용했고, 기존 row 0~9는 전혀 건드리지 않았다(레이아웃 대규모
+재작성 없음).
+
+## per_query_limit/target_count 입력 검증
+`_parse_positive_int(raw: str) -> int | None`(Tk 불필요, 모듈 레벨 순수
+함수)를 신규 추가했다 - 빈 문자열/공백/비정수/0/음수는 전부 `None`을
+반환하고 예외를 던지지 않는다. 두 필드(`limit_var`/`target_count_var`)에
+동일한 규칙을 적용할 수 있는 공용 helper이며, `tests/test_ui_network_wiring.py`
+에서 Tk 없이 직접 테스트했다. 이 helper를 실제 "수집 시작" 버튼 흐름에
+연결하는 것은 Network/List가 기본 실행 경로가 되는 이후 단계(WIRE-2C+)의
+몫으로 남겨뒀다(이번 단계는 legacy `start_crawl`을 수정하지 않았으므로,
+legacy 경로의 기존 `limit` 검증 로직도 그대로다).
+
+## _run_network_pipeline 인터페이스
+`_run_network_pipeline(self, query_queue, per_query_limit, target_count,
+output_path, *, collector_factory=NetworkBrowserCollector,
+orchestrator=run_collection_plan) -> dict`. 책임(요청서 §5 그대로): (1)
+`collected_at` 생성, (2) `collector_factory(collected_at=...)` 생성, (3)
+`with collector:` 진입, (4) `run_collection_plan` 호출(jobs=query_queue,
+per_query_limit, target_count, collect_query=collector.collect_query,
+should_continue=lambda: not self.stop_event.is_set(),
+on_security_block=self._note_security_block), (5) 결과를 로그(`[ui][network]`
+접두사)/상태(`set_status`)에 반영 후 result dict를 그대로 반환. 이번
+단계에서 Excel 저장, "저장했습니다" 문구, 최종 완료 모달은 구현하지
+않았다 - `output_path`는 현재 로그에 참고용으로만 남긴다.
+
+## collector/orchestrator 의존성 주입 방식
+`collector_factory`/`orchestrator` 둘 다 키워드 인자로 노출하고, 기본값을
+각각 `NetworkBrowserCollector`/`run_collection_plan` 함수·클래스 참조
+그 자체로 직접 지정했다(지연 import 불필요 - `NetworkBrowserCollector`
+정의/참조만으로는 Playwright가 시작되지 않는다는 계약이 WIRE-2B-1B에서
+이미 보장되어 있고, `run_collection_plan`은 순수 함수라 참조 자체가
+안전하다). 테스트는 항상 `FakeCollectorFactory`/fake orchestrator를
+명시적으로 주입해 실제 기본값 경로를 실행하지 않았다.
+
+## stop_reason별 UI 처리
+`_NETWORK_STOP_REASON_MESSAGES` 상수(target_reached/security_blocked/
+status_429/navigation_error/user_stopped/empty_jobs)와 `_network_stop_message()`
+(queue_exhausted 전용 - 목표 미달 시 "목표 미달: final/target" 문구, 아니면
+"완료" 문구)로 분기했다. navigation_error는 CAPTCHA/보안 확인과 다른 문구
+("브라우저 페이지 오류로 수집을 중단했습니다.")를 쓰고,
+`navigation_error_message`는 전체를 상태에 노출하지 않고 120자로 잘라 로그
+에만 별도 라인으로 남긴다. 어떤 문구에도 "저장했습니다"는 없다(아직 저장
+미연결).
+
+## 기존 legacy 기본 경로 유지 여부
+**유지됨(무수정).** `_run_queue_pipeline`/`_collect_premium_query`/
+`_collect_premium_query_legacy`/`_collect_basic_query`는 전혀 건드리지
+않았고, `start_crawl`의 스레드 타깃도 여전히 `self._run_queue_pipeline`이다
+(`tests/test_ui_network_wiring.py`의 `check_legacy_path_untouched`가
+`inspect.getsource(start_crawl)`로 이를 직접 확인). `_run_network_pipeline`은
+아직 어떤 버튼에도 연결되지 않았다(신규 worker 함수로만 존재).
+
+## 회귀 위험(명시적 고지)
+`self.limit_var`(검색 조합당 수집 상한)의 **기본값을 "300" → "30"으로
+변경**했다(요청서 §3 권장 기본값 반영: per_query_limit=30/target_count=300).
+이 값은 legacy 경로(`_collect_premium_query`/`_collect_basic_query`)에서
+여전히 유일한 "수집 개수" 입력으로 쓰이므로, 사용자가 값을 직접 입력하지
+않고 기본값 그대로 수집을 시작하면 **legacy 경로의 기본 수집 결과 건수가
+기존 300건 상당에서 30건 상당으로 줄어든다**(로직 변경은 아니고 화면
+기본값만 변경). 화면 진입 시 기본으로 채워지는 숫자만 바뀐 것이며, 사용자가
+직접 300으로 바꾸면 기존과 동일하게 동작한다.
+
+## 신규 테스트 결과
+`tests/test_ui_network_wiring.py` 10건 전부 PASS: 인자 전달 / collector
+생명주기(factory·enter·exit 각 1회) / target_reached 상태·로그 반영 /
+queue_exhausted 목표 미달 문구(50/300) / navigation_error(브라우저 오류
+문구, 전체 메시지 미노출) / user_stopped 문구 / security_blocked(콜백 전달
+확인 + 저장 문구 없음) / should_continue(stop_event 반영) / 입력 검증
+helper(`_parse_positive_int`) / legacy 경로 무영향(inspect 기반 확인).
+
+## 전체 회귀 결과
+- `python -m py_compile src/ui.py tests/test_ui_network_wiring.py` PASS.
+- `tests/test_ui_network_wiring.py` 10건 전부 PASS.
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향, legacy premium/basic 경로 무변경 재확인).
+
+## live/Excel/SAFE-1 배선 여부
+**전부 하지 않음.** 실제 Playwright/네이버 접속 없음(fake collector_factory/
+orchestrator만 사용), app.py/UI 창/build/EXE 실행 없음, 실제 Excel 저장 없음,
+SAFE-1 최종 통합(부분 저장 연결) 없음. `_note_security_block`은 기존과 동일한
+인스턴스 상태 기록 역할만 하며 저장 로직에는 연결되지 않았다.
+
+## 다음 WIRE-2C 작업
+- `_run_network_pipeline` 결과(rows)를 실제 `export_places_to_excel`에 연결
+  하고, MERGED_COLUMNS 11컬럼·내부 필드(place_id/source_*) 비노출을 통합
+  테스트로 재확인.
+- 보안 차단/부분 저장 시 실제 Excel 저장 + "부분 저장됨" 안내를 이 경로에도
+  연결(SAFE-1과 동일 수준으로).
+- `_parse_positive_int`를 실제 "수집 시작" 버튼 흐름(Network/List 전용
+  진입점)에 연결해 입력 검증이 실제로 수집을 차단하도록 배선.
+- README/LEGAL_NOTICE/안내·정책 탭 정합성 수정은 여전히 WIRE-2D로 보류.
+
+# 2026-07-14 ARCH-300C WIRE-2B-2A legacy 동작 보존 및 미배선 UI 정직 표시(live 없음)
+
+## 배경
+WIRE-2B-2에서 `limit_var`(검색 조합당 수집 상한) 기본값을 300 → 30으로
+바꿨는데, `start_crawl`이 여전히 legacy `_run_queue_pipeline`을 실행하고
+`limit_var`를 legacy의 유일한 "수집 개수" 입력으로 그대로 쓰기 때문에
+이는 화면 기본값만 바뀐 게 아니라 **legacy 기본 수집량이 300건 상당에서
+30건 상당으로 줄어드는 실질적 회귀**였다(WIRE-2B-2 보고에서 이미 고지한
+문제). 또한 신규 `target_count_var` 입력 위젯이 화면에 그대로 노출되어
+있었는데, `start_crawl`이 이 값을 전혀 읽지 않으므로 사용자가 값을 바꿔도
+아무 효과가 없는데도 동작하는 옵션처럼 보이는 문제가 있었다. 이번 단계는
+이 두 가지를 최소 수정으로 해결했다.
+
+## 변경 파일
+- `src/ui.py`: `_DEFAULT_PER_QUERY_LIMIT`을 "30" → "300"으로 복원(주석으로
+  WIRE-2C 기본 엔진 전환 시 30으로 다시 바꿀 예정임을 명시).
+  `_build_global_target_count_section()`에서 `target_count_entry`를
+  `state="disabled"`로 생성하고 "새 수집 엔진 연결 후 적용됩니다." 안내
+  라벨 추가. `_set_left_panel_state()`에 `target_count_entry`를 항상
+  `disabled`로 재적용하는 방어 코드 추가(수집 시작/종료로 좌측 패널이
+  `normal`로 풀려도 이 입력만은 계속 비활성 유지).
+- `tests/test_ui_network_wiring.py`: 신규 검증 3건 추가(legacy 기본값 보존,
+  target_count disabled+안내 문구, Network worker 무영향).
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## 1. limit_var 기본값 복원 결과
+`_DEFAULT_PER_QUERY_LIMIT`을 "300"으로 되돌렸다(모듈 상단 주석에 "Network/
+List가 기본 실행 경로가 된 뒤(WIRE-2C)에만 30으로 바꾼다"는 조건을 명시).
+`self.limit_var`가 이 상수를 그대로 참조하므로 legacy 경로의 기본 수집량은
+WIRE-2B-2 이전과 동일하게 복원됐다. "검색 조합당 수집 상한" 라벨과 신규
+Network worker 구조(`_run_network_pipeline`)는 그대로 유지했다.
+
+## 2. target_count disabled 처리 방식
+`_build_global_target_count_section()`에서 `ctk.CTkEntry(..., state=
+"disabled")`로 생성해 처음부터 비활성 상태로 만들었다. 추가로
+`_set_left_panel_state(state)`(수집 시작 시 `disabled`, 종료 시 `normal`로
+좌측 패널 전체를 일괄 전환하는 기존 메서드)가 이 위젯만은 항상
+`disabled`로 재적용하도록 방어 코드를 넣었다 - 그렇지 않으면 수집 완료 후
+좌측 패널이 `normal`로 풀리면서 target_count 입력도 함께 활성화되어
+버그가 재발했을 것이다. UI 레이아웃(섹션 순서/여백/스크롤)은 전혀 다시
+만들지 않았다.
+
+## 3. 안내 문구
+target_count 입력 아래 기존 설명(중복 제거 후 목표 개수, 미달 가능성) 다음
+줄에 "새 수집 엔진 연결 후 적용됩니다."를 1줄만 추가했다(긴 설명 추가하지
+않음).
+
+## 4. _run_network_pipeline 영향 여부
+**영향 없음.** `_run_network_pipeline`은 여전히 호출자가 전달한
+`target_count` 값을 그대로 `run_collection_plan`에 넘긴다 - UI에서
+`target_count_entry`가 disabled인 것은 화면(legacy 진입점)에만 적용되는
+정책이며, 이 worker의 시그니처·동작·fake wiring 테스트 구조는 전혀
+건드리지 않았다(`check_run_network_pipeline_ignores_target_count_disabled_state`
+로 target_count=300이 orchestrator에 그대로 전달됨을 재확인).
+
+## 신규/회귀 테스트 결과
+- `python -m py_compile src/ui.py tests/test_ui_network_wiring.py` PASS.
+- `tests/test_ui_network_wiring.py` 13건 전부 PASS(기존 10건 + 신규 3건:
+  legacy 기본값 보존 / target_count disabled+안내 문구 존재(소스 기반 확인,
+  `check_legacy_path_untouched`와 동일한 `inspect.getsource` 방식) / Network
+  worker가 target_count=300을 그대로 orchestrator에 전달).
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향).
+
+## live/Excel/Playwright/네이버/app.py/UI/build 실행 여부
+**전부 실행 안 함.** 실제 Tk 위젯 생성/렌더링도 하지 않았다(신규 disabled
+검증은 `inspect.getsource` 기반 소스 확인만 사용, 실제 CTkEntry 인스턴스를
+만들지 않음).
+
+## 다음 단계
+WIRE-2C에서 Network/List를 기본 실행 경로로 전환할 때 함께 처리할 항목(변경
+없음, WIRE-2B-2 기록과 동일): `_DEFAULT_PER_QUERY_LIMIT`을 30으로 재변경,
+`target_count_entry` 활성화 및 `start_crawl` 실제 연결, `_run_network_pipeline`
+결과의 Excel 저장/SAFE-1 통합, README/LEGAL_NOTICE/안내·정책 탭 정합성
+수정(WIRE-2D).
