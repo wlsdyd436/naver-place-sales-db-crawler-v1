@@ -4125,4 +4125,139 @@ git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
 - 이후 PERF-1B: 실제 50건 규모 live 성능 비교(WIRE-4B 기준선 대비
   적응형 settle의 실제 절감폭 측정, Opus가 지적한 3가지 데이터 공백
   - candidate 도착 간격/폴링 이벤트 수신 정상성/`.json()` 블로킹 시간
+
+---
+
+# 2026-07-15 ARCH-300C PERF-1B 적응형 settle 실제 50건 live 성능 비교
+
+## 목표
+WIRE-4B(고정 5초 settle)와 동일한 4-job/50건 조건에서 PERF-1A 적응형
+settle을 실제 네이버 환경에서 정확히 1회 실행해, 수집 정확성·안전
+상태·Excel 정합성을 유지하면서 실제 성능 개선폭을 실측한다.
+
+## 실행 전 Git commit
+`84c0e66e9bce9e7eebe5222b9ee2eaece935a78e`(PERF-1A 커밋, 실행 시점
+`git status --short` clean 확인).
+
+## 사용한 Python executable
+`C:\code\naver-place-sales-db-crawler-v1\.venv\Scripts\python.exe`
+(3.14.3) - `sys.executable`로 직접 확인.
+
+## 고정 실행 조건
+```
+query 4개(천호동/길동/성내동/암사동 카페), 순서 WIRE-4B와 동일
+per_query_limit = 20
+target_count = 50
+settle_ms = 5000(NetworkBrowserCollector 기본값과 동일, harness가 명시 전달)
+quiet_period_ms = 750, poll_interval_ms = 100(변경 없음, production 상수 그대로)
+브라우저/context 설정, dedup 방식, Excel 열 구조 변경 없음
+```
+
+## live 실행 횟수 / 재시도
+**정확히 1회.** 자동·수동 재시도 0회. 실행 마커
+`scratchpad/arch300_network_probe/results/perf1b/PERF1B_LIVE_STARTED.marker`
+정상 생성 확인(실행 전 부재 → 실행 직전 생성 → 삭제하지 않음).
+
+## 준비·실행·스킵 쿼리
+```
+total_job_count = 4
+executed_query_count = 3
+skipped_query_count = 1
+before_trim_count = 60
+final_count = 50
+stop_reason = target_reached
+exporter_call_count = 1
+```
+
+## 쿼리별 결과
+| # | query | query_wall_s | candidate | raw | local_unique | parse_error | adaptive_wait_ms | early_exit | CAPTCHA | 429 | nav_error | timeout |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 천호동 카페 | 2.63 | 1 | 20 | 20 | 0 | 1600 | True | False | False | False | False |
+| 2 | 길동 카페 | 2.55 | 1 | 20 | 20 | 0 | 1600 | True | False | False | False | False |
+| 3 | 성내동 카페 | 2.57 | 1 | 20 | 20 | 0 | 1600 | True | False | False | False | False |
+| 4 | 암사동 카페 | - | - | - | - | - | - | - | 실행 안 함(target_reached로 스킵) |
+
+## 시간 측정
+```
+session_ready_seconds     = 0.621
+orchestrator_seconds      = 7.740
+session_teardown_seconds  = 0.190
+export_seconds            = 0.025
+total_wall_seconds        = 8.586
+avg_query_wall_seconds    = 2.580
+```
+
+## WIRE-4B(고정 5초) 대비 성능 비교
+```
+WIRE-4B total_wall_seconds     = 19.03
+PERF-1B total_wall_seconds     = 8.586
+total_wall_improvement_seconds = 10.44
+total_wall_improvement_percent = 54.88%
+
+WIRE-4B avg_query_wall_seconds     = 5.92
+PERF-1B avg_query_wall_seconds     = 2.580
+avg_query_improvement_seconds      = 3.34
+avg_query_improvement_percent      = 56.42%
+
+adaptive_wait_sum_ms      = 4800(3개 쿼리 × 1600ms)
+fixed_wait_equivalent_ms  = 15000(3개 쿼리 × 5000ms)
+wait_reduction_ms         = 10200
+wait_reduction_percent    = 68.0%
+
+early_exit_query_count = 3
+hard_cap_query_count   = 0
+```
+
+## export 전 rows 중복 검증(production rows 기준)
+```
+rows_count = 50
+place_id_present_count = 50, place_id_duplicate_count = 0
+place_url_present_count = 50, place_url_duplicate_count = 0
+```
+
+## Excel 검증
+```
+통합_결과 헤더 11개, MERGED_COLUMNS와 순서·이름 완전 일치
+통합_결과 데이터 행 수 = 50 = final_count
+내부 필드(place_id/source_*) 미노출
+플레이스 URL 중복 0건
+원본_모바일/원본_PC 시트 유지(수집 안 함 - Network 엔진은 통합_결과 중심,
+  기존 WIRE-4B/4C 결과와 동일한 패턴)
+```
+
+## 판정
+```
+기능 PASS: True(final_count=50, stop_reason=target_reached, exported=True,
+  exporter_call_count=1, Excel 정합성 전부 충족, CAPTCHA/429/navigation_error
+  전부 False)
+적응형 settle 작동 PASS: True(early_exit_query_count=3 >= 1,
+  adaptive_wait_sum_ms(4800) < 15000, 각 쿼리 wait_ms(1600) <= 5000)
+성능 개선 PASS: True(total_wall 8.586 < 19.03, avg_query 2.580 < 5.92,
+  wait_reduction_percent 68.0% > 0)
+완전 무경고 PASS: True(parse_error_count_total=0, timeout_count=0,
+  hard_cap_query_count=0)
+```
+
+## production 코드 수정 여부
+**수정하지 않았다.** 이번 단계는 harness(`scratchpad/`)만 작성했고
+`src/pc/network_browser_collector.py` 등 production 파일은 전혀 건드리지
+않았다. live 실행 중 production 결함도 발견되지 않았다.
+
+## Git 상태(작업 종료 시점)
+작업 시작 전 이미 PERF-1A(`84c0e66`)가 커밋되어 있었다(이번 세션 사이에
+사용자가 커밋한 것으로 확인). 이번 PERF-1B 단계에서 `git status --short`:
+```
+ M PROJECT_STATE.md
+```
+`scratchpad/`는 `.gitignore`(13번째 줄)에 등록되어 있어 harness
+(`perf1b_adaptive_live_50.py`)와 결과 JSON/Excel/마커 파일 전부
+`git status`에 나타나지 않는다(무시 대상이므로 untracked로도 표시되지
+않음).
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 다음 단계
+- 사용자 검토 후 이번 PROJECT_STATE.md append 커밋 여부 결정.
+- harness 파일(`perf1b_adaptive_live_50.py`)은 `scratchpad/`가
+  gitignore 대상이므로 기본적으로 Git에 추가되지 않는다 - 별도로
+  추적하고 싶다면 사용자가 명시적으로 지시해야 한다.
   - 실측 포함).
