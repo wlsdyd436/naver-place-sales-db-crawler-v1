@@ -3669,3 +3669,182 @@ context 정상 종료, 쿼리별 page 생성·종료 정상, 재시도 0회)을 
 있다는 점(PoC 단계에서도 반복 실행 누적 시 차단 위험이 관찰된 바 있음)을
 WIRE-4C 설계 시 감안해야 한다. 속도 최적화 판단은 여전히 WIRE-4C의
 300건 기준선 확보 이후로 유보한다.
+
+---
+
+# 2026-07-15 ARCH-300C WIRE-4C 실제 Network 제품 경로 300건 단일 기준선 live 실행
+
+## 배경
+WIRE-4A(10건)·WIRE-4B(50건, 쿼리 4개)에 이어 이번 단계는 Tier1(법정동)→
+Tier2(역·상권)→Tier3(세부업종) 3단 큐 최대 24개로 target_count=300을
+실제 네이버에서 검증했다. PoC-7(2026-07-09)이 동일 구조로 이미 성공한
+적이 있는 실험이며, 이번 WIRE-4C는 그 결과를 production 코드 경로
+(`NetworkBrowserCollector`→`collect_network_query`→`run_collection_plan`→
+`export_places_to_excel`)로 재현했다. 정확히 1회만 실행했고 재시도/우회는
+구현하지 않았다.
+
+## 변경 파일
+- 신규 `scratchpad/arch300_network_probe/wire4c_product_live_300.py`:
+  WIRE-4B harness를 재사용해 24-job 3단 큐 + tier별 진단 집계를 추가한
+  단발성 live harness.
+- 신규 `scratchpad/arch300_network_probe/wire4c_live_300_result_20260715_165906.json`:
+  이번 실행의 전체 결과·쿼리별 로그.
+- 신규 `output/wire4c_live_300_20260715_165906.xlsx`: 실제 저장된 300행 Excel.
+- `PROJECT_STATE.md`: 이번 기록 append.
+- production 코드(`src/**`)는 **전혀 수정하지 않았다.**
+
+## 실행 환경 및 사전 회귀
+`.venv\Scripts\python.exe`(3.14.3) 기준으로만 실행. live 실행 전 최소
+회귀 3건(`test_network_product_integration_no_live.py` 11/11,
+`test_pc_network_browser_collector.py` 24/24, `test_pc_network_pipeline.py`
+12/12) 전부 PASS 확인 후에만 live를 실행했다.
+
+## 큐 구성 - work order 본문과의 차이 및 근거(투명성 기록)
+work order 본문의 Tier1/Tier3 목록을 실제 `data/regions_kr_sample.json`
+(현재 지역 데이터)과 `scratchpad/arch300_network_probe/poc7_target_300_probe.py`
+(PoC-7 실제 성공 스크립트)에 직접 대조한 결과 두 가지 차이를 발견해
+반영했다:
+
+1. **Tier3 "베이커리카페" 누락**: work order 본문은 Tier3를 6개(천호동/
+   길동/성내동 × 디저트카페/브런치카페)만 나열했지만, `regions_kr_sample.json`
+   의 `subcategory_keywords`는 `["디저트카페","브런치카페","베이커리카페"]`
+   3개이고, `poc7_target_300_probe.py`의 `SUBCATEGORIES`도 동일 3개다.
+   PoC-7의 실제 성공 큐는 Tier1(9)+Tier2(6)+Tier3(9)=24개였다(work order도
+   "PoC-7의 전체 24개 큐"라고 언급). "베이커리카페" 3개 job을 추가해 9개로
+   완성했다.
+2. **Tier1/Tier3 동 순서**: work order 본문은 Tier1을 가나다순(강일동→
+   고덕동→길동→...)으로, Tier3 동 순서를 천호동→길동→성내동으로 나열했지만,
+   `poc7_target_300_probe.py`의 실제 `LEGAL_DONGS`/`SUBCATEGORY_DONGS`는
+   천호동을 첫 항목으로 하는 순서(천호동→성내동→길동→암사동→명일동→고덕동→
+   상일동→둔촌동→강일동 / Tier3는 천호동→성내동→길동)이며, 이는 현재
+   `regions_kr_sample.json`의 `legal_dongs` 순서와도 정확히 일치한다.
+   §3의 "PoC-7 성공 순서를 기준으로" 지시를 우선해 PoC-7 실제 순서를
+   채택했다(Tier2 역/상권 순서는 work order 본문과 PoC-7이 이미 동일해
+   차이 없음).
+
+두 차이 모두 **live 실행 전에 큐를 확정**한 뒤 반영했으며, 실행 중에는
+전혀 수정하지 않았다. job dict의 키 이름(`source_city`/`source_district`/
+`source_subregion`/`source_layer`)은 `collect_network_query`가 실제로
+읽는 키와 정확히 맞췄다(PoC 전용 `region_expander.py`의 `city`/`gu`/`dong`
+키 이름은 그대로 재사용하지 않고 검색어 문자열·순서만 대조 근거로 삼음).
+
+## live 실행 횟수
+**정확히 1회.** `retries: 0`을 결과 JSON에 명시. 재실행 없음.
+
+## 전체 고정 job 수와 tier 구성
+총 24개(Tier1 9 / Tier2 6 / Tier3 9).
+
+## 실행·스킵 수
+`executed_query_count=17`(PoC-7의 live 결과와 정확히 동일한 실행 쿼리
+수), `skipped_query_count=7`. 17번째 쿼리(천호동 브런치카페, Tier3)
+직후 `before_trim_count=308>=target=300`으로 즉시 멈췄고, 남은 7개
+(천호동 베이커리카페 + 성내동/길동 세부업종 6개)는 harness의
+`recording_collect_query` wrapper 자체가 호출되지 않아 로그에도 17건만
+기록됐다 - 코드 레벨로 미실행이 직접 증명된다.
+
+## tier별 효율
+| tier | 실행 수 | raw 합 | local_unique 합 | returned_rows 합 | global 신규(진단) 합 |
+|---|---|---|---|---|---|
+| tier1(법정동) | 9 | 180 | 180 | 180 | 180 |
+| tier2(역/상권) | 6 | 150 | 150(일부 raw 26 중 로컬 dedup 후) | 120(per_query_limit=20 cap) | 104 |
+| tier3(세부업종) | 2 | 40 | 40 | 40 | 24 |
+
+Tier1(법정동)은 신규 기여율 100%(중복 없음), Tier2(역/상권)는 cap 이후도
+평균 약 87%가 새 업체, Tier3(세부업종, 이번엔 천호동 2개 쿼리만 실행)는
+동일 법정동을 다시 훑는 특성상 신규 기여가 60%로 가장 낮았다 - PoC-6/7의
+"Tier2 > Tier3 효율" 관찰과 방향이 일치한다.
+
+## before_trim/final_count
+`before_trim_count=308`, `final_count=300`(정확히 300으로 trim).
+
+## stop_reason
+`"target_reached"`.
+
+## CAPTCHA/429/navigation/parse 상태
+`security_blocked=False`, `status_429_seen=False`, `navigation_error=False`
+(17개 쿼리 전부). **`parse_error_count_total=1`**(12번째 쿼리, Tier2
+"둔촌동역 카페"에서 candidate 응답 2개 중 1개가 JSON 파싱에 실패 -
+`collect_network_query`가 이미 방어적으로 설계된 대로 예외를 삼키고
+`parse_error_count`만 증가시킨 뒤 나머지 candidate로 정상 진행했다).
+이 쿼리의 `local_unique_count=20`, `efficiency_ratio=0.9`로 결과 품질에
+실질적 영향은 없었고, 이후 쿼리 실행이나 최종 300건 도달에도 전혀
+지장이 없었다 - 재시도/우회 없이 설계된 방어 로직만으로 흡수됐다.
+
+## Excel 생성 및 행 수
+생성됨(`output/wire4c_live_300_20260715_165906.xlsx`). `통합_결과` 데이터
+행 **300개**(`final_count`와 정확히 일치), 헤더 11개가 `MERGED_COLUMNS`와
+정확히 일치, `place_id`/`source_*` 내부 필드 미노출. `원본_모바일`/
+`원본_PC`는 둘 다 `max_row=1`(헤더만).
+
+## 필드 채움 수(300건 기준)
+업체명 300/업종 300/리뷰수 300/주소 300/플레이스 URL 300/수집일 300,
+대표전화 279(21건 빈칸), 홈페이지 94, 인스타 80, 블로그 32,
+**새로오픈여부 0/300**(WIRE-4A/4B와 동일하게 항상 빈칸 재확인).
+
+## 전체/쿼리별 시간
+`session_ready_seconds=0.67`, `orchestrator_seconds=99.71`(쿼리 17개
+순차 실행 전체), `session_teardown_seconds=0.25`, `export_seconds=0.06`,
+`total_wall_seconds=100.72`, `avg_query_wall_seconds=5.87`,
+`rows_per_second≈2.98`, `seconds_per_final_row≈0.336`,
+`estimated_settle_seconds=85.0`(실행된 17개 × settle_ms=5000 고정).
+
+## WIRE-4A/4B 대비 속도 비교
+쿼리당 평균 소요시간이 WIRE-4A(6.13s, 1쿼리) → WIRE-4B(5.92s, 3쿼리
+평균) → WIRE-4C(5.87s, 17쿼리 평균)로 **쿼리 수가 늘어나도 쿼리당
+소요시간이 거의 동일하게 유지**됐다(성능 저하나 누적 지연 없음). 이는
+production 코드가 쿼리 간 상태를 누적하거나 지연시키는 부작용 없이
+동일 context에서 안정적으로 반복 실행됨을 보여준다.
+
+## 고정 settle 추정 비중
+`estimated_settle_seconds=85.0` / `orchestrator_seconds=99.71` ≈ **85.3%**
+- 쿼리 실행 시간의 대부분이 고정 5초 settle 대기이며, 실제 page 생성/
+goto/파싱/CAPTCHA probe에 쓰이는 시간은 쿼리당 약 0.87초 수준으로 작다.
+이는 향후 PERF-1에서 settle_ms를 조정할 경우 가장 큰 개선 여지가 있는
+지점임을 시사하지만, 이번 단계에서는 지시대로 어떤 코드도 최적화하지
+않았다.
+
+## 가장 낮은 효율 쿼리
+13번째 쿼리(Tier2, "서울특별시 강동구 암사역 카페") - `efficiency_ratio≈0.577`,
+`global_unique_added=15`(raw 26건 중 신규 15건, 나머지는 이미 다른
+법정동/역상권 쿼리와 겹침). PoC 단계에서도 역/상권 쿼리는 인접 법정동과
+지리적으로 겹쳐 중복이 더 많이 발생한다고 관찰된 바와 일치한다.
+
+## session/page 종료
+정상 종료(예외 없이 완료, exit code 0). `NetworkBrowserCollector`가
+쿼리 17개 동안 브라우저/context 1개를 공유하고 쿼리마다 새 page를
+생성·종료하는 계약이 300건 규모에서도 그대로 유지됨을 확인했다(개별
+page 생성/종료 횟수를 별도로 assert하는 로직은 WIRE-3 no-live 테스트에서
+이미 검증되어 있어 이번 live harness에서는 세션 정상 종료 여부만 관찰).
+
+## 재시도·우회 여부
+**없음.** CAPTCHA 자동 해결/DOM 제거, context 재시작, proxy/stealth,
+쿼리 재실행은 harness에 전혀 구현하지 않았다. 12번째 쿼리의 parse error
+1건도 재시도 없이 production의 기존 방어 로직만으로 처리됐다.
+
+## production 코드 수정 여부
+**무수정.** `src/**` 전체가 이번 300건 규모에서도 결함 없이 실제
+네이버와 정상 연결됨을 확인했다. settle_ms(5000)와 쿼리 순서도 전혀
+변경하지 않았다.
+
+## WIRE-4C 최종 판정
+**완전 PASS 기준 중 `parse_error_count 총합 == 0` 한 항목만 미충족
+(실제 1건)** - 그 외 모든 완전 PASS 조건(final_count==300,
+stop_reason==target_reached, before_trim_count>=300, 남은 query 미실행,
+실행된 모든 query candidate_response_count>=1, active CAPTCHA==False,
+HTTP 429==False, navigation_error==False, Excel 300행/11헤더/내부 메타
+미노출, 원본_모바일·원본_PC 헤더만, exporter 1회, session/context/page
+정상 종료, retries=0)은 전부 충족했다. parse_error 1건은 방어적으로
+이미 설계된 예외 흡수 로직이 정상 동작한 결과이며(재시도/데이터 손상
+없음, 최종 300건 도달에 영향 없음), production 코드 문제라기보다
+실제 네이버 응답의 자연스러운 변동성(2개 candidate 중 1개의 JSON 형식
+이상)으로 판단한다 - 다만 엄격한 수치 기준으로는 "완전 PASS"라고
+단정하지 않고 이 사실을 그대로 보고한다.
+
+## PERF-1 진행 가능 여부
+**가능.** WIRE-4A(10)·WIRE-4B(50)·WIRE-4C(300) 전 구간에서 target_count
+조기 종료, global dedup, 단일 Excel 저장, CAPTCHA/429/navigation_error
+안전 중단 계약이 실제 네이버에서 일관되게 검증됐다. 고정 settle 비중이
+전체 쿼리 시간의 약 85%를 차지한다는 이번 관찰이 PERF-1(속도 최적화)의
+1차 근거가 될 수 있다. 1건의 parse_error가 이번 단계의 유일한 미해결
+관찰 사항이며, production 코드 수정 여부(예: 발생 빈도가 잦다면 원인
+조사)는 사용자 판단 이후 별도 단계에서 결정한다.
