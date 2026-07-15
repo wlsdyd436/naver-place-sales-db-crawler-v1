@@ -4261,3 +4261,234 @@ git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
   gitignore 대상이므로 기본적으로 Git에 추가되지 않는다 - 별도로
   추적하고 싶다면 사용자가 명시적으로 지시해야 한다.
   - 실측 포함).
+
+---
+
+# 2026-07-15 ARCH-300C PERF-1C 적응형 settle 실제 300건 최종 성능 비교
+
+## 목표
+WIRE-4C(고정 5초 settle, 24-job/300건)와 동일한 조건에서 PERF-1A 적응형
+settle을 실제 네이버 환경으로 정확히 1회 실행해, 대규모 다중 쿼리에서도
+정확성·안전 계약·Excel 정합성을 유지하면서 최종 성능 개선폭을 실측한다.
+
+## 실행 전 Git commit
+`f936a55d3f98be668ab69045cb9cc47293374cb3`(PERF-1B 커밋, 실행 시점
+`git status --short` clean 확인).
+
+## 사용한 Python executable
+`C:\code\naver-place-sales-db-crawler-v1\.venv\Scripts\python.exe`
+(3.14.3) - `sys.executable`로 직접 확인.
+
+## 고정 실행 조건
+```
+query 24개(Tier1 법정동 9 → Tier2 역/상권 6 → Tier3 세부업종 9),
+  순서 WIRE-4C와 완전 동일(work order 본문도 이미 9+6+9로 정확해
+  WIRE-4C 때와 달리 추가 대조·수정이 필요 없었음)
+per_query_limit = 20
+target_count = 300
+settle_ms = 5000(harness가 명시 전달, production 기본값과 동일)
+quiet_period_ms = 750, poll_interval_ms = 100(변경 없음)
+브라우저/context 설정, dedup 방식, Excel 열 구조 변경 없음
+```
+
+## PERF-1C harness 경로
+`scratchpad/arch300_network_probe/perf1c_adaptive_live_300.py`
+(WIRE-4C의 Tier 큐 구성 + PERF-1B의 실행 마커/exporter counting
+wrapper/성능 비교 계산 구조를 재사용해 신규 작성, 기존 두 harness는
+무수정).
+
+## --check-config 검증
+BrowserSession/Playwright를 전혀 시작하지 않고 실행: query 24개
+(tier1=9/tier2=6/tier3=9) 확인, tier 순서 정확, production import
+5개 모듈 전부 성공, 마커 미생성 확인. PASS(exit 0).
+
+## live 전 `.venv` 전체 회귀
+11개 파일 전부 실행, **165 PASS, FAIL 0**(예상과 정확히 일치), 전 파일
+exit code 0.
+
+## live 실행 횟수 / 재시도
+**정확히 1회.** 자동·수동 재시도 0회. 실행 마커
+`scratchpad/arch300_network_probe/results/perf1c/PERF1C_LIVE_STARTED.marker`
+BrowserSession 시작 전 원자적(`open(..., "x")`)으로 생성 확인, 삭제하지
+않음.
+
+## 전체 실행 결과
+```
+total_job_count = 24
+executed_query_count = 17
+skipped_query_count = 7
+before_trim_count = 308
+final_count = 300
+stop_reason = target_reached
+exporter_call_count = 1
+```
+
+## Tier별 결과
+| tier | executed | raw_total | local_unique_total | returned_rows_total | global_unique_added_total | adaptive_wait_ms_total | query_wall_seconds_total |
+|---|---|---|---|---|---|---|---|
+| tier1(법정동) | 9/9 | 180 | 180 | 180 | 180 | 14100 | 22.68 |
+| tier2(역/상권) | 6/6 | 120 | 120 | 120 | 104 | 9200 | 15.65 |
+| tier3(세부업종) | 2/9(target_reached로 나머지 7개 스킵) | 40 | 40 | 40 | 24 | 3000 | 4.88 |
+
+## 쿼리별 진단(17개 실행, 전부 adaptive_settle_early_exit=True)
+| # | tier | query | wall_s | candidate | raw | parse_error | adaptive_wait_ms |
+|---|---|---|---|---|---|---|---|
+| 1 | tier1 | 천호동 카페 | 2.72 | 1 | 20 | 0 | 1600 |
+| 2 | tier1 | 성내동 카페 | 2.54 | 1 | 20 | 0 | 1600 |
+| 3 | tier1 | 길동 카페 | 2.52 | 1 | 20 | 0 | 1600 |
+| 4 | tier1 | 암사동 카페 | 2.56 | 1 | 20 | 0 | 1600 |
+| 5 | tier1 | 명일동 카페 | 2.42 | 1 | 20 | 0 | 1500 |
+| 6 | tier1 | 고덕동 카페 | 2.41 | 1 | 20 | 0 | 1500 |
+| 7 | tier1 | 상일동 카페 | 2.42 | 1 | 20 | 0 | 1500 |
+| 8 | tier1 | 둔촌동 카페 | 2.55 | 1 | 20 | 0 | 1600 |
+| 9 | tier1 | 강일동 카페 | 2.54 | 1 | 20 | 0 | 1600 |
+| 10 | tier2 | 천호역 카페 | 2.66 | 1 | 20 | 0 | 1500 |
+| 11 | tier2 | 강동역 카페 | 2.63 | 1 | 20 | 0 | 1600 |
+| 12 | tier2 | 둔촌동역 카페 | 2.61 | 1 | 20 | 0 | 1600 |
+| 13 | tier2 | 암사역 카페 | 2.55 | 1 | 20 | 0 | 1500 |
+| 14 | tier2 | 고덕역 카페 | 2.63 | 1 | 20 | 0 | 1500 |
+| 15 | tier2 | 명일역 카페 | 2.56 | 1 | 20 | 0 | 1500 |
+| 16 | tier3 | 천호동 디저트카페 | 2.46 | 1 | 20 | 0 | 1500 |
+| 17 | tier3 | 천호동 브런치카페 | 2.42 | 1 | 20 | 0 | 1500 |
+
+전 쿼리 CAPTCHA=False, HTTP 429=False, navigation_error=False,
+timeout=False.
+
+## adaptive wait 분포
+```
+sample_count = 17
+minimum_ms = 1500, median_ms = 1500, average_ms = 1547.06
+p95_ms = 1600(nearest-rank, ceil(0.95*17)=17번째 값 - 표본이 작아 근사치)
+maximum_ms = 1600
+adaptive_metadata_missing_count = 0
+```
+
+## export 전 rows 중복 검증(production rows 기준)
+```
+rows_count = 300
+place_id_present_count = 300, place_id_missing_count = 0, place_id_duplicate_count = 0
+place_url_present_count = 300, place_url_duplicate_count = 0
+```
+
+## Excel 검증
+```
+통합_결과 헤더 11개, MERGED_COLUMNS와 순서·이름 완전 일치
+통합_결과 데이터 행 수 = 300 = final_count
+내부 필드(place_id/source_*) 미노출
+플레이스 URL 중복 0건
+새로오픈여부 = 전부 빈칸(300, 필터 영구 비활성 정책 유지)
+필드 채움 수: 업체명 300/업종 300/리뷰수 300/주소 300/대표전화 279/
+  플레이스 URL 300/수집일 300/홈페이지 94/인스타 80/블로그 32
+원본_모바일/원본_PC 시트 유지(수집 안 함 - WIRE-4B/4C와 동일 패턴)
+```
+
+## PERF-1C 시간 측정
+```
+session_ready_seconds     = 0.719
+orchestrator_seconds      = 43.198
+session_teardown_seconds  = 0.219
+export_seconds            = 0.058
+total_wall_seconds        = 44.227
+avg_query_wall_seconds    = 2.541
+rows_per_second           = 6.783
+seconds_per_final_row     = 0.147
+```
+
+## WIRE-4C(고정 5초) 대비 성능 비교
+```
+WIRE-4C total_wall_seconds        = 100.72
+PERF-1C total_wall_seconds        = 44.227
+total_wall_improvement_percent    = 56.09%
+
+WIRE-4C orchestrator_seconds      = 99.71
+PERF-1C orchestrator_seconds      = 43.198
+orchestrator_improvement_percent  = 56.68%
+
+WIRE-4C avg_query_wall_seconds    = 5.87
+PERF-1C avg_query_wall_seconds    = 2.541
+avg_query_improvement_percent     = 56.71%
+
+adaptive_wait_sum_ms      = 26300(17개 쿼리)
+fixed_wait_equivalent_ms  = 85000(17개 쿼리 × 5000ms)
+wait_reduction_ms         = 58700
+wait_reduction_percent    = 69.06%
+
+early_exit_query_count = 17
+hard_cap_query_count   = 0
+
+rows_per_second: WIRE-4C 2.98 → PERF-1C 6.78
+seconds_per_final_row: WIRE-4C 0.336 → PERF-1C 0.147
+```
+WIRE-4C와 PERF-1C는 다른 시점의 네이버 환경이므로 네트워크·서비스 상태
+차이가 개선폭에 포함될 수 있다 - 이번 1회 결과를 일반적인 속도 보장으로
+표현하지 않는다.
+
+## PERF-1B 관찰과의 비교(참고용, 판정 기준 아님)
+PERF-1B(50건) avg_query_wall=2.580s / adaptive_wait 평균 1600ms →
+PERF-1C(300건) avg_query_wall=2.541s / adaptive_wait 평균 1547.06ms로
+거의 동일한 수준을 유지했다 - 쿼리 수가 늘어나도(4→24개, 실행 3→17개)
+쿼리당 성능이 저하되지 않았다.
+
+## 판정
+```
+제품 기능 PASS: True(final_count=300, stop_reason=target_reached,
+  exported=True, exporter_call_count=1, Excel 300행/11열 정합성 전부
+  충족, place_id/URL 중복 0, 내부 필드 미노출, CAPTCHA/429/
+  navigation_error 전부 False)
+적응형 settle 작동 PASS: True(early_exit_query_count=17 >= 1,
+  adaptive_wait_sum_ms(26300) < fixed_wait_equivalent_ms(85000),
+  adaptive_metadata_missing_count=0, 전 쿼리 wait_ms <= 5000)
+성능 개선 PASS: True(total_wall 44.227 < 100.72, orchestrator 43.198
+  < 99.71, avg_query 2.541 < 5.87, wait_reduction_percent 69.06% > 0)
+완전 무경고 PASS: True(parse_error_count_total=0, timeout_count=0,
+  hard_cap_query_count=0) - WIRE-4C의 유일한 경고였던 parse_error 1건이
+  이번에는 재현되지 않았다(같은 표본 없이 1회성 관찰이라 재현성을
+  단정하지 않는다).
+```
+
+## 알려진 한계와 실제 관찰 사항
+- WIRE-4C 대비 실행 쿼리 수가 17개로 동일(before_trim_count=308도 동일)
+  했다 - 네이버 데이터 자체가 이전 실행과 거의 동일하게 유지되고 있음을
+  시사하나, 시점이 다른 만큼 우연의 일치일 수 있다.
+- WIRE-4C의 parse_error_count_total=1은 이번 PERF-1C에서 재현되지
+  않았다. 적응형 settle이 이 문제를 "고쳤다"고 단정할 근거는 없다 -
+  두 실행 모두 1회성 관찰이며, parse error는 특정 응답의 우연한 파싱
+  실패였을 가능성이 더 높다.
+- adaptive_settle_wait_ms가 1500~1600ms 좁은 범위에 몰려 있다 - quiet
+  period(750ms) 도달까지 필요한 최소 폴링 틱(8틱=800ms) 근처에서 거의
+  항상 조기 종료된다는 뜻이며, 이는 PERF-1B 관찰과 일치한다.
+
+## production·tests 수정 여부
+**둘 다 수정하지 않았다.** `src/pc/network_browser_collector.py` 등
+production 파일과 `tests/*` 전부 무수정. live 실행 중 production 결함도
+발견되지 않았다.
+
+## Git 상태(작업 종료 시점)
+작업 시작 전 이미 PERF-1B(`f936a55`)가 커밋되어 있었다. 이번 PERF-1C
+단계에서 `git status --short`:
+```
+ M PROJECT_STATE.md
+```
+`scratchpad/`는 `.gitignore`(13번째 줄)에 등록되어 있어 harness
+(`perf1c_adaptive_live_300.py`)와 결과 JSON/Excel/마커 파일 전부
+`git status`에 나타나지 않는다.
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 생성된 결과 파일
+```
+scratchpad/arch300_network_probe/perf1c_adaptive_live_300.py
+scratchpad/arch300_network_probe/results/perf1c/PERF1C_LIVE_STARTED.marker
+scratchpad/arch300_network_probe/results/perf1c/perf1c_adaptive_live_300_result_20260715_201511.json
+scratchpad/arch300_network_probe/results/perf1c/perf1c_adaptive_live_300_20260715_201511.xlsx
+```
+
+## 다음 단계
+- 사용자 검토 후 PERF-1A/1B/1C 관련 파일(production 코드, 테스트,
+  PROJECT_STATE.md) 커밋 여부 결정.
+- harness 파일들은 `scratchpad/`가 gitignore 대상이므로 기본적으로
+  Git에 추가되지 않는다 - 별도 추적이 필요하면 사용자가 명시적으로
+  지시해야 한다.
+- WIRE-4C 대비 300건 규모에서도 56% 이상의 총시간 개선과 완전 무경고
+  PASS를 확인했으므로, 이 시점에서 적응형 settle의 실측 검증 단계
+  (PERF-1A/1B/1C)는 목표를 달성한 것으로 판단된다. 추가 단계 진행
+  여부는 사용자 결정 사항이다.
