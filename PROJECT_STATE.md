@@ -3462,3 +3462,210 @@ WIRE-3A에서는 새 테스트 함수를 추가하지 않고 기존 목표 도�
 **전부 실행 안 함.** WIRE-3와 동일하게 FakeBrowserSessionLike/FakePage/
 FakeResponse만 사용했고, `.xlsx` 파일 IO는 `tempfile.TemporaryDirectory()`
 안에서만 발생했다.
+
+---
+
+# 2026-07-15 ARCH-300C WIRE-4A 실제 Network 제품 경로 10건 단일 live 실행
+
+## 배경
+WIRE-1~WIRE-3A까지는 fake 브라우저 계층(FakeBrowserSessionLike/FakePage/
+FakeResponse)만으로 검증했고, 실제 production 코드로 네이버를 실행한
+적은 한 번도 없었다. 이번 단계는 실제 Playwright + 실제 네이버로 검색
+조합 **정확히 1개**만 단발성 실행해, `NetworkBrowserCollector` →
+`collect_network_query` → `run_collection_plan` → `export_places_to_excel`
+로 이어지는 실제 제품 경로가 실제 네이버 응답과 정상적으로 맞물리는지
+확인했다. 자동 재시도/재검색/CAPTCHA 우회는 전혀 구현하지 않았고, 정확히
+1회만 실행했다.
+
+## 변경 파일
+- 신규 `scratchpad/arch300_network_probe/wire4a_product_live_10.py`: 단발성
+  live harness(§아래).
+- 신규 `scratchpad/arch300_network_probe/wire4a_live_10_result_20260715_160736.json`:
+  이번 실행의 전체 결과 기록.
+- 신규 `output/wire4a_live_10_20260715_160736.xlsx`: 실제 저장된 10행 Excel.
+- `PROJECT_STATE.md`: 이번 기록 append.
+- production 코드(`src/**`)는 **전혀 수정하지 않았다.**
+
+## 실행 환경
+`.venv\Scripts\python.exe`(3.14.3) 기준으로만 실행했다(시스템 Python
+미사용). `import playwright, openpyxl, customtkinter` 확인 완료.
+Playwright Chromium(`chromium-1223`)이 이미 `.venv`에 설치되어 있어 추가
+설치는 하지 않았다. live 실행 전 최소 회귀 3건(`test_network_product_integration_no_live.py`
+11/11, `test_pc_network_browser_collector.py` 24/24, `test_pc_network_pipeline.py`
+12/12) 전부 PASS를 확인한 뒤에만 live를 실행했다.
+
+## 검색어와 실행값
+`query="서울특별시 강동구 천호동 카페"`, `source_city/district/subregion/layer`는
+work order 지정값 그대로. `per_query_limit=10`, `target_count=10`. job은
+정확히 1개, 검색어 추가 없음.
+
+## live 실행 횟수
+**정확히 1회.** 재시도/재검색/브라우저 재시작 없음(`retries: 0`을 결과
+JSON에 명시). 두 번째 실행은 수행하지 않았다.
+
+## 관찰 결과(요약)
+- `candidate_response_count=1`, `raw_item_count=20`, `local_unique_count=20`,
+  `parse_error_count=0`, `timeout=False`.
+- `active_captcha_detected=False`, `status_429_seen=False`,
+  `navigation_error=False`(`navigation_error_message=""`).
+- `executed_query_count=1`, `skipped_query_count=0`, `before_trim_count=10`,
+  `final_count=10`, `stop_reason="target_reached"`.
+- `exported=True`, `export_error=False`,
+  `export_path=output/wire4a_live_10_20260715_160736.xlsx`.
+- 생성된 검색 URL: `https://map.naver.com/v5/search/%EC%84%9C%EC%9A%B8%ED%8A%B9%EB%B3%84%EC%8B%9C%20%EA%B0%95%EB%8F%99%EA%B5%AC%20%EC%B2%9C%ED%98%B8%EB%8F%99%20%EC%B9%B4%ED%8E%98`
+  (WIRE-3의 URL 계약 검토와 동일한 `_SEARCH_URL_TEMPLATE` + `quote(job["query"])`
+  조합이 실제로 네이버에 정상 도달함을 확인).
+
+## Excel 실제 검증(openpyxl 재확인)
+`통합_결과` 헤더 11개가 `MERGED_COLUMNS`와 정확히 일치, 데이터 행 10개
+(`final_count`와 정확히 일치), `place_id`/`source_*` 내부 필드 미노출
+(`internal_field_leak=[]`). `원본_모바일`/`원본_PC`는 둘 다 `max_row=1`
+(헤더만). 필드 채움 수(10건 기준): 업체명 10/업종 10/리뷰수 10/주소 10/
+대표전화 10/플레이스 URL 10/수집일 10/인스타 4/홈페이지 0/블로그 0.
+**새로오픈여부는 10건 전부 빈칸(0)** - README/LEGAL_NOTICE/안내·정책
+탭에 기록한 "현재 Network 경로에서는 항상 빈칸" 설명과 실제 live 결과가
+정확히 일치함을 재확인했다.
+
+## 타이밍
+`session_ready_seconds=2.03`(브라우저+세션 준비), `orchestrator_seconds=6.13`
+(쿼리 1개 실행 전체 - page 생성/goto/settle(5000ms)/파싱/CAPTCHA probe/
+close 전부 포함, production 코드/Playwright page 객체를 건드리지 않기
+위해 세부 구간으로는 쪼개지 않음), `session_teardown_seconds=0.28`,
+`export_seconds=0.05`, `total_wall_seconds=8.50`.
+
+## 재시도·우회 여부
+**없음.** CAPTCHA 자동 해결/DOM 제거, context 재시작, proxy/stealth, 429
+회피 로직은 harness에 전혀 구현하지 않았다(애초에 이번 실행에서는
+CAPTCHA/429가 발생하지 않아 그런 분기 자체가 실행되지 않았다).
+
+## production 코드 수정 여부
+**무수정.** `src/**` 전체가 이번 단계에서 결함 없이 그대로 실제 네이버와
+정상 연결됨을 확인했다 - 코드 수정이 필요한 문제를 전혀 발견하지 못했다.
+
+## WIRE-4A 최종 판정
+**완전 PASS.** work order §8의 "완전 PASS" 조건(candidate_response_count>=1,
+raw_item_count>=10, local_unique_count>=10, final_count==10,
+stop_reason==target_reached, CAPTCHA/429/navigation_error 전부 False,
+exported==True, Excel 10행/11헤더 정확 일치, 내부 메타 미노출, session/
+page 정상 종료, exporter 1회, 재시도 0회)을 전부 만족했다.
+
+## 다음 단계 진입 가능 여부
+**가능.** WIRE-4B(더 큰 규모 live 검증, 50~300건 확장)로 진입할 수 있는
+최소 근거가 확보됐다. 단, 이번 결과는 강동구·천호동·카페·1회 실행이라는
+단일 표본이므로(PoC-7~9에서도 이미 확인된 한계) 다른 지역/업종/시점에서도
+동일하게 재현되는지는 여전히 별도 검증이 필요하다. 속도 최적화는 work
+order 지시대로 이번 단계에서 진행하지 않았다.
+
+---
+
+# 2026-07-15 ARCH-300C WIRE-4B 실제 Network 제품 경로 50건 단일 live 실행
+
+## 배경
+WIRE-4A는 쿼리 1개·목표 10건으로 production 경로가 실제 네이버와 정상
+연결됨을 확인했다. 이번 단계는 같은 브라우저 context 안에서 검색 조합
+**4개를 순차 실행**해, 쿼리 내부 local dedup뿐 아니라 쿼리 사이 global
+dedup과 목표(target=50) 조기 종료가 실제 환경에서도 설계대로 동작하는지
+확인했다. WIRE-4A와 동일하게 정확히 1회만 실행했고 재시도/우회는
+구현하지 않았다.
+
+## 변경 파일
+- 신규 `scratchpad/arch300_network_probe/wire4b_product_live_50.py`:
+  WIRE-4A harness를 재사용해 4-job 순차 실행 + 쿼리별 진단 로그 +
+  진단 전용 global unique_added 계산을 추가한 단발성 live harness.
+- 신규 `scratchpad/arch300_network_probe/wire4b_live_50_result_20260715_162551.json`:
+  이번 실행의 전체 결과·쿼리별 로그.
+- 신규 `output/wire4b_live_50_20260715_162551.xlsx`: 실제 저장된 50행 Excel.
+- `PROJECT_STATE.md`: 이번 기록 append.
+- production 코드(`src/**`)는 **전혀 수정하지 않았다.**
+
+## 실행 환경 및 사전 회귀
+`.venv\Scripts\python.exe`(3.14.3) 기준으로만 실행. live 실행 전 최소
+회귀 3건(`test_network_product_integration_no_live.py` 11/11,
+`test_pc_network_browser_collector.py` 24/24, `test_pc_network_pipeline.py`
+12/12) 전부 PASS 확인 후에만 live를 실행했다.
+
+## job 구성과 실행값
+공통 메타 `source_city=서울특별시, source_district=강동구,
+source_layer=legal_dong` + `source_subregion`별 4개 job(순서: 천호동 →
+길동 → 성내동 → 암사동), 각 `query="서울특별시 강동구 {법정동} 카페"`.
+`per_query_limit=20`, `target_count=50`.
+
+## live 실행 횟수
+**정확히 1회.** `retries: 0`을 결과 JSON에 명시. 재실행 없음.
+
+## 쿼리별 실행 결과
+| 순번 | 법정동 | candidate | raw | local_unique | returned_rows | global_unique_added(진단) | 누적(진단) | wall |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 천호동 | 1 | 20 | 20 | 20 | 20 | 20 | 6.02s |
+| 2 | 길동 | 1 | 20 | 20 | 20 | 20 | 40 | 5.88s |
+| 3 | 성내동 | 1 | 20 | 20 | 20 | 20 | 60 | 5.87s |
+| 4 | 암사동 | - | - | - | - | - | - | 미실행(target 도달로 skip) |
+
+3개 쿼리 전부 `parse_error_count=0`, `timeout=False`,
+`active_captcha_detected=False`, `status_429_seen=False`,
+`navigation_error=False`. job4(암사동)는 `run_collection_plan`이 query3
+직후 `before_trim_count=60>=target=50`으로 즉시 멈춰 `collect_query`
+자체가 호출되지 않았다(harness의 `recording_collect_query` wrapper 호출
+로그도 3건만 기록됨 - 코드 레벨로 미실행이 직접 증명됨).
+
+## 전체 오케스트레이션 결과
+`executed_query_count=3`, `skipped_query_count=1`, `before_trim_count=60`,
+`final_count=50`, `stop_reason="target_reached"`, `security_blocked=False`,
+`status_429_seen=False`, `navigation_error=False`.
+
+## 전역 중복 제거 진단
+쿼리별 반환 rows 합계(local dedup+per_query_limit cap 이후) = 60건, 이번
+실행에서는 **쿼리 간 겹치는 업체가 0건**이었다(`global_duplicates_removed=0`,
+`global_dedup_rate=0.0`) - 천호동/길동/성내동 세 법정동의 카페 검색
+결과가 이번 표본에서는 서로 겹치지 않았다는 뜻이다(과거 PoC-6/7의 "법정동
+간 중복률 0%, 역/상권에서만 중복 발생" 관찰과 방향이 일치한다).
+`run_collection_plan`을 전혀 건드리지 않는 별도 진단 전용 `seen` set으로
+계산한 누적 고유값(60)이 실제 오케스트레이터의 `before_trim_count`(60)와
+정확히 일치함을 확인했다(`diagnostic_cumulative_unique_matches_orchestrator_before_trim=true`)
+- 진단 계산이 실제 dedup 로직과 완전히 같은 결과를 냄을 이중으로
+검증한 셈이다.
+
+## Excel 실제 검증(openpyxl 재확인)
+`통합_결과` 헤더 11개가 `MERGED_COLUMNS`와 정확히 일치, 데이터 행 50개
+(`final_count`와 정확히 일치), `place_id`/`source_*` 내부 필드 미노출.
+`원본_모바일`/`원본_PC`는 둘 다 `max_row=1`(헤더만). 필드 채움 수(50건
+기준): 업체명 50/업종 50/리뷰수 50/주소 50/대표전화 50/플레이스 URL 50/
+수집일 50/인스타 21/홈페이지 14/블로그 3. **새로오픈여부는 50건 전부
+빈칸(0)** - WIRE-4A에 이어 다시 한 번 문서 기록과 실제 live 결과가
+일치함을 재확인했다.
+
+## 시간 기록(settle_ms=5000 고정, 변경 없음)
+`session_ready_seconds=0.96`, `orchestrator_seconds=17.77`(쿼리 3개 순차
+실행 전체), `session_teardown_seconds=0.26`, `export_seconds=0.04`,
+`total_wall_seconds=19.03`, `avg_query_wall_seconds=5.92`(쿼리 1개당
+평균 - WIRE-4A의 단일 쿼리 6.13초와 유사한 수준이라 여러 쿼리 순차
+실행에서도 쿼리당 소요시간이 크게 늘거나 줄지 않음을 확인했다). 속도
+최적화는 work order 지시대로 이번 단계에서 진행하지 않았다.
+
+## 재시도·우회 여부
+**없음.** CAPTCHA 자동 해결/DOM 제거, context 재시작, proxy/stealth는
+harness에 전혀 구현하지 않았다(이번 실행에서 CAPTCHA/429가 발생하지
+않아 그런 분기 자체가 실행되지 않았다).
+
+## production 코드 수정 여부
+**무수정.** `src/**` 전체가 이번 단계에서도 결함 없이 실제 네이버와
+정상 연결됨을 확인했다 - 4개 쿼리 순차 실행, 쿼리별 page 생성/종료,
+global dedup, target 조기 종료, 단일 Excel 저장 전부 코드 수정 없이
+설계대로 동작했다.
+
+## WIRE-4B 최종 판정
+**완전 PASS.** work order §7의 "완전 PASS" 조건(실행된 모든 query에서
+candidate_response_count>=1, parse_error_count==0, CAPTCHA/429/
+navigation_error 전부 False, final_count==50, stop_reason==target_reached,
+Excel 50행/11헤더 정확 일치, 내부 메타 미노출, exporter 1회, session/
+context 정상 종료, 쿼리별 page 생성·종료 정상, 재시도 0회)을 전부
+만족했다.
+
+## 다음 단계(WIRE-4C) 진행 가능 여부
+**가능.** WIRE-4A(10건)·WIRE-4B(50건) 모두 완전 PASS로, 300건 기준선
+검증(WIRE-4C)으로 진입할 최소 근거가 확보됐다. 다만 이번 표본도 여전히
+강동구·카페·법정동 4개·1회 실행이라는 단일 조건이므로, 300건 규모에서는
+더 많은 쿼리가 순차 실행되는 만큼 CAPTCHA/429 발생 가능성이 커질 수
+있다는 점(PoC 단계에서도 반복 실행 누적 시 차단 위험이 관찰된 바 있음)을
+WIRE-4C 설계 시 감안해야 한다. 속도 최적화 판단은 여전히 WIRE-4C의
+300건 기준선 확보 이후로 유보한다.
