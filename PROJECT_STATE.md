@@ -3848,3 +3848,281 @@ HTTP 429==False, navigation_error==False, Excel 300행/11헤더/내부 메타
 1차 근거가 될 수 있다. 1건의 parse_error가 이번 단계의 유일한 미해결
 관찰 사항이며, production 코드 수정 여부(예: 발생 빈도가 잦다면 원인
 조사)는 사용자 판단 이후 별도 단계에서 결정한다.
+
+---
+
+# 2026-07-16 ARCH-300C PERF-1A 적응형 Network settle 구현(no-live, Opus 4.8 반대 검토 포함)
+
+## 배경
+WIRE-4C 실측에서 `collect_network_query`의 고정 `settle_ms=5000` 대기가
+쿼리 실행 시간의 약 85.3%를 차지함을 확인했다(쿼리당 실제 유효 작업은
+평균 0.87초 수준). 이번 단계는 이 고정 대기를 "파싱 가능한(비어있지 않은)
+업체 목록 응답을 확인한 뒤 quiet period가 지나면 조기 종료"하는 적응형
+방식으로 바꾸되, 응답이 없거나 확인이 안 되면 기존과 동일하게 최대
+settle_ms(hard cap)까지 대기하도록 구현했다. 실제 live 실행은 하지 않았다
+(no-live 코드+테스트 단계).
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`: `collect_network_query`의
+  `page.wait_for_timeout(settle_ms)` 고정 대기 한 줄을 적응형 폴링 루프로
+  교체. 모듈 상수 `_QUIET_PERIOD_MS=750`, `_POLL_INTERVAL_MS=100` 추가.
+  반환 dict에 `adaptive_settle_wait_ms`/`adaptive_settle_early_exit` 2개
+  필드 추가(모든 반환 경로 - navigation_error 조기 반환 포함 - 동일한
+  키 집합 유지). 함수 시그니처(`collect_network_query(page, job,
+  per_query_limit, *, collected_at, settle_ms=5000)`)는 완전히 그대로다.
+- 신규 `tests/test_pc_network_adaptive_settle.py`: fake-clock 기반
+  `FakeAdaptivePage`로 적응형 로직의 핵심 분기를 실제 대기 없이 검증하는
+  14개 테스트.
+- `PROJECT_STATE.md`: 이번 기록 append.
+- `tests/test_pc_network_browser_collector.py`/`tests/test_network_product_integration_no_live.py`
+  는 수정이 필요 없어(기존 assert가 대기 시간/tick 수를 검사하지 않음)
+  **그대로 재실행만 하고 무수정**으로 뒀다.
+- `src/ui.py`/`src/exporter.py`/`src/pc/browser_session.py`/
+  `src/pc/network_list_scraper.py`/`src/pc/network_pipeline.py`/
+  `README.md`/`LEGAL_NOTICE.md`/`app.py`/live harness 파일/UI 기본값/
+  query queue 순서는 **전혀 건드리지 않았다.**
+
+## 현재 흐름 도식화(수정 전)
+`page.on("response", handler)` 등록 → `page.goto(url, wait_until=
+"domcontentloaded", timeout=40000)`(PlaywrightTimeoutError는 관용적으로
+흡수, 그 외 예외는 즉시 navigation_error 반환) → **`page.wait_for_timeout
+(settle_ms)` 고정 5초 대기**(handler는 이 동안 계속 status_429_seen/
+candidate_responses만 누적, `.json()`은 안 부름) → 대기 종료 후 모든
+candidate를 순회하며 `response.json()` + `_extract_list_items()`로 raw_items
+수집(parse_error_count 집계) → `_probe_captcha_state` → 매핑/로컬 dedup/cap
+→ 반환 → `finally`에서 `page.off()`.
+
+## Opus 4.8 반대 검토 결과 및 반영
+구현 전 Agent 도구로 Claude Opus 4.8에 계획을 반대 검토시켰다(코드는
+전혀 작성하지 않은 상태에서 계획 텍스트만 검토, 실제 소스 파일들을 직접
+대조해 확인). 지정된 8개 항목 중 7개는 결함 없음으로 확인됐고, **1개
+항목에서 실제 정확성 결함을 발견**했다:
+
+- **[반드시 수정] "candidate는 있으나 result.place.list가 없는 경우"를
+  valid로 취급하기로 한 원래 계획의 결정이 위험하다는 지적**: `is_candidate_response`
+  의 URL 토큰 매칭이 넓어서(`pcmap` 등) 실제 업체 목록이 아닌 응답도
+  candidate로 잡힐 수 있다. "파싱만 성공하면(빈 목록이어도) valid"로
+  정의하면, 이런 decoy 응답 때문에 quiet period 후 조기 종료해버려서
+  그 뒤에 도착하는 **진짜 데이터가 담긴 응답을 통째로 놓칠 위험**이 있다는
+  지적이었다. → **valid 정의를 "파싱 성공 AND 추출된 목록이 비어있지
+  않음"으로 좁혀 반영**했다(코드/docstring/신규 테스트 전부 이 정의로
+  작성됨).
+- [권장, 반영] navigation_error 조기 반환 경로에도 `adaptive_settle_wait_ms=0`,
+  `adaptive_settle_early_exit=False` 기본값을 포함해 모든 반환 경로의
+  키 집합을 동일하게 유지(향후 무조건 접근 시 KeyError 예방).
+- [권장, 반영] 테스트에 "valid 후보 2개가 quiet period를 넘는 간격으로
+  도착 → 두 번째는 유실"이라는 **알려진 트레이드오프를 명시적으로
+  고정(pin)하는 테스트**를 추가(회귀 감지용).
+- [권장, 반영] `elapsed_ms`가 실제 벽시계 시간이 아니라 폴링 대기(wait_for_timeout
+  호출)의 누적 합임을 함수 docstring에 명시.
+- [문제 없음으로 확인] 규칙 4(첫 후보 parse error 시 조기 종료 안 함),
+  HTTP 429 감지 시점(폴링 루프 종료 시점과 무관하게 handler가 실시간으로
+  잡음), callback 안 `.json()` 미호출, fake-clock 테스트 가능성(설계
+  유효, 추가 시나리오 반영), `timeout` 필드 의미 보존, 기존 9개 반환
+  필드/호출자(NetworkBrowserCollector, run_collection_plan) 호환성.
+- **데이터 공백으로 남은 것(Opus 명시)**: candidate 응답 간 실제 도착
+  간격(750ms 적정성의 실측 근거), 폴링 방식이 실제 Playwright 이벤트
+  dispatch를 정상 수신하는지, `response.json()` 블로킹 시간 - 이 세
+  가지는 no-live 테스트로 검증 불가능하며 다음 live 단계(PERF-1B 또는
+  WIRE-5)에서 반드시 실측해야 한다고 명시했다. 이 사실을 코드 주석과
+  아래 "다음 단계"에도 남겼다.
+
+## 적응형 종료 계약(구현 요약)
+`_ensure_parsed(index)`가 candidate 응답 하나당 `response.json()`/
+`_extract_list_items()`를 정확히 1회만 호출하도록 메모이즈한다(폴링
+루프의 "peek" 확인과 이후 harvest 단계가 캐시를 공유 - 중복 파싱/중복
+`parse_error_count` 집계 방지). 폴링 루프는 `_POLL_INTERVAL_MS`(100ms)
+간격으로 `page.wait_for_timeout`을 반복 호출하며, 매 tick마다: (1) 새
+candidate가 도착했으면 그 후보들을 파싱해 "성공 + 비어있지 않음"이 하나라도
+있으면 `valid_list_confirmed=True`로 표시하고, 새 candidate 도착 자체는
+valid 여부와 무관하게 quiet 타이머를 리셋한다(규칙 5). (2) 새 candidate가
+없고 이미 valid가 확인된 상태면 quiet 누적 시간을 늘리고, `_QUIET_PERIOD_MS`
+(750ms)에 도달하면 즉시 break한다. candidate가 전혀 없거나 끝까지 valid로
+확인되지 않으면 `elapsed_ms < settle_ms` 조건에 의해 자연스럽게 hard cap
+(기존 5초)까지 전부 대기한다(회귀 없음). 루프 종료 후 harvest(raw_items/
+parse_error_count 산출), `_probe_captcha_state`, dedup/cap, `timeout` 계산은
+전부 기존과 동일한 순서·로직을 그대로 유지했다.
+
+## 호환성 확인
+- 함수 시그니처 무변경, `settle_ms` 기본값 5000 무변경.
+- 기존 9개 반환 필드(rows/active_captcha_detected/status_429_seen/
+  candidate_response_count/raw_item_count/local_unique_count/
+  parse_error_count/timeout/navigation_error/navigation_error_message)
+  이름·의미 전부 무변경. 신규 필드 2개는 추가만 됨(삭제·이름 변경 없음).
+- `NetworkBrowserCollector.collect_query`는 `collect_network_query(page,
+  job, per_query_limit, collected_at=self.collected_at,
+  settle_ms=self.settle_ms)`로 무수정 그대로 호출.
+- `run_collection_plan`은 `result.get("navigation_error")`/`"rows"`/
+  `"active_captcha_detected"`/`"status_429_seen"`만 읽으므로 신규 필드
+  추가로 인한 영향 없음(무수정).
+- `response callback`(`_make_response_handler`)은 이번 단계에서 전혀
+  수정하지 않았고, 여전히 status/url/resource_type만 확인 - `.json()`은
+  폴링 루프의 메인 동기 흐름(peek/harvest)에서만 호출됨을 소스 기반
+  테스트(`check_response_handler_does_not_call_json`)로 재확인했다.
+
+## 알려진 트레이드오프(의도된 설계, 문서화 완료)
+quiet period가 지나 조기 종료한 "직후"에 두 번째 candidate가 도착하면
+그 응답은 수집되지 않는다(harvest가 이미 끝난 뒤이므로) - 기존 고정
+5초 대기는 이 경우를 항상 잡았을 수 있다. 이는 속도 최적화가 감수하는
+알려진 트레이드오프이며, `check_second_valid_candidate_beyond_quiet_period_is_lost`
+테스트로 이 동작 자체를 회귀 없이 고정해 뒀다. candidate 간 실제 도착
+간격이 750ms보다 얼마나 큰/작은 경우가 실제로 있는지는 아직 live로
+계측되지 않았다.
+
+## 신규 테스트 결과
+`tests/test_pc_network_adaptive_settle.py`(신규) **14건 전부 PASS**:
+모듈 상수 확인 / 단일 valid 후보 조기 종료(9틱, hard cap 50틱보다
+훨씬 적음) / parse error만 있으면 hard cap 폴백 / candidate 0건이면
+hard cap 폴백(timeout 의미 보존) / 늦게 도착한 valid 후보로 quiet
+재시작(11틱) / quiet 이내 valid 후보 2개 모두 수집(12틱) / **quiet 초과
+간격 두 번째 후보 유실 고정**(알려진 트레이드오프) / hard cap 직전(4900ms)
+후보도 harvest에서는 정상 수집 / response.json() candidate당 정확히
+1회(중복 집계 없음) / **빈 목록 candidate는 valid로 취급 안 됨**(반대
+검토 결함 수정 확인) / 빈 목록 decoy 이후 지연 도착한 진짜 데이터가
+유실 없이 정상 수집(수정 효과 확인) / navigation_error 경로 필드
+기본값 포함 / CAPTCHA 판정 무영향 / response callback 소스에 `.json(`
+미호출 확인.
+
+## 전체 회귀 결과
+- `python -m py_compile src/pc/network_browser_collector.py tests/test_pc_network_browser_collector.py tests/test_pc_network_adaptive_settle.py tests/test_network_product_integration_no_live.py` PASS.
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무수정 파일,
+  적응형 구현으로도 회귀 없음 - 기존 assert가 대기 시간을 검사하지
+  않아 그대로 통과).
+- `tests/test_pc_network_adaptive_settle.py`(신규) 14건 전부 PASS.
+- `tests/test_network_product_integration_no_live.py` 11건 전부 PASS(무수정,
+  실제 NetworkBrowserCollector/run_collection_plan/export_places_to_excel을
+  쓰는 통합 시나리오도 회귀 없음).
+- `tests/test_pc_network_pipeline.py` 12건, `tests/test_pc_network_list_scraper.py`
+  39건, `tests/test_ui_network_start.py` 12건, `tests/test_ui_network_wiring.py`
+  19건, `tests/test_ui_network_export.py` 7건, `tests/test_ui_policy_text.py`
+  13건, `tests/test_ui_query_builder.py` 9건, `tests/test_ui_pc_full_wiring.py`
+  4건 - 전부 PASS(무영향).
+- 총 164개 검증 항목 전부 PASS, FAIL 0.
+
+## production 코드 수정 여부
+`src/pc/network_browser_collector.py` **1개 파일만** 수정했다(허용 범위
+내). `src/pc/network_list_scraper.py`/`src/pc/network_pipeline.py`는
+가능하면 수정하지 말라는 지시대로 **무수정**(실제로 수정할 필요가 전혀
+없었다 - 적응형 로직은 `collect_network_query` 내부에만 존재).
+
+## live 실행 여부
+**전부 실행 안 함.** 이번 단계는 코드 구현 + no-live fake-clock 테스트만
+수행했다(요청서 §10 지시대로).
+
+## 다음 단계(반드시 live로 확인해야 할 것)
+Opus 4.8이 지적한 3가지 데이터 공백을 실측하는 live 검증 단계가 필요하다:
+(1) candidate 응답 간 실제 도착 간격 분포(750ms quiet_period가 적정한지),
+(2) 100ms 간격 폴링이 실제 Playwright response 이벤트를 정상적으로
+수신하는지(현재 no-live 테스트는 fake clock이라 이 부분을 검증하지
+못함), (3) `response.json()`의 실제 블로킹 시간. 이 실측 없이는 이번
+PERF-1A의 실제 속도 개선폭(WIRE-4C 기준 85% 절감 잠재력 중 실제 달성
+가능한 비율)을 확정할 수 없다.
+
+---
+
+# 2026-07-16 ARCH-300C PERF-1A 커밋 전 보완 검증(non-candidate 429 계약 + .venv 전체 재검증)
+
+## 목표
+- quiet period 진행 중 도착하는 non-candidate HTTP 429 감지 계약을
+  fake-clock 테스트로 추가.
+- 프로젝트 `.venv` 실행기(`.\.venv\Scripts\python.exe`)로 PERF-1A 관련
+  전체 회귀를 처음부터 다시 검증.
+- 반대 검토(Opus 4.8)는 이번 단계에서 다시 수행하지 않았다 - PERF-1A
+  본 구현은 이전 단계에서 이미 반대 검토를 마쳤고, 이번은 그 위에 테스트
+  1건을 보강하는 최소 작업이었다.
+
+## 변경 파일
+- `tests/test_pc_network_adaptive_settle.py`: 신규 테스트 1건 추가
+  (`check_non_candidate_429_during_quiet_period_is_detected`), main()
+  등록 목록에 추가. 나머지 14건은 무수정.
+- `PROJECT_STATE.md`: 이번 보완 기록 append.
+- `src/pc/network_browser_collector.py`: **무수정** - 신규 테스트가
+  production 결함을 재현하지 않아 수정할 이유가 없었다(§아래 "테스트
+  시나리오" 참고).
+
+## 테스트 시나리오
+`FakeAdaptivePage`에 두 응답을 예약: (1) ms=0에 정상 valid candidate
+(파싱 성공, 비어있지 않은 목록 1건), (2) ms=400(quiet period 진행 중,
+아직 조기 종료 전)에 **candidate가 아닌 URL/resource_type**의 HTTP 429
+응답(`FakeResponse("https://map.naver.com/", 429, "document")` - 기존
+`tests/test_pc_network_browser_collector.py`의 non-candidate 429 테스트와
+동일한 값 재사용).
+
+## 테스트가 검증한 정확한 계약
+- `result["status_429_seen"] is True` - candidate가 아닌 URL이어도 429
+  상태 코드만으로 감지됨(`_make_response_handler`가 상태 코드 확인을
+  `is_candidate_response` 판별보다 먼저, 독립적으로 수행하기 때문).
+- `result["candidate_response_count"] == 1` - 429 응답이 candidate로
+  잘못 집계되지 않음(1건 그대로, 정상 candidate 1개만 유지).
+- `result["parse_error_count"] == 0`, `len(result["rows"]) >= 1`,
+  `result["timeout"] is False`, `result["navigation_error"] is False` -
+  429 도착이 기존 결과 필드에 부작용을 남기지 않음.
+- `result["adaptive_settle_early_exit"] is True`,
+  `result["adaptive_settle_wait_ms"] < 5000` - 429 도착과 무관하게 정상
+  조기 종료됨.
+- **`len(page.wait_calls) == 1 + _QUIET_TICKS`(9틱)** - 429가 전혀 없었던
+  기존 `check_single_valid_candidate_exits_early` 테스트와 정확히 동일한
+  tick 수. 이는 candidate가 아닌 429 도착이 quiet 타이머를 "새 candidate
+  도착"처럼 재시작시키지 않았음을 직접 증명한다(재시작됐다면 tick 수가
+  더 많이 나왔을 것).
+- `non_candidate_429.json_call_count == 0` - 429 응답 자체에 대해
+  `response.json()`이 전혀 호출되지 않음(429 판정은 상태 코드만으로
+  끝나며, candidate가 아니므로 harvest 대상에도 포함되지 않음 -
+  callback 안에서든 밖에서든 무거운 파싱이 발생하지 않음을 재확인).
+
+## production 코드 추가 수정 여부
+**수정하지 않았다.** 신규 테스트가 첫 실행에서 바로 PASS했다 - 기존
+구현(`_make_response_handler`가 429 상태 확인을 candidate 판별과 완전히
+분리해 무조건 먼저 수행하는 구조, PERF-1A 이전부터 있던 로직이며 이번
+단계에서 전혀 건드리지 않음)이 이미 이 계약을 만족하고 있었다.
+
+## 신규 적응형 테스트 PASS / FAIL
+`tests/test_pc_network_adaptive_settle.py`: **15건 전부 PASS, FAIL 0**
+(기존 14건 + 신규 429 테스트 1건).
+
+## 전체 회귀 파일별 PASS / FAIL(전부 `.\.venv\Scripts\python.exe`로 실행)
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_pc_network_browser_collector.py | 24 | 0 | PASS |
+| tests/test_pc_network_adaptive_settle.py | 15 | 0 | PASS |
+| tests/test_network_product_integration_no_live.py | 11 | 0 | PASS |
+| tests/test_pc_network_pipeline.py | 12 | 0 | PASS |
+| tests/test_pc_network_list_scraper.py | 39 | 0 | PASS |
+| tests/test_ui_network_start.py | 12 | 0 | PASS |
+| tests/test_ui_network_wiring.py | 19 | 0 | PASS |
+| tests/test_ui_network_export.py | 7 | 0 | PASS |
+| tests/test_ui_policy_text.py | 13 | 0 | PASS |
+| tests/test_ui_query_builder.py | 9 | 0 | PASS |
+| tests/test_ui_pc_full_wiring.py | 4 | 0 | PASS |
+
+모든 파일 exit code 0.
+
+## 전체 PASS 합계
+**165건 전부 PASS, FAIL 0**(이전 기록 164건 + 신규 429 테스트 1건).
+이전 PERF-1A 기록의 "164건"은 그 시점의 정확한 결과로 그대로 유지하며
+수정하지 않았다.
+
+## 사용한 Python 실행 경로
+`C:\code\naver-place-sales-db-crawler-v1\.venv\Scripts\python.exe`
+(3.14.3) - `sys.executable`로 직접 확인. bare `python`/시스템 Python은
+사용하지 않았다.
+
+## live 여부
+**전부 실행 안 함.** 실제 네이버 접속, 업체 데이터 JSON·Excel 생성 없음.
+
+## Git 상태
+작업 시작 시점과 종료 시점 모두 아래와 동일(신규 파일 1개 내용만 갱신,
+파일 목록 변화 없음):
+```
+ M PROJECT_STATE.md
+ M src/pc/network_browser_collector.py
+?? tests/test_pc_network_adaptive_settle.py
+```
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 다음 단계
+- 사용자 검토 후 PERF-1A(적응형 settle + 이번 429 보완 테스트) 커밋.
+- 이후 PERF-1B: 실제 50건 규모 live 성능 비교(WIRE-4B 기준선 대비
+  적응형 settle의 실제 절감폭 측정, Opus가 지적한 3가지 데이터 공백
+  - candidate 도착 간격/폴링 이벤트 수신 정상성/`.json()` 블로킹 시간
+  - 실측 포함).
