@@ -479,7 +479,10 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.new_open_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             filter_frame,
-            text="현재 기본 수집에서는 새로오픈 필터를 지원하지 않습니다.",
+            text=(
+                "현재 버전에서는 새로오픈 여부를 정확하게 판별할 수 없어 사용할 수 없습니다.\n"
+                "Excel의 '새로오픈여부' 열은 유지되며 현재 결과에서는 빈칸으로 저장됩니다."
+            ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
 
@@ -508,8 +511,10 @@ class SalesDbCrawlerApp(ctk.CTk):
         ctk.CTkLabel(
             target_frame,
             text=(
-                "각 검색 조합마다 적용되는 수집 상한입니다.\n"
-                "전체 저장 개수는 지역 수와 중복 제거 결과에 따라 달라집니다."
+                "검색 조합(지역+업종으로 만든 검색어 1개)마다 적용되는 최대 수집 상한입니다.\n"
+                "실제 수집 수는 검색 결과에 따라 이 값보다 적을 수 있습니다.\n"
+                "전체 저장 개수는 지역 수와 중복 제거 결과에 따라 달라집니다.\n"
+                "최대 300개"
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
@@ -534,11 +539,25 @@ class SalesDbCrawlerApp(ctk.CTk):
         ctk.CTkLabel(
             global_target_frame,
             text=(
-                "중복 제거 후 최종 저장할 목표 개수입니다.\n"
-                "업종·지역 및 검색 결과에 따라 목표 개수에 미달할 수 있습니다."
+                "여러 검색 조합의 결과를 합치고 중복을 제거한 뒤\n"
+                "Excel에 최종 저장할 최대 업체 수입니다.\n"
+                "목표 개수는 보장값이 아니며, 업종·지역 및 검색 결과에 따라 미달할 수 있습니다."
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
+        # UX-1: "검색 조합당 수집 상한"(§5)과 "전체 목표 저장 개수"(§6)의 관계를
+        # 숫자를 넣지 않고는 이해하기 어렵다는 사용자 혼동 지점이 있어, 두 값을
+        # 모두 입력한 뒤 확인하게 되는 이 섹션 마지막에 기본값 30/300 예시를
+        # 짧게 덧붙인다(옵션 A: 두 숫자 입력 영역 아래 공통 안내 문구).
+        ctk.CTkLabel(
+            global_target_frame,
+            text=(
+                "예) 조합당 30 / 전체 목표 300\n"
+                "→ 검색어마다 최대 30개씩 수집하고, 여러 결과를 합쳐\n"
+                "   중복 제거 후 전체 최대 300개를 저장합니다."
+            ),
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))

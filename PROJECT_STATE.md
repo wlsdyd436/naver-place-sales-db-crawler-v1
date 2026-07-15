@@ -4492,3 +4492,175 @@ scratchpad/arch300_network_probe/results/perf1c/perf1c_adaptive_live_300_2026071
   PASS를 확인했으므로, 이 시점에서 적응형 settle의 실측 검증 단계
   (PERF-1A/1B/1C)는 목표를 달성한 것으로 판단된다. 추가 단계 진행
   여부는 사용자 결정 사항이다.
+
+---
+
+# 2026-07-15 ARCH-300C UX-1 수집 설정 사용자 설명 개선
+
+## 목표
+"검색 조합당 수집 상한"·"전체 목표 저장 개수"·새로오픈 필터라는 세 설정의
+의미와 차이를 일반 사용자가 UI 문구만으로 이해할 수 있도록 개선한다.
+수집 로직·입력 검증·기본값·Excel 정책은 변경하지 않는다.
+
+## 사용자 혼동 지점(work order 그대로)
+1. "검색 조합"이 무엇인지 UI만으로 알기 어려움.
+2. 검색 조합당 수집 상한과 전체 목표 저장 개수의 차이가 불명확.
+3. 조합당 상한을 높이면 그 개수가 반드시 수집된다고 오해 가능.
+4. 새로오픈업체 체크박스가 왜 비활성화됐는지 알 수 없음.
+5. 검색 조합당 300 지원 여부는 LIMIT-300-A/B에서 별도 검증 예정 -
+   UX-1에서 확정적으로 표현하지 않음.
+
+## 변경 파일
+- `src/ui.py`: `_build_filter_section`(새로오픈 안내),
+  `_build_target_count_section`(검색 조합당 상한 안내),
+  `_build_global_target_count_section`(전체 목표 저장 개수 안내 + 30/300
+  예시) 3개 메서드의 설명 Label 텍스트만 수정. 위젯 생성 순서·row/grid
+  배치·`state="disabled"`·`_DEFAULT_PER_QUERY_LIMIT`/`_DEFAULT_TARGET_COUNT`
+  값·검색 조합 생성 로직·입력 검증 로직은 전혀 건드리지 않았다.
+- `tests/test_ui_policy_text.py`: UX-1 신규 검증 12건 추가(아래 §테스트
+  참고), `PER_QUERY_LIMIT_SECTION_SOURCE`/`GLOBAL_TARGET_COUNT_SECTION_SOURCE`/
+  `FILTER_SECTION_SOURCE` 소스 상수 추가.
+- `tests/test_ui_network_start.py`: 기존
+  `check_new_open_filter_disabled_and_normalized`가 검사하던 정확한
+  문자열("새로오픈 필터를 지원하지 않습니다")이 이번 문구 개선으로
+  사라져 실제로 깨졌으므로, 검사 대상 문자열만 새 문구 일부
+  ("정확하게 판별할 수 없어 사용할 수 없습니다")로 최소 교체했다.
+  disabled 상태·new_open_checkbox 이름 검증 등 나머지 계약은 그대로
+  유지(계약 약화 없음, work order §3 조건부 수정 허용 범위 내).
+
+## 최종 적용한 사용자 문구
+
+### 새로오픈업체(§_build_filter_section)
+```
+현재 버전에서는 새로오픈 여부를 정확하게 판별할 수 없어 사용할 수 없습니다.
+Excel의 '새로오픈여부' 열은 유지되며 현재 결과에서는 빈칸으로 저장됩니다.
+```
+(체크박스 자체는 `state="disabled"` 그대로 유지, 초기값도 항상 False)
+
+### 검색 조합당 수집 상한(§_build_target_count_section, "5. 검색 조합당 수집 상한")
+```
+검색 조합(지역+업종으로 만든 검색어 1개)마다 적용되는 최대 수집 상한입니다.
+실제 수집 수는 검색 결과에 따라 이 값보다 적을 수 있습니다.
+전체 저장 개수는 지역 수와 중복 제거 결과에 따라 달라집니다.
+```
+
+### 전체 목표 저장 개수(§_build_global_target_count_section, "6. 전체 목표 저장 개수")
+```
+여러 검색 조합의 결과를 합치고 중복을 제거한 뒤
+Excel에 최종 저장할 최대 업체 수입니다.
+목표 개수는 보장값이 아니며, 업종·지역 및 검색 결과에 따라 미달할 수 있습니다.
+```
+
+### 조합당 30 / 전체 300 예시(같은 섹션, 위 문구 바로 아래 별도 Label)
+```
+예) 조합당 30 / 전체 목표 300
+→ 검색어마다 최대 30개씩 수집하고, 여러 결과를 합쳐
+   중복 제거 후 전체 최대 300개를 저장합니다.
+```
+
+## 선택한 UI 표시 방식
+work order §4.4의 A/B/C/D 중 **A(두 숫자 입력 영역 아래 공통 안내
+문구)**를 선택했다 - "6. 전체 목표 저장 개수" 섹션은 사용자가 "5. 검색
+조합당 수집 상한"을 이미 입력한 뒤 도달하는 위치이므로, 두 값의 관계를
+설명하기에 가장 자연스러운 지점이라고 판단했다. 새 팝업/tooltip 시스템은
+만들지 않았고, 기존 CTkLabel(text_color="gray", font size 11) 스타일과
+"\n" 수동 줄바꿈 패턴을 그대로 재사용했다(저장소 전체에 wraplength 사용
+사례가 없어 기존 패턴을 유지).
+
+## UI 레이아웃 변경 내용
+새 CTkFrame이나 새 grid row(섹션 단위)는 추가하지 않았다. 기존 3개
+섹션의 설명 Label 텍스트 줄 수만 늘었다(새로오픈 1→2줄, 조합당 상한
+2→3줄, 전체 목표 2→3줄 + 예시용 Label 1개 신규, row=2 추가). 좌측
+패널이 `CTkScrollableFrame`이라 세로 길이 증가는 스크롤로 흡수되며,
+가로 폭이 늘어나는 표현은 쓰지 않아 가로 스크롤 위험은 없다고 판단했다
+(실제 창 렌더링 시각 확인은 아래 §수동 UI 확인 참고).
+
+## 기능·입력 검증·기본값 무변경 확인
+`_DEFAULT_COLLECTION_ENGINE`/`_DEFAULT_PER_QUERY_LIMIT`("30")/
+`_DEFAULT_TARGET_COUNT`("300")/검색 조합 생성 로직/`_parse_positive_int`
+입력 검증/Network 수집 로직/Excel 열·시트 구조/새로오픈여부 빈칸 정책
+전부 무수정(`tests/test_ui_network_start.py::check_default_constants`,
+`tests/test_ui_policy_text.py::check_ux1_default_values_unchanged` 등
+기존+신규 테스트로 재확인).
+
+## 새로오픈 체크박스 disabled 유지 확인
+`_build_filter_section` 소스에 `state="disabled"`와 `new_open_checkbox`
+식별자가 문구 개선 후에도 그대로 존재(`check_new_open_filter_disabled_and_normalized`,
+`check_ux1_new_open_checkbox_disabled_contract_preserved` 둘 다 PASS).
+
+## 테스트
+`tests/test_ui_policy_text.py`에 UX-1 신규 검증 12건 추가:
+1. `check_ux1_search_combination_defined` - 검색 조합=지역+업종 검색어
+   1개 정의 존재
+2. `check_ux1_per_query_limit_is_per_single_combination` - 조합당
+   상한이 검색어 1개 기준 최대 수집 상한이라는 의미
+3. `check_ux1_actual_count_may_be_lower` - 실제 수집 수가 더 적을 수
+   있다는 안내
+4. `check_ux1_global_target_aggregates_combinations` - 전체 목표가
+   여러 검색 조합 통합 결과 기준이라는 의미
+5. `check_ux1_global_target_dedup_then_save` - 중복 제거 후 Excel
+   최종 저장 안내
+6. `check_ux1_global_target_not_guaranteed` - 전체 목표가 보장값이
+   아니라는 안내
+7. `check_ux1_new_open_currently_unavailable` - 새로오픈 현재 사용
+   불가(정확 판별 불가) 안내
+8. `check_ux1_new_open_column_kept_blank` - Excel 새로오픈여부 열
+   유지 + 빈칸 안내
+9. `check_ux1_per_query_vs_global_example` - 조합당 30/전체 300 예시
+   존재
+10. `check_ux1_forbidden_phrases_absent_in_new_ui_text` - 새 UI
+    문구에 금지 표현 없음(순수 주석 줄은 검사 대상에서 제외 - 기존
+    개발자 주석 "'300개 보장'처럼 과장된 표현은 쓰지 않는다" 등 반례
+    인용에 의한 오탐 방지)
+11. `check_ux1_new_open_checkbox_disabled_contract_preserved` - disabled
+    계약 유지
+12. `check_ux1_default_values_unchanged` - 기본값 30/300 불변
+
+## 테스트 파일별 PASS/FAIL(전부 `.\.venv\Scripts\python.exe`로 실행)
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_ui_policy_text.py | 25 | 0 | PASS |
+| tests/test_ui_network_start.py | 12 | 0 | PASS |
+| tests/test_ui_network_wiring.py | 19 | 0 | PASS |
+| tests/test_ui_query_builder.py | 9 | 0 | PASS |
+| tests/test_ui_pc_full_wiring.py | 4 | 0 | PASS |
+
+전체 PASS 합계: **69건, FAIL 0**. 모든 파일 exit code 0.
+
+## 수동 UI 확인
+실행하지 않았다. `run_app()`/`app.mainloop()`는 `SalesDbCrawlerApp.__init__`이
+아니라 별도 진입점에서만 호출되고 `_build_ui()` 계열 메서드는 위젯
+생성만 수행함을 소스로 확인해, UI를 실제로 열어도 Network/브라우저
+수집이 자동 시작되지는 않을 것으로 판단했다. 다만 이번 세션에는 실제
+창을 시각적으로 캡처·확인할 스크린샷 도구가 없어 텍스트 잘림/위젯
+겹침/창 높이 부족 여부를 눈으로 검증하지 못했다 - work order §8의
+대안대로 자동 테스트 결과와 코드 구조 확인만으로 보고하며, 실제 화면
+확인은 별도 UX-QA 단계 후보로 남긴다.
+
+## live 실행 여부
+**전부 실행 안 함.** 실제 네이버·Playwright 접속 없음.
+
+## production 수집 코드 수정 여부
+**수정하지 않았다.** `src/pc/*`, `src/exporter.py`, `app.py`, Network
+수집 로직, 검색 조합 생성 로직, 입력 검증 로직 전부 무수정. `src/ui.py`
+안에서도 3개 메서드의 설명 Label 텍스트만 바꿨을 뿐 위젯 생성/데이터
+흐름/이벤트 배선은 그대로다.
+
+## Git 상태(작업 종료 시점)
+작업 시작 전 이미 PERF-1C(`cd759c1`)가 커밋되어 있었다. 이번 UX-1
+단계에서:
+```
+git status --short
+ M PROJECT_STATE.md
+ M src/ui.py
+ M tests/test_ui_network_start.py
+ M tests/test_ui_policy_text.py
+```
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 다음 단계
+LIMIT-300-A
+- 검색 조합당 상한의 실제 입력 허용 범위 확인
+- 1, 300 경계값 허용 여부
+- 0, 음수, 301 이상, 문자, 소수 거부 여부
+- UX-1에서는 입력 검증을 변경하지 않았음

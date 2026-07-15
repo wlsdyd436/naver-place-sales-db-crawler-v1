@@ -17,6 +17,11 @@ from src import ui
 README_TEXT = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
 LEGAL_NOTICE_TEXT = (ROOT_DIR / "LEGAL_NOTICE.md").read_text(encoding="utf-8")
 POLICY_TAB_SOURCE = inspect.getsource(ui.SalesDbCrawlerApp._build_policy_tab)
+# UX-1: 좌측 패널의 "검색 조합당 수집 상한"/"전체 목표 저장 개수"/새로오픈
+# 필터 설명 문구를 소스 기반으로 검증한다(정책 탭과 동일한 방식 재사용).
+PER_QUERY_LIMIT_SECTION_SOURCE = inspect.getsource(ui.SalesDbCrawlerApp._build_target_count_section)
+GLOBAL_TARGET_COUNT_SECTION_SOURCE = inspect.getsource(ui.SalesDbCrawlerApp._build_global_target_count_section)
+FILTER_SECTION_SOURCE = inspect.getsource(ui.SalesDbCrawlerApp._build_filter_section)
 
 
 class ValidationReporter:
@@ -220,6 +225,134 @@ def check_forbidden_hype_phrases_absent(reporter: ValidationReporter) -> None:
         reporter.fail(f"README/LEGAL_NOTICE에 금지 표현이 긍정 주장 형태로 남아있음: {found}")
 
 
+# ---------------------------------------------------------------------------
+# 14~25(UX-1). 좌측 패널 사용자 설명 문구(검색 조합/조합당 상한/전체 목표/새로오픈)
+# ---------------------------------------------------------------------------
+
+
+def check_ux1_search_combination_defined(reporter: ValidationReporter) -> None:
+    ok = "지역+업종으로 만든 검색어 1개" in PER_QUERY_LIMIT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: '검색 조합 = 지역+업종으로 만든 검색어 1개' 정의가 조합당 상한 섹션에 존재")
+    else:
+        reporter.fail(f"UX-1: 검색 조합 정의 문구가 조합당 상한 섹션에 없음\n{PER_QUERY_LIMIT_SECTION_SOURCE}")
+
+
+def check_ux1_per_query_limit_is_per_single_combination(reporter: ValidationReporter) -> None:
+    ok = "검색 조합" in PER_QUERY_LIMIT_SECTION_SOURCE and "최대 수집 상한" in PER_QUERY_LIMIT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 조합당 상한이 검색 조합(검색어) 1개 기준의 최대 수집 상한이라는 의미 존재")
+    else:
+        reporter.fail(f"UX-1: 조합당 상한이 검색어 1개 기준이라는 의미가 없음\n{PER_QUERY_LIMIT_SECTION_SOURCE}")
+
+
+def check_ux1_actual_count_may_be_lower(reporter: ValidationReporter) -> None:
+    ok = "실제 수집 수는 검색 결과에 따라 이 값보다 적을 수 있습니다" in PER_QUERY_LIMIT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 조합당 상한을 입력해도 실제 수집 수는 더 적을 수 있다는 안내 존재")
+    else:
+        reporter.fail(f"UX-1: 실제 수집 수가 더 적을 수 있다는 안내가 없음\n{PER_QUERY_LIMIT_SECTION_SOURCE}")
+
+
+def check_ux1_global_target_aggregates_combinations(reporter: ValidationReporter) -> None:
+    ok = "여러 검색 조합의 결과를 합치고" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 전체 목표 저장 개수가 여러 검색 조합의 통합 결과 기준이라는 의미 존재")
+    else:
+        reporter.fail(f"UX-1: 전체 목표가 여러 검색 조합 통합 기준이라는 의미가 없음\n{GLOBAL_TARGET_COUNT_SECTION_SOURCE}")
+
+
+def check_ux1_global_target_dedup_then_save(reporter: ValidationReporter) -> None:
+    ok = "중복을 제거한 뒤" in GLOBAL_TARGET_COUNT_SECTION_SOURCE and "Excel에 최종 저장" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 중복 제거 후 Excel에 최종 저장한다는 안내 존재")
+    else:
+        reporter.fail(f"UX-1: 중복 제거 후 최종 저장 안내가 없음\n{GLOBAL_TARGET_COUNT_SECTION_SOURCE}")
+
+
+def check_ux1_global_target_not_guaranteed(reporter: ValidationReporter) -> None:
+    ok = "목표 개수는 보장값이 아니며" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 전체 목표 저장 개수가 보장값이 아니라는 안내 존재")
+    else:
+        reporter.fail(f"UX-1: 전체 목표가 보장값이 아니라는 안내가 없음\n{GLOBAL_TARGET_COUNT_SECTION_SOURCE}")
+
+
+def check_ux1_new_open_currently_unavailable(reporter: ValidationReporter) -> None:
+    ok = "정확하게 판별할 수 없어 사용할 수 없습니다" in FILTER_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 새로오픈 필터가 현재 정확 판별 불가로 사용할 수 없다는 안내 존재")
+    else:
+        reporter.fail(f"UX-1: 새로오픈 현재 사용 불가 안내가 없음\n{FILTER_SECTION_SOURCE}")
+
+
+def check_ux1_new_open_column_kept_blank(reporter: ValidationReporter) -> None:
+    ok = "새로오픈여부' 열은 유지되며" in FILTER_SECTION_SOURCE and "빈칸으로 저장됩니다" in FILTER_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: Excel '새로오픈여부' 열은 유지되고 현재 결과는 빈칸이라는 안내 존재")
+    else:
+        reporter.fail(f"UX-1: 새로오픈여부 열 유지/빈칸 안내가 없음\n{FILTER_SECTION_SOURCE}")
+
+
+def check_ux1_per_query_vs_global_example(reporter: ValidationReporter) -> None:
+    ok = (
+        "조합당 30" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+        and "전체 목표 300" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+        and "최대 300개를 저장" in GLOBAL_TARGET_COUNT_SECTION_SOURCE
+    )
+    if ok:
+        reporter.pass_("UX-1: 조합당 30 / 전체 목표 300 차이를 보여주는 예시 문구 존재")
+    else:
+        reporter.fail(f"UX-1: 조합당 30/전체 300 예시 문구가 없음\n{GLOBAL_TARGET_COUNT_SECTION_SOURCE}")
+
+
+def check_ux1_forbidden_phrases_absent_in_new_ui_text(reporter: ValidationReporter) -> None:
+    forbidden_phrases = [
+        "300개 보장", "무제한 수집", "모든 업체 수집", "새로오픈 정확 판별",
+        "CAPTCHA 해결", "CAPTCHA를 우회", "차단되지 않습니다", "공식 API",
+        "네이버가 공식 허용", "법적으로 문제없", "합법 보장",
+        "곧 지원됩니다", "다음 버전에서 반드시 지원됩니다",
+        "새로오픈 업체를 자동으로 정확히 판별합니다", "상세 페이지에서 무조건 확인할 수 있습니다",
+    ]
+    # inspect.getsource()는 코드 주석까지 포함하므로, 금지 표현을 "쓰지 않는다"는
+    # 부정 문맥으로 인용한 기존 개발자 주석(예: "'300개 보장'처럼 과장된 표현은
+    # 쓰지 않는다", "'300개 보장'이 아니라 ...")을 오탐으로 걸러내기 위해
+    # 실제 화면에 보이는 텍스트가 아닌 순수 주석 줄(#로 시작하는 줄)은 검사
+    # 대상에서 제외한다 - 이 검사의 목적은 "사용자에게 보이는 새 문구"에 금지
+    # 표현이 없는지 확인하는 것이지, 개발자 주석의 반례 인용까지 막는 것이
+    # 아니다.
+    def _strip_full_line_comments(source: str) -> str:
+        return "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+
+    combined = "\n".join(
+        _strip_full_line_comments(section)
+        for section in (PER_QUERY_LIMIT_SECTION_SOURCE, GLOBAL_TARGET_COUNT_SECTION_SOURCE, FILTER_SECTION_SOURCE)
+    )
+    found = [phrase for phrase in forbidden_phrases if phrase in combined]
+    if not found:
+        reporter.pass_("UX-1: 새 UI 문구(조합당 상한/전체 목표/새로오픈)에 금지 표현 없음")
+    else:
+        reporter.fail(f"UX-1: 새 UI 문구에 금지 표현이 있음: {found}")
+
+
+def check_ux1_new_open_checkbox_disabled_contract_preserved(reporter: ValidationReporter) -> None:
+    ok = 'state="disabled"' in FILTER_SECTION_SOURCE and "new_open_checkbox" in FILTER_SECTION_SOURCE
+    if ok:
+        reporter.pass_("UX-1: 새로오픈 체크박스 disabled 계약이 문구 개선 후에도 유지됨")
+    else:
+        reporter.fail(f"UX-1: 새로오픈 체크박스 disabled 계약이 사라짐\n{FILTER_SECTION_SOURCE}")
+
+
+def check_ux1_default_values_unchanged(reporter: ValidationReporter) -> None:
+    ok = ui._DEFAULT_PER_QUERY_LIMIT == "30" and ui._DEFAULT_TARGET_COUNT == "300"
+    if ok:
+        reporter.pass_("UX-1: 기본값 조합당 30 / 전체 목표 300이 변경되지 않음")
+    else:
+        reporter.fail(
+            f"UX-1: 기본값이 변경됨: PER_QUERY_LIMIT={ui._DEFAULT_PER_QUERY_LIMIT}, TARGET_COUNT={ui._DEFAULT_TARGET_COUNT}"
+        )
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -236,6 +369,19 @@ def main() -> int:
     check_legal_notice_no_legal_guarantee_wording(reporter)
     check_policy_tab_core_guidance_present(reporter)
     check_forbidden_hype_phrases_absent(reporter)
+
+    check_ux1_search_combination_defined(reporter)
+    check_ux1_per_query_limit_is_per_single_combination(reporter)
+    check_ux1_actual_count_may_be_lower(reporter)
+    check_ux1_global_target_aggregates_combinations(reporter)
+    check_ux1_global_target_dedup_then_save(reporter)
+    check_ux1_global_target_not_guaranteed(reporter)
+    check_ux1_new_open_currently_unavailable(reporter)
+    check_ux1_new_open_column_kept_blank(reporter)
+    check_ux1_per_query_vs_global_example(reporter)
+    check_ux1_forbidden_phrases_absent_in_new_ui_text(reporter)
+    check_ux1_new_open_checkbox_disabled_contract_preserved(reporter)
+    check_ux1_default_values_unchanged(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

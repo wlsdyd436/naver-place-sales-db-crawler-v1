@@ -416,7 +416,7 @@ def check_new_open_filter_disabled_and_normalized(reporter: ValidationReporter) 
     static_ok = (
         'state="disabled"' in filter_source
         and "new_open_checkbox" in filter_source
-        and "새로오픈 필터를 지원하지 않습니다" in filter_source
+        and "정확하게 판별할 수 없어 사용할 수 없습니다" in filter_source
         and "new_open_checkbox" in panel_state_source
         and '"disabled"' in panel_state_source
     )
