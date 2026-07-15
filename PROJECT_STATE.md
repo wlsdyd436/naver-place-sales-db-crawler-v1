@@ -3152,3 +3152,313 @@ live 10/50/300 제품 검증은 아직 미실행 상태로 남아있다.
 ## 커밋 관련
 WIRE-2C-2(엔진 전환)와 WIRE-2D(문서 정합성)를 검토 후 한 커밋으로 묶을
 예정이므로, 이번 단계에서도 git add/commit을 하지 않았다.
+
+---
+
+# 2026-07-15 ARCH-300C WIRE-3 실제 production 함수 기반 no-live 전체 통합 검증
+
+## 배경
+WIRE-2C-1/2C-2/2D까지 각 계층(orchestrator, browser collector, UI worker,
+문서)을 개별적으로 fake/monkeypatch 기반 단위 테스트로 검증해왔다. 이번
+단계는 실제 네이버·Playwright에 접속하지 않으면서도, UI 시작 지점부터
+`NetworkBrowserCollector`→`collect_network_query`→`network_list_scraper`
+매핑→`run_collection_plan`→`export_places_to_excel`까지 **실제 production
+함수를 최대한 그대로 연결**해 전체 흐름이 실제로 맞물려 동작하는지
+한 번에 검증했다. 가짜로 대체한 것은 Playwright 브라우저 계층
+(FakeBrowserSessionLike/FakePage/FakeResponse/FakeLocator)뿐이다.
+
+## 변경 파일
+- 신규 `tests/test_network_product_integration_no_live.py`: 11개 통합
+  테스트(§아래).
+- `PROJECT_STATE.md`: 이번 기록 append.
+- production 코드(`src/ui.py`, `src/pc/network_browser_collector.py`,
+  `src/pc/network_pipeline.py`, `src/pc/network_list_scraper.py`)는
+  **전혀 수정하지 않았다** - 통합 테스트에서 실제 결함이 발견되지 않았다
+  (§아래 "테스트 fixture 문제 vs production 결함" 참고).
+
+## 통합 테스트에서 실제 사용한 production 함수
+- `src.pc.network_browser_collector.NetworkBrowserCollector`(실제 클래스,
+  `session_factory`만 fake 주입)
+- `src.pc.network_browser_collector.collect_network_query`(monkeypatch 없이
+  그대로 호출됨 - `NetworkBrowserCollector.collect_query`를 통해서든, URL
+  계약 검증에서 직접 호출하든 전부 실제 함수)
+- `src.pc.network_list_scraper`의 `_extract_list_items`/`_map_item_to_row`/
+  `dedup_rows`/`classify_captcha_signal`/`is_candidate_response`(전부
+  `collect_network_query` 내부에서 실제로 실행됨, 별도 monkeypatch 없음)
+- `src.pc.network_pipeline.run_collection_plan`(실제 함수, fake 없이 직접
+  전달)
+- `src.exporter.export_places_to_excel`(실제 함수, `tempfile.TemporaryDirectory()`
+  안에서 실제 `.xlsx` 파일을 만듦)
+- `src.ui.SalesDbCrawlerApp._run_network_pipeline`(실제 메서드, 시나리오
+  4~9는 인스턴스 메서드로 직접 호출, 시나리오 10은 `ui.SalesDbCrawlerApp.
+  _run_network_pipeline`을 언바운드로 가져와 fake collector_factory만 주입한
+  wrapper로 교체 - 이유는 아래 "worker 예외 시나리오 설계" 참고)
+- `src.ui.SalesDbCrawlerApp._run_network_pipeline_worker`(시나리오 10에서
+  전혀 monkeypatch하지 않은 실제 클래스 메서드 그대로 호출)
+- `src.ui.SalesDbCrawlerApp._network_stop_message`(시나리오 5에서 실제
+  메서드로 안내 문구 직접 검증)
+- `src.ui.SalesDbCrawlerApp.set_running`/`_set_left_panel_state`/
+  `_note_security_block`(시나리오 10/6에서 실제 메서드 그대로 실행)
+
+## fake BrowserSession/page/response 구조
+`FakeBrowserSessionLike`(컨텍스트 매니저 + `.context`/`.page` 속성만
+BrowserSession과 동일한 계약) → `.context`(`FakeContext`)는 `new_page()`
+호출마다 미리 준비된 `FakePage` 목록을 순서대로 하나씩 내준다(job 실행
+순서와 1:1 대응) → `FakePage`는 `on`/`off`/`goto`/`wait_for_timeout`/
+`locator`/`close`를 지원하며, `goto(url)` 호출 시 준비된 `FakeResponse`들을
+등록된 response handler에 그대로 전달한다(실제 Playwright response 이벤트
+발생과 동일한 순서). `FakeResponse.json()`은 `{"result": {"place": {"list":
+[...]}}}` 구조를 반환해 실제 `_extract_list_items`의 알려진 경로 탐색을
+그대로 태운다. `FakeLocator`는 CAPTCHA probe selector별 count/visible/
+bounding_box를 미리 지정해 실제 `_probe_captcha_state`/`classify_captcha_signal`
+계산 로직을 그대로 통과시킨다. `wait_for_timeout`은 실제 대기 없이 호출
+인자만 기록한다. `test_pc_network_browser_collector.py`의 기존 검증된
+FakePage/FakeResponse/FakeLocator 계약을 그대로 재사용/확장(close() 추가)
+했다 - 새로운 계약을 임의로 만들지 않았다.
+
+## 목표 도달 결과
+job 3개(per_query_limit=3, target_count=5). job1 응답 2개(A,B / B,C - B는
+job1 내부 local dup)로 local dedup 후 A,B,C 3건. job2(B,C,D)는 전역 dedup으로
+D만 신규 추가(누적 A,B,C,D). job3(E,F,G)에서 전부 신규 추가되어 누적 7건 →
+target=5 도달로 trim. **stop_reason=target_reached, final_count=5,
+executed_query_count=3, skipped_query_count=0**, 저장된 업체 순서가
+정확히 결정적으로 `업체A,업체B,업체C,업체D,업체E` - PASS.
+
+## 목표 미달 결과
+job 3개 전부 실행(target_count=10), 전역 dedup 후 최종 고유 업체 4개
+(A,B,C,D - job2의 A는 job1과 전역 중복이라 제외). **stop_reason=
+queue_exhausted, final_count=4**, `_network_stop_message`가 "미달" +
+"4개를 저장했습니다"를 포함한 안내 문구를 실제로 생성 - PASS.
+
+## CAPTCHA 결과
+job1 정상 3건(X,Y,Z), job2는 candidate 응답 없이 CAPTCHA locator만
+visible+면적>0으로 준비(실제 `_probe_captcha_state`/`classify_captcha_signal`
+이 active로 판정), job3용 FakePage는 아예 준비하지 않아 실행되면 IndexError로
+즉시 드러나도록 방어했다. **stop_reason=security_blocked, final_count=3,
+executed_query_count=2, skipped_query_count=1**, job1의 3건이 그대로
+보존·저장되고 `app._security_block_decision`이 `_note_security_block`(실제
+메서드)을 통해 정상 연결됨을 확인했다. 재시도/session 재시작은 코드
+경로 자체에 존재하지 않으므로(NetworkBrowserCollector에 그런 로직 없음)
+구조적으로 발생하지 않는다 - PASS.
+
+## HTTP 429 결과
+job1 정상 2건(M,N), job2는 candidate 아닌 응답에 status=429만 포함(실제
+response handler가 URL 후보 여부와 무관하게 status만 먼저 검사), job3용
+FakePage 미준비로 실행 시 즉시 드러나도록 방어. **stop_reason=status_429,
+final_count=2, executed_query_count=2, skipped_query_count=1**, 이전
+결과 2건이 exporter 정확히 1회로 저장됨 - PASS.
+
+## 0건 처리
+job 2개 모두 candidate 응답은 있으나 `result.place.list=[]`. **final_count=0,
+exported=False, export_error=False, export_path=""**, 실제 임시 디렉터리에
+xlsx 파일이 전혀 생성되지 않음, 상태 문구 "저장할 결과가 없습니다." - PASS.
+
+## local/global dedup
+local dedup: job1 내부에서 동일 응답 세트에 B가 두 번 등장해도 1건으로
+수렴(실제 `dedup_rows` local pass). global dedup: job2/job3에서 이전
+job과 겹치는 업체(B,C 또는 A)가 `run_collection_plan`의 공유 `seen` set을
+통해 정확히 걸러짐(목표 도달 시나리오에서 D만 신규 추가, 목표 미달
+시나리오에서 job2의 A 제외). 둘 다 실제 함수(`dedup_rows`,
+`run_collection_plan`)로 검증됨 - PASS.
+
+## Excel 결과
+목표 도달 시나리오에서 실제 `export_places_to_excel`이 만든 `.xlsx`를
+`openpyxl`로 직접 열어 확인: `통합_결과` 헤더가 `exporter.MERGED_COLUMNS`
+11개와 정확히 일치, 데이터 행 5개, `원본_모바일`/`원본_PC`는 `max_row==1`
+(헤더만). 전부 `tempfile.TemporaryDirectory()` 안에서만 생성되고 테스트
+종료 시 자동 삭제됨 - PASS.
+
+## browser/page/session teardown
+목표 도달 시나리오 기준: `FakeBrowserSessionLike.exit_count==1`(context
+manager 정상 종료), 초기 page(`session.page`, `_close_initial_page_if_present`
+대상)의 `close_call_count==1`, `context.new_page_call_count==3`(job 수와
+일치), 생성된 쿼리별 page 3개 전부 `close_call_count==1`. CAPTCHA/429
+시나리오도 동일 원칙(실행된 job 수만큼만 page 생성·close, 세션은 정상
+종료) - PASS.
+
+## UI 정상·예외 복구
+정상 경로(시나리오 4~9)는 `_run_network_pipeline`을 인스턴스 메서드로 직접
+호출해 매 시나리오 결과 dict/Excel/상태 문구를 검증했다. 예외 경로
+(시나리오 10)는 `NetworkBrowserCollector.__enter__`가 `session_factory()`를
+try/except 없이 그대로 호출한다는 실제 코드 특성을 활용해, `session_factory`
+가 `RuntimeError`를 던지도록 구성 - 이 예외가 `with collector_factory(...)
+as collector:` 블록을 그대로 통과해 `_run_network_pipeline_worker`(실제
+메서드, monkeypatch 없음)의 `except Exception`에서 잡힘을 확인했다.
+`self.after`를 즉시 실행되도록 fake 처리하고 `set_running`/
+`_set_left_panel_state`도 실제 메서드 그대로 둔 상태에서, 최종적으로
+`app.btn_start.configure_calls[-1] == {"state": "normal"}`까지 실제로
+전파됨을 확인했다 - "저장했습니다"/"저장 완료" 문구는 어디에도 없고
+"수집 중 오류가 발생했습니다."만 표시됨, 불완전한 xlsx 파일도 생성되지
+않음 - PASS.
+
+## 테스트 fixture 문제 vs production 결함(발견했지만 production 코드는 수정하지 않음)
+시나리오 10을 처음 구현했을 때 `set_running(False)` → `_set_left_panel_state`
+→ `hasattr(self, "new_open_checkbox")` 호출에서 `RecursionError`가
+발생했다. 원인은 `__new__`로 만든 헤드리스 fake app이 `tkinter.Widget`의
+정상 초기화(`self.tk` 등)를 거치지 않아, 존재하지 않는 위젯 속성을
+`hasattr()`로 조회할 때 `Widget.__getattr__`가 `self.tk`로 위임을
+시도하다 무한 재귀에 빠지는 것이었다. **이것은 production 결함이
+아니다** - 실제 앱에서는 `_build_ui()`가 항상 먼저 완료된 뒤에만
+`set_running`이 호출되므로 `new_open_checkbox`는 이미 실제 위젯으로
+존재하고, `hasattr()`는 재귀 없이 즉시 True를 반환한다. 재현 조건은
+"헤드리스 fixture가 실제 위젯 존재를 흉내내지 못함"뿐이므로, 수정은
+production 코드(`src/ui.py`)가 아니라 테스트 fixture
+(`_make_app_with_real_ui_recovery`에 `app.new_open_checkbox = FakeWidget()`
+추가)에서 했다. 요청서 §10 "production 로직은 결함이 발견된 경우에만
+최소 수정"의 판단 기준에 따라, 이 사례는 fixture 문제로 분류하고
+production 코드는 무수정으로 유지했다.
+
+## 검색 URL 계약 검토
+`src/pc/network_browser_collector._SEARCH_URL_TEMPLATE =
+"https://map.naver.com/v5/search/{query}"` + `quote(job["query"])` 조합을
+`scratchpad/arch300_network_probe/poc1_probe.py`~`poc9_food_subvertical_probe.py`
+9개 PoC 스크립트 전부의 `search_url = f"https://map.naver.com/v5/search/
+{quote(...)}"` 패턴과 grep으로 직접 대조 - **완전히 일치**(PoC-7에서
+live 17개 쿼리 연속 성공, CAPTCHA/429 없음으로 실측 검증된 패턴과 동일).
+no-live 문자열 계약 6개 전부 확인: (1) `job["query"]`가 URL에 정확히
+포함됨, (2) 한글/공백/특수문자(&, /)가 안전하게 인코딩되고 unquote
+round-trip이 원본과 일치, (3) source_city/source_district 등 내부 메타가
+URL에 중복 반영되지 않음(오직 `job["query"]`만 사용), (4) 위 PoC 패턴과
+정확히 일치, (5) URL 하나당 쿼리 하나만 표현되고 서로 섞이지 않음, (6)
+`network_browser_collector.py` 소스에 `requests`/`httpx`/
+`urllib.request`/`http.client` import가 전혀 없고 `page.goto()`로만
+이동함을 `inspect.getsource()`로 확인. **현재 구현과 성공 PoC 기록 사이에
+충돌이나 차이는 발견되지 않았다** - production 코드 변경 불필요. 실제
+네이버가 이 URL을 정상 처리하는지 자체는 이번 단계에서 검증하지 않았고
+(no-live 문자열 계약만), WIRE-4A의 실제 live 검증으로 남겨둔다.
+
+## 신규 테스트 결과
+`tests/test_network_product_integration_no_live.py`(신규) **11건 전부
+PASS**: 목표 도달 전체 통합 / 목표 미달 전체 통합 / CAPTCHA 안전 중단 전체
+통합 / HTTP 429 안전 중단 전체 통합 / 0건 전체 통합 / URL-job 쿼리 일치·
+PoC 패턴 일치 / URL 한글·공백·특수문자 인코딩 / URL에 source_* 메타 미중복
+/ URL 하나당 쿼리 하나 / 직접 HTTP 클라이언트 없음(page.goto만) / worker
+예외 시 실제 UI 복구(session_factory 예외 → 실제 set_running(False) →
+실제 btn_start.configure(state="normal")까지 전파).
+
+## 전체 회귀 결과
+- `python -m py_compile src/ui.py tests/test_network_product_integration_no_live.py tests/test_ui_network_start.py tests/test_ui_network_wiring.py tests/test_ui_network_export.py tests/test_ui_policy_text.py` PASS.
+- `tests/test_network_product_integration_no_live.py` 11건 전부 PASS.
+- `tests/test_ui_policy_text.py` 13건 전부 PASS(무영향).
+- `tests/test_ui_network_start.py` 12건 전부 PASS(무영향).
+- `tests/test_ui_network_wiring.py` 19건 전부 PASS(무영향).
+- `tests/test_ui_network_export.py` 7건 전부 PASS(무영향).
+- `tests/test_pc_network_pipeline.py` 12건 전부 PASS(무영향, 파일 무수정).
+- `tests/test_pc_network_browser_collector.py` 24건 전부 PASS(무영향, 파일 무수정).
+- `tests/test_pc_network_list_scraper.py` 39건 전부 PASS(무영향, 파일 무수정).
+- `tests/test_ui_query_builder.py` 9건 전부 PASS(무영향).
+- `tests/test_ui_pc_full_wiring.py` 4건 전부 PASS(무영향).
+- 총 140개 검증 항목 전부 PASS, FAIL 0.
+
+## production 코드 수정 여부
+**무수정.** `src/ui.py`/`src/pc/network_browser_collector.py`/
+`src/pc/network_pipeline.py`/`src/pc/network_list_scraper.py` 전부 이번
+단계에서 결함이 발견되지 않아 그대로 유지했다(§위 "테스트 fixture 문제
+vs production 결함" 참고 - 유일하게 발견된 이슈는 테스트 fixture의
+한계였고 production 코드와 무관했다).
+
+## live/Playwright/네이버/app.py/UI/build/EXE 실행 여부
+**전부 실행 안 함.** 모든 브라우저 계층은 FakeBrowserSessionLike/FakePage/
+FakeResponse/FakeLocator로 대체됐고, `.xlsx` 파일 IO는
+`tempfile.TemporaryDirectory()` 안에서만 발생했다(자동 삭제). 실제
+Playwright 시작, 네이버 접속, `app.py` 실행, 실제 Tk 창, build/EXE 실행은
+전혀 없었다.
+
+## 다음 단계
+WIRE-4A: 실제 Playwright + 네이버로 소규모(10개) live 검증. 이번 WIRE-3에서
+확인한 URL 계약(§검색 URL 계약 검토)이 실제로 네이버 응답을 정상적으로
+받아오는지, CAPTCHA/429 없이 동작하는지는 여전히 미검증 상태로 남아있다.
+
+---
+
+# 2026-07-15 ARCH-300C WIRE-3A 목표 도달 후 미실행 통합 검증 보강 + 합계 기록 정정(기능 변경 없음)
+
+## 배경
+WIRE-3에서 구현한 정상 목표 도달 시나리오는 job 3개(target이 job3에서 정확히
+도달)만 검증했고, "목표 도달 이후 남은 job이 실제로 실행되지 않는다"는
+계약을 별도 job으로 명시적으로 증명하지 않았다. 이번 단계는 job을 4개로
+늘려 4번째 job(목표 도달 이후)이 new_page/goto/close 어느 것도 호출되지
+않고 결과·Excel 어디에도 섞이지 않음을 직접 검증하도록 보강했다. 아울러
+WIRE-3 최초 보고의 "전체 검증 합계 140"이 단순 합산 오류였음을 발견해
+정정한다 - **기능 실패나 회귀가 아니라 보고 숫자 정정**이다.
+
+## 변경 파일
+- `tests/test_network_product_integration_no_live.py`: `check_target_reached_full_integration`
+  을 4 job 구조로 확장(job4=X,Y,Z 추가), `_counting_exporter()` 헬퍼 추가
+  (실제 `export_places_to_excel`을 그대로 위임 호출하면서 호출 횟수만
+  기록), `_run_pipeline()`에 `excel_exporter` 선택 인자 추가(기본값은 기존과
+  동일하게 실제 `export_places_to_excel`). 나머지 시나리오(목표 미달/
+  CAPTCHA/429/0건/URL 계약/worker 예외)는 무수정.
+- `PROJECT_STATE.md`: 이번 정정 기록 append.
+- production 코드는 이번에도 **전혀 수정하지 않았다**(결함 미발견).
+
+## 목표 도달 시 총 job 수
+**4개**(JOB1~JOB4). JOB1=천호동, JOB2=성내동, JOB3=길동(target=5 도달
+시점), JOB4=암사동(X,Y,Z - 목표 도달 이후이므로 절대 실행되면 안 됨).
+
+## 실행된 job 수 / 건너뛴 job 수
+**실행 3 / 건너뜀 1**(`executed_query_count == 3`, `skipped_query_count == 1`).
+`before_trim_count`(job1~3 누적 dedup 결과, 7건)도 목표(5) 이상임을 확인했다.
+
+## job4 미실행 검증 방법
+1. `FakeContext`에 page1~4를 전부 등록해뒀지만(즉 "준비는 됐지만 안 쓰임"을
+   증명하는 방식 - 없어서 어쩔 수 없이 안 쓰인 게 아님), `run_collection_plan`
+   이 job3에서 멈추면 `context.new_page()`가 3번만 호출되므로 `page4`는
+   `context._pages` 목록에서 아예 꺼내지지 않는다.
+2. `page4.goto_calls == []`(한 번도 호출된 적 없음), `page4.close_call_count
+   == 0`, `page4 not in session.context.pages_served`를 전부 직접 단언했다.
+3. `session.context.new_page_call_count == 3`(정확히 3, 4가 아님)도 함께 확인.
+
+## Excel에 job4 업체가 없는지
+`result["rows"]`에서 `{"업체X","업체Y","업체Z"}`와의 교집합이 비어있음을
+먼저 확인하고, 실제 저장된 `.xlsx`를 `openpyxl`로 열어 `통합_결과`의
+`업체명` 컬럼 전체 집합에서도 X/Y/Z가 전혀 없음을 재확인했다(이중 확인 -
+orchestrator 결과 레벨과 실제 파일 레벨 둘 다). 최종 저장 순서는 여전히
+`["업체A","업체B","업체C","업체D","업체E"]` 5건으로 결정적이다.
+
+## page/session teardown 결과
+`session.exit_count == 1`, 초기 page `close_call_count == 1`,
+`new_page_call_count == 3`, 실제 사용된 page 3개(`pages_served`)는 각각
+정확히 1회씩 close. `exporter_calls == [1]`(`_counting_exporter`로 실제
+`export_places_to_excel` 호출 횟수를 직접 계측 - 이전 보고서는 파일 존재
+여부로 간접 추정했으나 이번에 명시적 카운트로 보강했다).
+
+## 신규/보강 테스트 결과
+`tests/test_network_product_integration_no_live.py` **11건 전부 PASS**
+(파일 수/테스트 개수는 그대로 11개 - 기존 목표 도달 테스트 1개를 강화한
+것이며 신규 테스트 함수를 추가한 것은 아니다).
+
+## 전체 테스트 합계 정정
+WIRE-3 최초 보고서(2026-07-15 WIRE-3 기록)의 "총 140개 검증 항목"은 단순
+합산 오류다. 실제 합은 다음과 같다:
+
+```
+11(test_network_product_integration_no_live.py)
++ 13(test_ui_policy_text.py)
++ 12(test_ui_network_start.py)
++ 19(test_ui_network_wiring.py)
++ 7(test_ui_network_export.py)
++ 12(test_pc_network_pipeline.py)
++ 24(test_pc_network_browser_collector.py)
++ 39(test_pc_network_list_scraper.py)
++ 9(test_ui_query_builder.py)
++ 4(test_ui_pc_full_wiring.py)
+= 150
+```
+
+**정정: 기존(WIRE-3 시점) 정확한 합계는 150 PASS였다(140이 아님).** 이번
+WIRE-3A에서는 새 테스트 함수를 추가하지 않고 기존 목표 도달 테스트 1개를
+보강했을 뿐이므로, WIRE-3A 이후 최종 합계도 **150 PASS, FAIL 0**으로
+동일하다. 이는 기능 실패나 회귀가 발견된 것이 아니라 이전 보고서의 단순
+산술 오기를 바로잡는 기록이다.
+
+## production 코드 수정 여부
+**무수정.** 이번 통합 테스트 보강에서도 production 코드
+(`src/ui.py`/`src/pc/network_browser_collector.py`/`src/pc/network_pipeline.py`/
+`src/pc/network_list_scraper.py`/`src/exporter.py`)에서 결함이 발견되지
+않았다.
+
+## live/Playwright/네이버/app.py/UI/build/EXE 실행 여부
+**전부 실행 안 함.** WIRE-3와 동일하게 FakeBrowserSessionLike/FakePage/
+FakeResponse만 사용했고, `.xlsx` 파일 IO는 `tempfile.TemporaryDirectory()`
+안에서만 발생했다.
