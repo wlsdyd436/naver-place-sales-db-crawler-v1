@@ -96,19 +96,27 @@ _DEFAULT_TARGET_COUNT = "300"
 # (§start_crawl/_start_legacy_crawl/_start_network_crawl).
 _DEFAULT_COLLECTION_ENGINE = "network"
 
-def _parse_positive_int(raw: str) -> int | None:
+def _parse_positive_int(raw: str, max_value: int | None = None) -> int | None:
     """문자열을 양의 정수로 파싱한다(WIRE-2B-2: per_query_limit/target_count
     공용 입력 검증 helper, Tk 불필요).
 
     비어있음/공백/비정수/0/음수는 전부 None을 반환한다(예외를 던지지 않음 -
     호출자가 None 여부로 차단 여부를 판단하고, 필드별 로그 메시지는 호출자가
     작성한다).
+
+    max_value(LIMIT-300-A, 선택적): 주어지면 이 값을 초과하는 정수도 None을
+    반환한다. 기본값 None이면 기존과 동일하게 상한 없이 양의 정수를 전부
+    허용한다 - target_count 호출부는 max_value를 넘기지 않아 300 초과값도
+    그대로 유효하다(검색 조합당 상한에만 max_value=300을 지정해, 전체 목표
+    저장 개수에 실수로 300 상한이 전파되지 않도록 분리한다).
     """
     try:
         value = int((raw or "").strip())
     except (TypeError, ValueError):
         return None
     if value <= 0:
+        return None
+    if max_value is not None and value > max_value:
         return None
     return value
 
@@ -1307,18 +1315,18 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.log("[ui] 실패: 키워드를 입력하세요")
             return
 
-        per_query_limit = _parse_positive_int(self.limit_var.get())
+        per_query_limit = _parse_positive_int(self.limit_var.get(), max_value=300)
         if per_query_limit is None:
-            message = "검색 조합당 수집 상한은 양의 정수여야 합니다."
+            message = "검색 조합당 수집 상한은 1~300 사이의 정수로 입력해 주세요."
             self.log(f"[ui] 실패: {message}")
-            self.show_error("입력 오류", message)
+            self.show_error("검색 조합당 수집 상한 오류", message)
             return
 
         target_count = _parse_positive_int(self.target_count_var.get())
         if target_count is None:
-            message = "전체 목표 저장 개수는 양의 정수여야 합니다."
+            message = "전체 목표 저장 개수는 1 이상의 정수로 입력해 주세요."
             self.log(f"[ui] 실패: {message}")
-            self.show_error("입력 오류", message)
+            self.show_error("전체 목표 저장 개수 오류", message)
             return
 
         if not output_path:

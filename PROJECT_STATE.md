@@ -4664,3 +4664,162 @@ LIMIT-300-A
 - 1, 300 경계값 허용 여부
 - 0, 음수, 301 이상, 문자, 소수 거부 여부
 - UX-1에서는 입력 검증을 변경하지 않았음
+
+---
+
+# 2026-07-15 ARCH-300C LIMIT-300-A 검색 조합당 수집 상한 1~300 입력 계약 검증
+
+## 목표
+검색 조합당 수집 상한의 허용 범위를 정수 1~300으로 명확히 고정하고,
+전체 목표 저장 개수(양의 정수, 300 초과 허용)와 서로 다른 검증 규칙을
+갖도록 분리한다. 실제 네이버 수집은 실행하지 않는다.
+
+## 작업 전 기준 커밋
+`b592a79 개선: 수집 설정 설명과 사용자 안내 강화`(UX-1) - Git log
+최상단 일치, `git status --short` clean 확인.
+
+## 확인한 현재 입력 파싱 구조
+`src/ui.py:99` `_parse_positive_int(raw)`가 `per_query_limit`/
+`target_count` 공용 파서였다(WIRE-2B-2부터). 호출부는 `_start_network_crawl`
+(`src/ui.py:1310`, `1317`) 단 2곳뿐이었고, legacy 실행 경로는 이 함수를
+쓰지 않는다. 기존에는 두 값 다 "0 이하/비정수"만 거부하고 상한 검증
+자체가 없어, 전체 목표 저장 개수는 이미 301 이상을 허용하고 있었지만
+검색 조합당 상한도 마찬가지로 300 초과가 그대로 통과되는 상태였다
+(예: "999"도 허용됨) - 이번 단계로 처음 상한이 생긴 것이다.
+
+## 검색 조합당 상한과 전체 목표가 기존에 어떻게 검증됐는지
+둘 다 동일한 `_parse_positive_int(raw)` 호출 → `None`이면
+`"...은 양의 정수여야 합니다."` 형태의 동일한 톤의 오류만 반환. 필드
+구분은 메시지 문구로만 됐고(제목도 공통 "입력 오류"), 최대값 개념
+자체가 없었다.
+
+## 변경 파일
+- `src/ui.py`: `_parse_positive_int`에 선택적 `max_value` 인자 추가
+  (기본값 None, 하위 호환). `_start_network_crawl`의 `per_query_limit`
+  호출에만 `max_value=300` 지정, `target_count` 호출은 그대로 유지.
+  오류 메시지 2건을 필드별로 구체화(§오류 메시지 참고).
+- `tests/test_ui_network_start.py`: 기존
+  `check_invalid_per_query_limit_blocks_execution`/
+  `check_invalid_target_count_blocks_execution`에 거부값 확장 +
+  필드별 오류 로그 검증 추가, 신규 3건 추가
+  (`check_per_query_limit_boundary_values_allowed`,
+  `check_target_count_allows_values_above_300`,
+  `check_per_query_limit_and_target_count_validated_independently`).
+  기존 입력 검증 테스트 파일이 이미 적합해 새 테스트 파일은 만들지
+  않았다.
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## 선택한 최소 구현 방식
+work order §5 방식 A(공용 파서에 선택적 `max_value` 인자 추가)를
+선택했다. 호출부가 단 2곳뿐이라 방식 B(호출부에서 별도 300 초과 검사
+추가)보다 오히려 A가 더 단순했고, `target_count` 호출부는 인자를
+전달하지 않아 300 상한이 실수로 전파될 위험이 없다. 기존
+`ui._parse_positive_int(raw)` 단일 인자 호출(테스트 포함)은
+`max_value=None` 기본값으로 완전히 하위 호환된다.
+
+## 검색 조합당 최종 허용 범위
+```
+1 <= per_query_limit <= 300 (정수만)
+```
+`target_count`는 여전히 `target_count >= 1`만 요구하며 상한 없음.
+
+## 검색 조합당 허용값 테스트 결과
+1/30/299/300 전부 허용 → Network worker thread 정상 생성, 전달된
+`per_query_limit` 값도 정확히 일치(`check_per_query_limit_boundary_values_allowed`
+PASS).
+
+## 검색 조합당 거부값 테스트 결과
+0/-5/abc/301/999/-300/빈 문자열/공백만/1.0/30.5/30개/+/- 총 13종 전부
+차단, thread 생성 0회, "검색 조합당 수집 상한" 오류 로그 확인
+(`check_invalid_per_query_limit_blocks_execution` PASS).
+
+## 전체 목표 301·500·1000 허용 결과
+1/300/301/500/1000 전부 허용되어 thread 정상 생성, 전달된 `target_count`
+값도 정확히 일치 - 300 초과값이 차단되지 않음을 확인
+(`check_target_count_allows_values_above_300` PASS). 무효값(0/-5/abc/3.5/
+빈 문자열)은 그대로 차단(`check_invalid_target_count_blocks_execution` PASS).
+
+## 두 입력의 분리 계약 결과
+`check_per_query_limit_and_target_count_validated_independently` PASS:
+- limit=300/target=1000 → 둘 다 유효, thread 생성.
+- limit=301/target=1000 → 검색 조합당 상한 오류만 발생(전체 목표 오류
+  로그는 섞이지 않음).
+- limit=30/target=0 → 전체 목표 저장 개수 오류만 발생(검색 조합당 상한
+  오류 로그는 섞이지 않음).
+
+## 오류 메시지
+```
+검색 조합당 수집 상한 오류: 검색 조합당 수집 상한은 1~300 사이의 정수로 입력해 주세요.
+전체 목표 저장 개수 오류: 전체 목표 저장 개수는 1 이상의 정수로 입력해 주세요.
+```
+`messagebox.showerror`의 제목(title)도 공통 "입력 오류"에서 필드별
+제목("검색 조합당 수집 상한 오류"/"전체 목표 저장 개수 오류")으로
+분리했다.
+
+## 잘못된 입력 시 worker·수집 미실행 확인
+전체 무효값 테스트(총 18개 케이스: per_query_limit 13종 + target_count
+5종)에서 `instances`(fake Thread 생성 목록)와 `running_calls`
+(`set_running` 호출 목록)가 전부 비어있음을 매 케이스마다 확인했다.
+Network worker thread 자체가 생성되지 않으므로 그 안에서만 호출되는
+`BrowserSession`/`NetworkBrowserCollector`/`run_collection_plan`/
+`export_places_to_excel` 등 실제 수집·저장 함수는 애초에 호출될 여지가
+없다 - 다만 이번 테스트 구조는 thread 미생성 여부까지만 직접
+검증하며, BrowserSession/exporter 호출 자체를 별도로 재확인하지는
+않았다(기존 `check_invalid_*` 테스트와 동일한 검증 수준, 이 한계를
+그대로 보고한다).
+
+## 기본값 30/300 유지 확인
+`_DEFAULT_PER_QUERY_LIMIT == "30"`, `_DEFAULT_TARGET_COUNT == "300"`
+무변경(`check_default_constants` PASS, 정상 start_crawl 테스트에서도
+기본값으로 thread가 생성됨을 재확인).
+
+## 새로오픈 disabled 유지 확인
+`check_new_open_filter_disabled_and_normalized` PASS - `state="disabled"`,
+`new_open_checkbox` 식별자, UX-1에서 개선한 안내 문구 전부 그대로.
+
+## 기능·수집·Excel 계약 무변경 확인
+검색 조합 생성 로직(`build_collection_queries`), 지역·업종 선택 로직,
+`target_reached` 조기 종료, local/global dedup, `NetworkBrowserCollector`,
+`run_collection_plan`, 적응형 settle, Excel 11개 열, 새로오픈여부 빈칸
+정책, CAPTCHA·429·navigation 정책 전부 무수정 - 이번 단계는 `src/ui.py`의
+`_parse_positive_int` 시그니처 확장과 `_start_network_crawl`의 호출부
+2줄 + 오류 메시지 4줄만 변경했다. `per_query_limit=300`을 실제 수집
+함수로 실행하지도 않았다(전부 fake thread 기반 no-live 테스트).
+
+## 테스트 파일별 PASS/FAIL(전부 `.\.venv\Scripts\python.exe`로 실행)
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_ui_network_start.py | 15 | 0 | PASS |
+| tests/test_ui_network_wiring.py | 19 | 0 | PASS |
+| tests/test_ui_query_builder.py | 9 | 0 | PASS |
+| tests/test_ui_policy_text.py | 25 | 0 | PASS |
+| tests/test_ui_pc_full_wiring.py | 4 | 0 | PASS |
+
+## 전체 PASS 합계
+**72건 전부 PASS, FAIL 0**(test_ui_network_start.py는 기존 12 + 신규 3 = 15).
+
+## 실제 네이버·Playwright 실행 여부
+**전부 실행 안 함.**
+
+## production 수집 코드 수정 여부
+**수정하지 않았다.** `src/pc/*`, `src/exporter.py`, `app.py` 전부
+무수정. `src/ui.py`도 입력 파싱/검증 로직 외에는 건드리지 않았다.
+
+## Git 상태(작업 종료 시점)
+작업 시작 전 이미 UX-1(`b592a79`)이 커밋되어 있었다. 이번 LIMIT-300-A
+단계에서:
+```
+git status --short
+ M PROJECT_STATE.md
+ M src/ui.py
+ M tests/test_ui_network_start.py
+```
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 다음 단계
+LIMIT-300-B
+- 검색 조합 1개, per_query_limit=300, target_count=300
+- 실제 live 정확히 1회, 재시도 0회
+- 현재 production 경로에서 실제 몇 건까지 수집되는지 측정
+- 300건 보장 테스트가 아니라 현재 목록 수집 범위 확인(LIMIT-300-A는
+  입력 계약만 검증했고 실제 수집 능력은 검증하지 않았음)

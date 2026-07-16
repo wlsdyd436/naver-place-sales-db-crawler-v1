@@ -253,7 +253,11 @@ def check_normal_start_crawl_selects_network_worker(reporter: ValidationReporter
 
 
 def check_invalid_per_query_limit_blocks_execution(reporter: ValidationReporter) -> None:
-    for invalid_value in ("0", "-5", "abc"):
+    # LIMIT-300-A: 기존 0/-5/abc에 더해 301 이상(경계 위반)·999·공백/빈
+    # 문자열·소수·숫자+문자 혼합·부호만 있는 값까지 전부 검색 조합당 상한
+    # 오류로 차단돼야 한다(전체 목표 저장 개수와는 별개 계약).
+    invalid_values = ("0", "-5", "abc", "301", "999", "-300", "", "   ", "1.0", "30.5", "30개", "+", "-")
+    for invalid_value in invalid_values:
         app, logs, statuses, running_calls = _make_app()
         app.limit_var = FakeVar(invalid_value)
         fake_threading, instances = _make_fake_threading()
@@ -265,8 +269,31 @@ def check_invalid_per_query_limit_blocks_execution(reporter: ValidationReporter)
         if instances or running_calls:
             reporter.fail(f"per_query_limit={invalid_value!r}: 실행이 차단되지 않음(instances={len(instances)}, running_calls={running_calls})")
             return
+        if not any("검색 조합당 수집 상한" in message for message in logs):
+            reporter.fail(f"per_query_limit={invalid_value!r}: 검색 조합당 상한 관련 오류 로그가 없음(logs={logs})")
+            return
 
-    reporter.pass_("per_query_limit 오류(0/-5/abc) 각각 실행 차단, thread 생성 0회")
+    reporter.pass_(f"per_query_limit 오류({len(invalid_values)}종: 0/-5/abc/301/999/-300/빈 문자열/공백/소수/숫자+문자/부호만) 각각 실행 차단, thread 생성 0회, 필드별 오류 로그 확인")
+
+
+def check_per_query_limit_boundary_values_allowed(reporter: ValidationReporter) -> None:
+    """LIMIT-300-A: 검색 조합당 상한의 경계값 1/30/299/300은 모두 허용되어
+    Network worker thread가 정상 생성돼야 한다(300을 넘지 않으므로 차단
+    이유가 없음)."""
+    for boundary_value in ("1", "30", "299", "300"):
+        app, logs, statuses, running_calls = _make_app()
+        app.limit_var = FakeVar(boundary_value)
+        fake_threading, instances = _make_fake_threading()
+
+        with _Saved(["threading"]) as saved:
+            saved.set("threading", fake_threading)
+            app.start_crawl()
+
+        if not instances or instances[0].args[1] != int(boundary_value):
+            reporter.fail(f"per_query_limit={boundary_value!r}: 허용돼야 하지만 thread 미생성 또는 값 불일치(instances={instances})")
+            return
+
+    reporter.pass_("per_query_limit 경계값(1/30/299/300) 전부 허용되어 thread 정상 생성됨")
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +302,8 @@ def check_invalid_per_query_limit_blocks_execution(reporter: ValidationReporter)
 
 
 def check_invalid_target_count_blocks_execution(reporter: ValidationReporter) -> None:
-    for invalid_value in ("0", "-5", "abc"):
+    invalid_values = ("0", "-5", "abc", "3.5", "")
+    for invalid_value in invalid_values:
         app, logs, statuses, running_calls = _make_app()
         app.target_count_var = FakeVar(invalid_value)
         fake_threading, instances = _make_fake_threading()
@@ -287,8 +315,87 @@ def check_invalid_target_count_blocks_execution(reporter: ValidationReporter) ->
         if instances or running_calls:
             reporter.fail(f"target_count={invalid_value!r}: 실행이 차단되지 않음(instances={len(instances)}, running_calls={running_calls})")
             return
+        if not any("전체 목표 저장 개수" in message for message in logs):
+            reporter.fail(f"target_count={invalid_value!r}: 전체 목표 저장 개수 관련 오류 로그가 없음(logs={logs})")
+            return
 
-    reporter.pass_("target_count 오류(0/-5/abc) 각각 실행 차단, thread 생성 0회")
+    reporter.pass_(f"target_count 오류({len(invalid_values)}종: 0/-5/abc/3.5/빈 문자열) 각각 실행 차단, thread 생성 0회, 필드별 오류 로그 확인")
+
+
+def check_target_count_allows_values_above_300(reporter: ValidationReporter) -> None:
+    """LIMIT-300-A: 전체 목표 저장 개수는 검색 조합당 상한과 별개로 300
+    초과값(301/500/1000)도 그대로 허용해야 한다(target_count에는 max_value를
+    전달하지 않으므로 상한 검증 자체가 없음)."""
+    for allowed_value in ("1", "300", "301", "500", "1000"):
+        app, logs, statuses, running_calls = _make_app()
+        app.target_count_var = FakeVar(allowed_value)
+        fake_threading, instances = _make_fake_threading()
+
+        with _Saved(["threading"]) as saved:
+            saved.set("threading", fake_threading)
+            app.start_crawl()
+
+        if not instances or instances[0].args[2] != int(allowed_value):
+            reporter.fail(f"target_count={allowed_value!r}: 허용돼야 하지만 thread 미생성 또는 값 불일치(instances={instances})")
+            return
+
+    reporter.pass_("target_count(1/300/301/500/1000) 전부 허용되어 thread 정상 생성됨(300 초과도 차단되지 않음)")
+
+
+# ---------------------------------------------------------------------------
+# 5A. 검색 조합당 상한 / 전체 목표 저장 개수 분리 검증 계약
+# ---------------------------------------------------------------------------
+
+
+def check_per_query_limit_and_target_count_validated_independently(reporter: ValidationReporter) -> None:
+    """LIMIT-300-A §4 분리 계약: (1) limit=300/target=1000은 둘 다 유효,
+    (2) limit=301/target=1000은 검색 조합당 상한 오류만 발생(전체 목표는
+    검증 전에 이미 차단), (3) limit=30/target=0은 전체 목표 저장 개수
+    오류만 발생(검색 조합당 상한은 통과)."""
+
+    # (1) 유효 조합: limit=300, target=1000 → 둘 다 통과, thread 생성.
+    app, logs, statuses, running_calls = _make_app()
+    app.limit_var = FakeVar("300")
+    app.target_count_var = FakeVar("1000")
+    fake_threading, instances = _make_fake_threading()
+    with _Saved(["threading"]) as saved:
+        saved.set("threading", fake_threading)
+        app.start_crawl()
+    if not instances or instances[0].args[1] != 300 or instances[0].args[2] != 1000:
+        reporter.fail(f"limit=300/target=1000: 유효해야 하지만 실패(instances={instances})")
+        return
+
+    # (2) limit=301(무효) / target=1000(유효라도 도달 전 차단) → 검색 조합당 상한 오류.
+    app, logs, statuses, running_calls = _make_app()
+    app.limit_var = FakeVar("301")
+    app.target_count_var = FakeVar("1000")
+    fake_threading, instances = _make_fake_threading()
+    with _Saved(["threading"]) as saved:
+        saved.set("threading", fake_threading)
+        app.start_crawl()
+    if instances or not any("검색 조합당 수집 상한" in message for message in logs):
+        reporter.fail(f"limit=301/target=1000: 검색 조합당 상한 오류가 나와야 하는데 결과가 다름(instances={len(instances)}, logs={logs})")
+        return
+    if any("전체 목표 저장 개수" in message for message in logs):
+        reporter.fail(f"limit=301/target=1000: 전체 목표 저장 개수 오류가 섞여 나오면 안 됨(logs={logs})")
+        return
+
+    # (3) limit=30(유효) / target=0(무효) → 전체 목표 저장 개수 오류.
+    app, logs, statuses, running_calls = _make_app()
+    app.limit_var = FakeVar("30")
+    app.target_count_var = FakeVar("0")
+    fake_threading, instances = _make_fake_threading()
+    with _Saved(["threading"]) as saved:
+        saved.set("threading", fake_threading)
+        app.start_crawl()
+    if instances or not any("전체 목표 저장 개수" in message for message in logs):
+        reporter.fail(f"limit=30/target=0: 전체 목표 저장 개수 오류가 나와야 하는데 결과가 다름(instances={len(instances)}, logs={logs})")
+        return
+    if any("검색 조합당 수집 상한" in message for message in logs):
+        reporter.fail(f"limit=30/target=0: 검색 조합당 상한 오류가 섞여 나오면 안 됨(logs={logs})")
+        return
+
+    reporter.pass_("분리 계약 확인: limit=300/target=1000 유효, limit=301은 조합당 상한 오류만, target=0은 전체 목표 오류만 발생")
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +585,10 @@ def main() -> int:
     check_target_count_entry_enabled_and_restored_normal(reporter)
     check_normal_start_crawl_selects_network_worker(reporter)
     check_invalid_per_query_limit_blocks_execution(reporter)
+    check_per_query_limit_boundary_values_allowed(reporter)
     check_invalid_target_count_blocks_execution(reporter)
+    check_target_count_allows_values_above_300(reporter)
+    check_per_query_limit_and_target_count_validated_independently(reporter)
     check_empty_query_queue_blocks_execution(reporter)
     check_stop_event_cleared_before_run(reporter)
     check_running_state_applied_before_thread_start(reporter)
