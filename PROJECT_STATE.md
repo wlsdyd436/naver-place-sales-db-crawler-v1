@@ -4823,3 +4823,172 @@ LIMIT-300-B
 - 현재 production 경로에서 실제 몇 건까지 수집되는지 측정
 - 300건 보장 테스트가 아니라 현재 목록 수집 범위 확인(LIMIT-300-A는
   입력 계약만 검증했고 실제 수집 능력은 검증하지 않았음)
+
+---
+
+# 2026-07-16 ARCH-300C LIMIT-300-B 검색 조합 1개 상한 300 실제 수집 범위 실측
+
+## 목표
+검색 조합당 상한 300이 UI/입력 계약상 허용되는 것(LIMIT-300-A)과 별개로,
+현재 Network/List production 경로가 검색어 하나에서 스크롤·페이지네이션
+추가 없이 실제 몇 건까지 확보하는지 정확히 1회 측정한다.
+
+## 작업 전 기준 커밋
+`19faee1 검증: 검색 조합당 수집 상한 1~300 계약 확정`(LIMIT-300-A) -
+Git log 최상단 일치, `git status --short` clean 확인.
+
+## Python executable
+`C:\code\naver-place-sales-db-crawler-v1\.venv\Scripts\python.exe`(3.14.3).
+
+## 고정 검색어·실행 조건
+```
+query = 서울특별시 강동구 카페
+source_city = 서울특별시, source_district = 강동구, source_subregion = 강동구
+source_layer = district(기존 harness에 legal_dong/landmark/vertical 전례는
+  있었지만 구 단위 단일 쿼리 전례가 없어, work order 권장값을 그대로
+  채택 - production은 source_layer를 enum 검증 없이 row 메타로만
+  pass-through하므로 새 값 사용에 제약 없음을 코드로 확인)
+per_query_limit = 300
+target_count = 300
+settle_ms = 5000(production 기본값과 동일)
+quiet_period_ms = 750, poll_interval_ms = 100(변경 없음)
+retry_count = 0, scroll_count = 0, pagination_count = 0
+```
+
+## 사전 회귀(전부 `.\.venv\Scripts\python.exe`로 실행)
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_ui_network_start.py | 15 | 0 | PASS |
+| tests/test_pc_network_browser_collector.py | 24 | 0 | PASS |
+| tests/test_pc_network_adaptive_settle.py | 15 | 0 | PASS |
+| tests/test_network_product_integration_no_live.py | 11 | 0 | PASS |
+| tests/test_pc_network_pipeline.py | 12 | 0 | PASS |
+
+**전체 77 PASS, FAIL 0**, 전부 exit code 0.
+
+## harness
+`scratchpad/arch300_network_probe/limit300b_single_query_live.py`
+(PERF-1C harness의 실행 마커/설정 검증/exporter counting wrapper/export
+전 중복 검증/Excel 검증 구조를 재사용해 신규 작성, 기존 perf1b/perf1c
+harness는 무수정). `--check-config` 모드로 query_count=1, per_query_limit=300,
+target_count=300, retry/scroll/pagination=0, production import 5개
+모듈 전부 성공, 마커 미생성을 확인(PASS, exit 0).
+
+## 실행 마커
+`scratchpad/arch300_network_probe/results/limit300b/LIMIT300B_LIVE_STARTED.marker` -
+BrowserSession 시작 전 `open(path, "x")`로 원자적 생성 확인, 삭제하지 않음.
+
+## live 실행 횟수 / 재시도·스크롤·페이지네이션
+**정확히 1회.** retry_count=0, scroll_count=0, pagination_count=0 전부
+확인(추가 스크롤/페이지 열기/재검색 없음).
+
+## 쿼리 진단(단일 쿼리)
+```
+recorded_per_query_limit = 300(collect_query에 실제 전달된 값 확인)
+query_wall_seconds = 3.08
+candidate_response_count = 1
+raw_item_count = 20
+local_unique_count = 20
+returned_row_count = 20
+parse_error_count = 0
+adaptive_settle_wait_ms = 1700
+adaptive_settle_early_exit = True
+timeout = False, navigation_error = False
+active_captcha_detected = False, status_429_seen = False
+```
+
+## 오케스트레이터 결과
+```
+executed_query_count = 1, skipped_query_count = 0
+before_trim_count = 20
+final_count = 20
+stop_reason = queue_exhausted
+security_blocked = False
+```
+
+## export 전 내부 중복 검증
+```
+rows_count = 20 (= final_count)
+place_id_present_count = 20, missing = 0, duplicate_count = 0
+place_url_present_count = 20, duplicate_count = 0
+```
+
+## exporter_call_count
+`1`.
+
+## Excel 검증
+헤더 11개 = MERGED_COLUMNS 완전 일치, data_row_count=20=final_count,
+내부 필드(place_id/source_*) 미노출, 플레이스 URL 중복 0, 새로오픈여부
+전부 빈칸(20건, 정책 유지).
+
+## 시간 측정
+```
+session_ready_seconds = 1.120
+orchestrator_seconds = 3.085
+session_teardown_seconds = 0.258
+export_seconds = 0.033
+total_wall_seconds = 4.505
+```
+
+## available_ratio_percent / per_query_limit_unused
+```
+available_ratio_percent = 6.67%(20/300)
+per_query_limit_unused = 280
+```
+
+## 최종 판정
+```
+실행 계약 PASS: True
+- live 1회, retry/scroll/pagination=0, total_job_count=1,
+  executed_query_count=1, recorded_per_query_limit=300,
+  navigation_error=False, CAPTCHA=False, 429=False
+- final_count>=1 추가 조건: exported=True, exporter_call_count=1,
+  Excel data_row_count=final_count, place_id/URL 중복 0,
+  내부 필드 누출 없음 - 전부 충족
+
+실제 단일 조합 300건 수집 지원: 미확인(final_count=20 < 300)
+```
+
+## 결과의 정확한 해석
+이번 1회 실행에서 **현재 production 경로가 검색어 하나("서울특별시
+강동구 카페")에서 확보한 개수는 20건**이었다(`candidate_response_count=1`,
+즉 네트워크 응답이 1건만 도착했고 그 안에 20개 항목이 있었던 것으로
+보임). `per_query_limit=300`은 정확히 전달됐고 UI/파서 계약(LIMIT-300-A)
+자체는 정상 작동했다 - 다만 이 상한은 "수집 결과에 적용되는 최대 허용값"
+일 뿐 "실제로 300개를 만들어내는" 기능이 아니므로, 20건이라는 결과는
+LIMIT-300-B 실행 자체의 실패가 아니다. `stop_reason=queue_exhausted`는
+큐(검색 조합 1개)가 소진되어 정상 종료됐다는 뜻이며, "네이버에 업체가
+20개뿐이다" 또는 "강동구 카페는 20개뿐"이라고 단정하지 않는다 - 현재
+목록 화면 응답 구조상 추가 스크롤/페이지네이션 없이는 이번 코드가 첫
+응답 1건(20개)만 확보한다는 관찰일 뿐이다.
+
+## PAGE-300-PoC 필요 여부
+final_count(20) < 300이므로 work order §16 기준 **PAGE-300-PoC 후보**에
+해당한다(현재 목록의 추가 결과 구조 조사, 스크롤·페이지네이션·추가
+response 가능성 검증 - 구현 전 브라우저/Network 실측 우선). 단, 실제
+다음 우선순위는 사용자 검토 후 결정 사항이며 이번 단계에서 임의로
+시작하지 않는다.
+
+## production·tests 수정 여부
+**둘 다 수정하지 않았다.** `src/*`, `tests/*` 전부 무수정 - harness
+(`scratchpad/`)만 신규 작성했다. live 실행 중 production 결함도
+발견되지 않았다.
+
+## Git 상태(작업 종료 시점)
+작업 시작 전 이미 LIMIT-300-A(`19faee1`)가 커밋되어 있었다. 이번
+LIMIT-300-B 단계에서:
+```
+git status --short
+ M PROJECT_STATE.md
+```
+`scratchpad/`는 `.gitignore`에 등록되어 있어 harness
+(`limit300b_single_query_live.py`)와 결과 JSON/Excel/마커 파일 전부
+`git status`에 나타나지 않는다.
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## 다음 단계
+사용자 검토 후 다음 중 우선순위 결정:
+- PAGE-300-PoC: 현재 목록의 추가 결과 구조 조사, 스크롤·페이지네이션·
+  추가 response 가능성 검증(구현 전 브라우저/Network 실측 우선)
+- 또는 다른 우선순위(예: NEWOPEN-1 새로오픈 신호 탐색 PoC)
+이번 단계에서는 어느 쪽도 임의로 시작하지 않는다.
