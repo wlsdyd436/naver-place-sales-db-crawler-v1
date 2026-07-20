@@ -5788,3 +5788,129 @@ candidate_response_count`, CAPTCHA·429·timeout·navigation_error 없음,
 page 2 DOM 전환 확인 및 `pagination_unverified_candidate_count==0`.
 하나라도 어긋나면 조건부 PASS가 아니라 즉시 HOLD로 판정한다. 과거 PAGE
 기록은 수정하거나 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-2C body snapshot 적용 후 실제 40건 재검증
+
+## 기준/실행 정보
+- 기준 커밋: `b37d5ad8e0e92977be6b881c4dbb088099ba3dfa`(기능: Network 응답 body
+  snapshot과 lifecycle 안전성 구현) - 작업 전/후 동일, 변경 없음
+- 검색어: "서울특별시 강동구 카페", query_count=1
+- 실행 마커: `scratchpad/arch300_page300_probe/results/page300_2b2c/
+  PAGE300_2B2C_LIVE_STARTED.marker`(harness 시작 직전 `open(..., "x")`로 원자 생성,
+  삭제하지 않음)
+- live 실행 횟수: 정확히 1회(20260720_162022), retry_count=0, 재실행 없음
+- 허용 페이지: [1, 2] - page 3 이상 접근 없음(`pagination_page_count=2`)
+- production `_MAX_PAGINATION_PAGES` 원래 값 5 → live override 2 → 실행 후
+  복구 값 5(`production_max_pages_after_restore=5`, 복구 성공)
+
+## harness/사전 검증
+- harness: `scratchpad/arch300_page300_probe/page300_2b2c_live_40.py`(신규,
+  page300_2b2_live_40.py의 마커/설정검증/exporter counting wrapper/Excel 검증
+  구조를 재사용하되 그 harness는 수정하지 않음. collector/parser/body snapshot
+  로직은 harness에서 재구현하지 않고 production 함수만 호출)
+- 컴파일: `py_compile` PASS
+- `--check-config`: PASS(네이버 접속 없음, 실행 마커 미생성 확인)
+- 사전 회귀(7개 파일, work order §9 목록 그대로): 전부 PASS, 합계 144건
+  (`test_pc_network_pagination.py` 35 / `test_pc_network_browser_collector.py`
+  34 / `test_pc_network_adaptive_settle.py` 18 /
+  `test_network_product_integration_no_live.py` 11 /
+  `test_pc_network_pipeline.py` 12 / `test_ui_network_start.py` 15 /
+  `test_ui_network_wiring.py` 19) - 직전 PAGE-300-2B-2B 기록(144건)과 동일,
+  회귀 없음
+- parser 회귀: `test_pc_network_list_scraper.py` 42 PASS(GraphQL top-level list
+  계약 포함, 직전 기록과 동일)
+
+## live 결과(candidate/raw/unique/final)
+- CAPTCHA·HTTP 429·timeout·navigation_error: 전부 발생 안 함(False)
+- candidate_response_count=2, pagination_raw_item_count=20,
+  pagination_unique_item_count=20, final_count=20, stop_reason=queue_exhausted
+- pagination_page_count=2, pagination_click_count=1,
+  pagination_stop_reason=`max_page_count_reached`(per_query_limit_reached 아님 -
+  page 2가 신규 unique 0건을 반환해 override(2페이지) 상한에 그대로 도달)
+- per_page_diagnostics:
+  - page 1: candidate=1, raw_item_count=20, new_unique_count=20,
+    duplicate_count=0, adaptive_wait_ms=1700
+  - page 2: candidate=1, raw_item_count=0, new_unique_count=0,
+    duplicate_count=0, adaptive_wait_ms=5000(hard cap 전체 대기 - 조기 종료
+    안 됨, valid confirmed 없었기 때문)
+- pagination_unverified_candidate_count=0, pagination_drain_item_count=0(§4/§6
+  DOM identity 불일치·drain 관련 문제 없음 - page 2 DOM 전환 자체는 정상 확인됨)
+
+## body snapshot 진단(이번 검증의 핵심)
+- body_snapshot_success_count=2(page 1·page 2 candidate 모두 requestfinished
+  시점 body snapshot 자체는 성공 - PAGE-300-2B-2A의 "response.json() 지연 접근
+  실패" 문제는 재현되지 않음)
+- body_snapshot_error_count=0, body_snapshot_total_bytes=78973bytes(원문은
+  결과 JSON/로그에 저장하지 않음)
+- **json_decode_error_count=1** - body snapshot은 성공했지만 그 bytes 중 1건
+  (page 2 candidate)이 `json.loads()` 단계에서 디코드 실패
+- parse_error_count=1(json_decode_error_count와 동일 candidate - 실제 harvest
+  루프에서도 동일하게 error로 집계됨, 이중 집계나 누락 없음)
+- graphql_page2_analysis: page2_diagnostics_present=true,
+  page2_raw_item_count=0, page2_item_extraction_success=false - **parser
+  (`_extract_list_items`/`_find_item_lists`)가 item을 못 찾은 것이 아니라, JSON
+  디코드 자체가 실패해 parser 호출 이전 단계에서 이미 실패**했다(§15 "정상
+  JSON인데 item 추출 0"인 HOLD 케이스가 아니라 §12 "JSON decode 실패" FAIL
+  케이스에 해당)
+- 알려진 한계(이번 harness가 새로 추가한 진단이 아님, production의 기존 계약):
+  `body_snapshot_error_type`/`body_snapshot_error_message`는 candidate가
+  requestfinished/requestfailed 단계에서 실패했을 때만 채워지며, snapshot
+  자체는 성공했지만 이후 `json.loads()`가 실패한 경우의 구체적 예외
+  타입/메시지는 현재 production 반환 계약에 노출되지 않는다(`_ensure_parsed`
+  내부에서만 소비되고 버려짐) - 이번 harness는 원본 body를 별도로 다시
+  파싱하지 않았으므로(작업 지시 §6/§15 금지 사항) 정확한 decode 실패 원인
+  (인코딩/압축/빈 응답 등)은 이번 결과만으로는 확정할 수 없다.
+
+## page 1·2 ID 교차 검증
+- page1_unique_id_count=20, page2_unique_id_count=0(추출된 item 자체가 0건),
+  page_intersection_count=0, total_unique_id_count=20
+- pre_export_dedup_check: place_id 20건 전부 존재, 중복 0건, 플레이스 URL
+  중복 0건
+
+## Excel 검증
+- exporter_call_count=1(정확히 1회)
+- 헤더: 업체명/업종/새로오픈여부/리뷰수/주소/대표전화/플레이스 URL/수집일/
+  홈페이지/인스타/블로그(11개, MERGED_COLUMNS와 완전 일치)
+- data_row_count=20(final_count와 일치), 새로오픈여부 전부 빈칸, 내부 필드
+  (place_id/source_city/source_district/source_subregion/source_layer/
+  source_query) 미노출, 플레이스 URL 중복 0건
+
+## 성능
+session_ready_seconds=0.80, orchestrator_seconds=10.79,
+session_teardown_seconds=0.25, export_seconds=0.05, total_wall_seconds=11.91
+
+## 최종 판정: **FAIL**
+work order §12 기준 "page 2 response가 candidate로 등록되고 body snapshot도
+성공했으나 JSON decode 실패 → FAIL"에 정확히 해당한다
+(`json_decode_error_count=1 > 0`). fail_conditions 중
+`json_decode_error_present=true`만 True이고 나머지(page3 접근/body snapshot
+자체 실패/exporter 중복/override 미복구/2차 live 등)는 전부 False - 이번
+FAIL의 유일한 원인은 JSON decode 실패다. PAGE-300-2B-2B에서 목표로 했던
+"response body lifecycle 문제 해결"은 확인됐으나(snapshot 성공률
+2/2=100%), 그 다음 단계(디코드 가능한 유효 JSON인지)에서 새로운 문제가
+실측으로 드러났다.
+
+## production·tests 무수정 확인
+`git status --short`/`git diff --name-status`/`git diff --stat`/
+`git diff --check` 전부 출력 없음(변경 없음) - `scratchpad/`는
+`.gitignore`(13행)에 의해 전체 무시되므로 신규 harness/결과 JSON/Excel/마커도
+tracked 변경으로 나타나지 않는다. 이 PROJECT_STATE.md append만이 유일한
+tracked 변경이다. `src/*`, `tests/*`, `app.py`, `src/ui.py`, `src/exporter.py`,
+`src/pc/network_pipeline.py`, `src/pc/browser_session.py` 전부 무수정.
+
+## 결과 파일(Git 미포함)
+- `scratchpad/arch300_page300_probe/results/page300_2b2c/
+  PAGE300_2B2C_LIVE_STARTED.marker`
+- `scratchpad/arch300_page300_probe/results/page300_2b2c/
+  page300_2b2c_live_40_result_20260720_162022.json`
+- `scratchpad/arch300_page300_probe/results/page300_2b2c/
+  page300_2b2c_live_40_20260720_162022.xlsx`
+
+## 다음 단계
+FAIL - production 수정 전 재-live 금지(work order §19 FAIL 분기 그대로).
+production을 수정하지 않고 원인부터 좁혀야 한다: page 2 candidate의
+body_snapshot bytes가 왜 `json.loads()`에서 실패하는지(BOM 이외의 인코딩,
+gzip/brotli 등 압축 해제 여부, 빈 응답, truncated body 등 가능성) 확인하는
+no-live 정밀 진단이 먼저 필요하다 - 구체적인 디코드 실패 타입/메시지를
+production 반환 계약에 임시로(진단 전용, capture_artifacts 유사 패턴) 노출하는
+별도 진단 단계를 검토해야 한다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
