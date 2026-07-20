@@ -4992,3 +4992,509 @@ git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
   추가 response 가능성 검증(구현 전 브라우저/Network 실측 우선)
 - 또는 다른 우선순위(예: NEWOPEN-1 새로오픈 신호 탐색 PoC)
 이번 단계에서는 어느 쪽도 임의로 시작하지 않는다.
+
+# 2026-07-16 LIMIT-300-B 제품 판정 정정
+
+기존 기록의 “실행 계약 PASS”는 harness와 안전 실행 절차가 정상이라는
+하위 판정일 뿐, 제품 요구사항 달성을 의미하지 않는다.
+
+최종 제품 판정:
+
+LIMIT-300-B FAIL
+
+근거:
+
+- 요구사항: 단일 검색 조합에서 실제 최대 300개 업체 수집
+- 실제 final_count: 20
+- per_query_limit=300 전달만 성공
+- 추가 스크롤·페이지네이션·추가 response 수집 미구현
+- 따라서 현재 제품은 검색 조합당 300건 실제 수집을 지원하지 못함
+
+---
+
+# PAGE-300-PoC
+
+- 목표: 단일 검색 조합 추가 결과·스크롤·페이지네이션 구조 실측
+- 기준 커밋: 2ad0f30 검증: 단일 검색 조합 300건 수집 미달 확인
+- 검색어: 서울특별시 강동구 카페
+- 브라우저 세션 수: 1 (Subagent & Python Probe)
+- 스크롤 횟수: 스크롤 20회(목록 무반응), 페이지네이션 클릭 1회(새 응답 로드)
+- CAPTCHA·429 여부: 초기 페이지 이동에서는 미발생
+
+초기 목록:
+- response 수: 1
+- item 수: 20
+- 고유 업체 수: 20
+
+추가 목록:
+- response 수: 1 (page 2 클릭 기준)
+- response별 item 수: 20
+- 누적 고유 업체 수: 40
+- 중복 수: 0
+- page·offset·cursor 구조: DOM 페이지네이션 버튼 클릭 시 `graphql` 요청 파라미터가 페이지에 맞게 변경됨
+
+DOM 구조:
+- `searchIframe` 내부에 존재
+스크롤 컨테이너:
+- `#_pcmap_list_scroll_container` (그러나 무한 스크롤 미지원, 하단 페이지네이션 구조)
+목록 종료 조건:
+- 하단 다음 버튼(`>`)의 `aria-disabled="true"` 상태
+기존 production matcher 호환성:
+- 기존 matcher(`is_candidate_response`) 및 JSON 파서와 100% 호환됨
+20개에서 종료된 원인:
+- 현재 코드는 첫 응답 수신 후 적응형 settle이 끝나면 즉시 반환하며, 페이지네이션 클릭 순회 로직이 구현되어 있지 않기 때문
+
+성능·안전 추정:
+- 페이지 당 1~2초 소요, 300개 수집 시 약 30~45초 소요. 연속 다수 페이지 접근 시 CAPTCHA/429 차단 위험이 큼.
+A/B/C/D 판정:
+- PAGE-300-PoC B등급
+추천 구현 경로:
+- DOM의 페이지네이션 버튼 순차 클릭 및 Network 대기 타이밍 결합 로직 구현, CAPTCHA 대응 부분 저장 연동
+production·tests 무수정: 확인됨
+Git 상태: Clean
+다음 단계: PAGE-300-2B 구현 설계 또는 기타 검토
+
+# 2026-07-16 PAGE-300-PoC-B2 페이지네이션 구현 계약 보충 실측
+
+- 기존 실측 범위는 page 1과 page 2이며 누적 약 40개까지 확인했다.
+- 페이지네이션 추가 로딩 구조는 확인했지만 실제 300개 도달은 검증하지 않았다.
+- 실측한 page 2 response가 기존 matcher/parser와 호환 가능한 구조인지 확인했으며, page 3 이후 결과는 이번 보충 실측 범위에 따라 별도로 기록한다.
+- 300개에는 데이터가 충분하다는 전제 아래 초기 1페이지와 추가 최대 14페이지가 필요하다.
+- 정확한 300개 수집 시간은 아직 live 검증되지 않았다.
+- 다페이지 접근에는 CAPTCHA·429 위험이 있으나 안전 페이지 수와 발생 확률은 확정되지 않았다.
+
+- 사용 브라우저: Playwright Python Probe (Antigravity Extension 보조)
+- 검색어: 서울특별시 강동구 카페
+- 최대 접근 페이지: 3페이지
+- 페이지 클릭 수: 2회
+- CAPTCHA·429 여부: 1-3페이지 내 미발생
+- DOM selector 계약:
+  - iframe: `iframe#searchIframe`
+  - 페이지네이션 영역: `.zRM9F`
+  - 페이지 번호: `<a role="button" class="mBN2s">` 내부에 번호 텍스트 포함
+  - 현재 페이지 판별: `aria-current="page"`는 존재하지 않음. 활성화된 클래스 차이 등 간접 판별 필요.
+  - 다음 번호 묶음: `<a role="button" class="eUTV2"><span class="place_blind">다음페이지</span></a>`
+- Network request 계약:
+  - `GET https://map.naver.com/p/api/search/allSearch` (GraphQL 아님)
+  - page 변수: 쿼리스트링 활용 추정 (GraphQL payload 변수 아님 확인됨)
+- response JSON 계약:
+  - 목록 배열: `result.place.list`
+  - 고유 식별자: `id` 또는 `placeId`
+  - `totalCount`: `result.place.totalCount`
+  - `hasNext`, `nextCursor`: 존재하지 않음 (null)
+- matcher/parser 호환성: `is_candidate_response` 및 JSON 파싱 완벽 호환.
+- 종료 조건: `totalCount` 역산 기반 또는 하단 `>`(다음) 버튼의 `aria-disabled="true"` 확인.
+- 성능: 페이지 당 1-2초 내외
+- B2 최종 판정: B2-B (제한된 범위 구현 가능)
+- 추천 구현 범위: page 1~5 번호 클릭을 목표로 제한된 범위 구현 (다음 묶음 클릭은 보류)
+- production·tests 무수정: 확인됨
+- Git 상태: Clean
+- 다음 단계: PAGE-300-2B-1 (Claude Sonnet 5를 사용한 제한된 페이지네이션 no-live 구현 및 100건 단계 검증)
+
+---
+
+# 2026-07-16 PAGE-300-2B-1 page 1~5 제한 페이지네이션 no-live 구현
+
+## 목표
+검색 조합당 상한 300을 UI가 받아들이는 것(LIMIT-300-A)과 별개로, 실제
+production 경로가 첫 페이지(약 20건)를 넘어 추가로 수집할 수 있도록
+목록 하단 페이지 번호 버튼을 최대 5페이지(초기 page1 + 추가 클릭 최대
+4회, 약 100건 범위)까지 순차 클릭하는 제한된 페이지네이션을 구현하고
+Fake 객체 기반 no-live 테스트로 검증한다. 실제 네이버 live는 이번
+단계에서 실행하지 않는다.
+
+## Gemini 작업 이후 저장소 변경 감사 결과
+- `git status --short`: `M PROJECT_STATE.md` 1건만 존재(작업 시작 전).
+  `git diff -- src`, `git diff -- tests`, `git diff -- app.py`,
+  `git diff -- README.md`, `git diff -- LEGAL_NOTICE.md` 전부 출력 없음
+  (무수정 확인). `git ls-files --others --exclude-standard`도 빈 결과
+  (gitignore 밖의 예상 못한 untracked 파일 없음).
+- `scratchpad/arch300_page300_probe/`(Gemini 조사 산출물: probe 스크립트
+  4개, 리포트 2개, JSON 요약 1개)는 전부 `.gitignore` 대상이라 git
+  추적 밖이다. 내용 감사 결과 `force=True`/CAPTCHA 우회/자동 재시도/
+  `while True` 무한루프 등 위험 코드 없음(hasNext/nextCursor/graphql
+  토큰은 "이 값이 없다"는 조사 결과를 기록한 텍스트일 뿐, 실제로
+  사용하는 코드가 아님을 확인).
+- 변경 내용을 `scratchpad/arch300_page300_probe/pre_claude_gemini_changes.patch`
+  로 백업.
+
+## PROJECT_STATE.md append-only 무결성 확인
+- `git diff --check -- PROJECT_STATE.md`에서 trailing whitespace 2건
+  발견("- Network request 계약: ", "- response JSON 계약: ") - 둘 다
+  Gemini가 새로 추가한 PAGE-300-PoC-B2 섹션(파일 마지막) 내부였다.
+- Python `difflib.SequenceMatcher`로 전후 파일을 비교한 결과 opcode는
+  `insert` 1건뿐(과거 내용 삭제 0건) - 순수 append임을 확인했다.
+- trailing whitespace가 신규 append 섹션 내부에만 있음을 확인했으므로,
+  work order §2 지시에 따라 그 공백 2건만 최소 수정했다(과거 섹션은
+  전혀 건드리지 않음). 수정 후 `git diff --check` 재확인 결과 오류
+  없음, difflib 재확인 결과도 여전히 순수 insert 1건만 존재(공백
+  제거로 인한 실질적 텍스트 손실 없음).
+
+## PAGE-300-PoC-B2 판정 근거(B2-B, 확정된 것/미확정 유지한 것)
+확정: iframe `#searchIframe`, 페이지 번호 `<a role="button">` + 정확한
+숫자 텍스트, `aria-current="page"` 없음(내부 상태로 현재 페이지 추적
+필요), 응답 `result.place.list`/`result.place.totalCount`, 기존
+`is_candidate_response`/parser와 100% 호환, `hasNext`/`nextCursor`/
+GraphQL variables 전부 미확인(사용 금지).
+미확정 유지: 다음 페이지 번호 "묶음" 전환 UI, 300건 전체 실제 도달
+가능 여부(다음 단계 PAGE-300-2B-2 이후 live로 확인 필요), CAPTCHA/429
+위험이 실제 다중 페이지 클릭에서 얼마나 자주 발생하는지.
+
+## 기존 production이 20개에서 끝났던 원인
+`collect_network_query`가 첫 페이지 candidate 응답의 적응형 settle이
+끝나면 즉시 반환했고, 페이지 번호 클릭 순회 로직 자체가 코드에 전혀
+없었다(주석 "page=1만 수집한다"에 명시돼 있던 기존 설계 그대로).
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`: `_MAX_PAGINATION_PAGES=5` 상수
+  추가, `_find_search_frame`/`_find_page_button`/`_wait_for_next_page_settle`
+  헬퍼 3개 신규 추가, `collect_network_query` 본문에 제한된 페이지네이션
+  루프 추가(기존 단일 페이지 로직은 그대로 두고 이어붙임).
+- `tests/test_pc_network_pagination.py`: 신규 파일, 23개 테스트
+  (요청된 20개 + 반대 검토 지적 수정 확인용 3개 추가).
+- `PROJECT_STATE.md`: 이번 기록 append.
+
+## 페이지네이션 흐름 요약
+첫 페이지 settle·harvest(기존 로직 무수정) → local unique가
+per_query_limit보다 적고 CAPTCHA/429가 아직 없으면 → 루프 진입: (1)
+클릭 전 CAPTCHA/429 확인 → (2) searchIframe 탐색(지연 캐싱) → (3)
+`get_by_role("button", name=str(target), exact=True)`로 목표 페이지
+버튼 탐색 → (4) count==0이면 pagination_exhausted, count>1이면
+ambiguous_page_button → (5) visible/enabled 확인 → (6)
+scroll_into_view_if_needed() + click()(force 없음) → (7) 클릭+대기를
+하나의 try 블록으로 묶어 예외를 pagination_click_error로 흡수 → (8)
+클릭 직후 CAPTCHA/429 재확인(전/후 모두 확인) → (9) 신규 candidate
+대기(기존 quiet-period 재사용) 실패 시 next_page_response_timeout →
+(10) harvest+dedup 누적 → (11) per_query_limit_reached →
+max_page_count_reached → no_new_unique_rows(2연속 무수확) 순으로 종료
+조건 확인 → 최대 5페이지까지 반복 → 최종 per_query_limit cap 적용.
+
+## 최대 페이지 5 제한
+`_MAX_PAGINATION_PAGES = 5`(모듈 상수, UI/공개 API 비노출). limit=300을
+줘도 최대 5페이지(약 100건) 내에서 `max_page_count_reached`로 종료되며,
+이를 300건 지원 완료로 보고하지 않는다(테스트 4로 확인).
+
+## iframe·페이지 번호 locator
+`_find_search_frame`은 `src/pc/browser_session.py`의
+`find_search_frame`과 동일한 3단계 폴백(name → frame_locator+body wait
+→ frames 스캔)을 bare page 전용으로 재구현(browser_session.py 자체는
+무수정). `_find_page_button`은 `frame.get_by_role("button",
+name=str(target_page_number), exact=True)`만 사용 - has_text(부분
+일치)는 쓰지 않아 "2"가 "12"/"20"과 오매칭되지 않는다(테스트 15로
+`get_by_role` 호출 인자 자체를 확인).
+
+## 일반 click 방식 / force click 미사용 확인
+`scroll_into_view_if_needed()` → `click()` 순서만 사용, `force`나 다른
+인자를 전혀 넘기지 않는다. 테스트의 Fake locator `click()`은 의도적으로
+인자를 받지 않게 설계해, production이 `force=True`를 넘겼다면
+TypeError로 즉시 드러나도록 했다(테스트 16 PASS로 확인).
+
+## 신규 candidate response 판별 방식 / JSON parse 횟수 보장 / parser 재사용
+클릭 전 candidate 개수를 저장해두고, 이후 개수가 늘어난 인덱스만
+harvest 대상으로 삼는다(기존 quiet-period 폴링 로직을
+`_wait_for_next_page_settle`로 일반화해 재사용, 로직 복제 아님).
+`response.json()`은 `parsed_cache`/`_ensure_parsed`를 페이지 전체에서
+계속 공유하므로 candidate당 정확히 1회만 호출된다(테스트 13·14로 확인).
+`is_candidate_response`/`_extract_list_items`/`_map_item_to_row`/
+`dedup_rows`는 전부 무수정 재사용(page1과 동일한 함수, 새 파서 없음).
+
+## 페이지 간 dedup / 종료 조건
+모든 페이지의 row를 같은 `local_seen` set에 계속 누적하고
+(`dedup_rows` 재사용), 최종적으로 `per_query_limit`으로 한 번만 자른다.
+종료 조건 우선순위(1.per_query_limit_reached > 2.captcha_detected >
+3.status_429_seen > 4.max_page_count_reached > 5.pagination_exhausted
+> 6.ambiguous_page_button > 7.pagination_click_error >
+8.next_page_response_timeout > 9.no_new_unique_rows)를 클릭 전/후
+양쪽에서 일관되게 적용한다(아래 반대 검토 반영 참고).
+
+## CAPTCHA·429·클릭 오류·response timeout 처리
+기존 `_probe_captcha_state`/`classify_captcha_signal`을 그대로 재사용
+(새 우회 selector 없음). 클릭 전과 클릭+대기 직후 양쪽에서 확인하며,
+즉시 중단하고 재시도하지 않는다(모두 테스트로 확인 - 아래 참고).
+
+## 추가 진단 필드
+`pagination_page_count`, `pagination_click_count`,
+`pagination_stop_reason`, `pagination_error_message`,
+`pagination_candidate_response_count`, `pagination_raw_item_count`,
+`pagination_unique_item_count`, `pagination_duplicate_count`,
+`pagination_max_pages`, `per_page_diagnostics`(페이지별 배열). 기존
+필드 `candidate_response_count`/`raw_item_count`/`local_unique_count`/
+`adaptive_settle_wait_ms`는 페이지네이션이 없으면 기존과 완전히
+동일한 값이고, 있으면 전체 쿼리 누적값으로 자연스럽게 확장된다(별도
+분기 없이 같은 누산 변수를 계속 사용하기 때문).
+
+## 기존 public interface 유지 여부
+`NetworkBrowserCollector.collect_query(job, per_query_limit)`,
+`collect_network_query(page, job, per_query_limit, *, collected_at,
+settle_ms=...)` 시그니처 무변경. 기존 반환 필드 전부 유지(신규 필드는
+선택적 추가). `navigation_error` 조기 반환 경로에도 신규 필드 기본값을
+일관되게 추가했다.
+
+## 반대 검토(Codex, gpt-5.6-sol, high reasoning, read-only sandbox) 결과와 반영
+구현+no-live 테스트 완료 직후 `src/pc/network_browser_collector.py`와
+`tests/test_pc_network_pagination.py`만 읽기 전용으로 검토를 요청했다
+(코드 수정 없음, 허용 파일 2개로 한정). 지적 사항과 처리:
+1. **[수정함]** 클릭 "전"에만 CAPTCHA를 확인하고 그 결과를 캐시해
+   재사용하던 구조라, 클릭·대기 도중 나타난 CAPTCHA를 놓치고
+   `active_captcha_detected=False`로 잘못 보고할 수 있었다 → 클릭+대기
+   직후에도 다시 확인하도록 수정(테스트 21로 재현/확인).
+2. **[수정함]** `_wait_for_next_page_settle` 내부 `page.wait_for_timeout()`
+   이 예외를 던지면(예: 클릭 이후 page/context 종료) 그 예외가
+   `collect_network_query` 밖으로 그대로 전파되어 이미 수집한 부분
+   rows까지 잃을 위험이 있었다 → 클릭+대기 전체를 하나의 try 블록으로
+   묶어 모든 예외를 `pagination_click_error`로 안전하게 흡수하도록
+   수정(테스트 22로 재현/확인).
+3. **[수정함]** 마지막(5번째) 페이지에서 신규 unique 2연속 0건이
+   되면 `no_new_unique_rows`가 `max_page_count_reached`보다 먼저
+   보고되는 우선순위 위반이 있었다 → harvest 직후 검사 순서를
+   per_query_limit → max_page → no_new_unique 순으로 재정렬(테스트
+   23으로 재현/확인).
+4. **[알려진 한계로 문서화, 미수정]** candidate_response_count가 "어느
+   페이지에서 온 응답인지" 태깅하지 않는 단순 누적 카운터라, 이론상
+   이전 페이지의 늦은 응답이 다음 페이지 응답으로 오인될 가능성이
+   있다는 지적 - 이는 PERF-1A부터 있던 quiet-period 조기 종료 설계
+   자체의 기존 트레이드오프가 다중 페이지로 확장된 것이며, 실제 응답에
+   page/cursor 식별자가 없다는 PAGE-300-PoC-B2 실측 결론상 근본 해결이
+   불가능하다 - docstring에 명시했다.
+5. **[의도적 유지, 미수정]** `_find_search_frame`이 browser_session.py의
+   `find_search_frame`과 동일하게 frame_locator로 찾은 객체를 버리고
+   다시 `page.frame(name=...)`을 호출해, iframe에 `name` 속성이 없으면
+   탐색에 실패할 수 있다는 지적 - work order가 명시적으로 요구한 "동일한
+   폴백 순서 재구현"이며 browser_session.py는 이번 단계 수정 금지
+   범위이므로 임의로 다르게 구현하지 않았다. docstring에 한계로 명시.
+6. **[문서화]** `pagination_click_count`는 "성공적으로 다음 페이지를
+   확보한 횟수"를 의미하며 실제 DOM click() 호출 횟수와 다를 수 있다는
+   지적 - docstring에 의미를 명확히 했다(기능 변경 없음).
+검토 결과 확인된 정상 사항: 일반 경로 최대 페이지 계산 정확, 두 공개
+함수 시그니처 유지, 누적 dedup·최종 cap 정상, force/JS click/URL 직접
+조작/GraphQL/hasNext/nextCursor 의존 전부 소스에 없음, 기존 frame API
+없는 FakePage 호환성 코드 추적상 성립, 300건 지원을 확정 주장하는
+코드·테스트 없음.
+
+## 신규 테스트 23개(요청 20개 + 반대 검토 반영 3개)
+1~20은 work order §18 그대로: limit=20/30/100/300 각 시나리오, page2
+중복 누적, 목표 버튼 없음, 버튼 2개 이상(ambiguous), 일반 click 오류,
+response timeout, CAPTCHA/429(클릭 전), 2연속 무수확, response.json()
+미호출/정확히 1회, exact 매칭 확인, force 미사용, URL/GraphQL/hasNext·
+nextCursor 미의존(정적 소스 검사 2건 포함), 기존 단일 페이지 계약 유지.
+21~23(반대 검토 반영): 클릭 직후 CAPTCHA 감지, wait 중 예외 안전망,
+5페이지+2연속 무수확 시 우선순위(max_page_count_reached) 확인.
+
+## 컴파일과 단독 실행
+`.\.venv\Scripts\python.exe -m py_compile src\pc\network_browser_collector.py
+tests\test_pc_network_pagination.py` exit 0. 단독 실행 **23/23 PASS**
+(반대 검토 반영 수정 전 1차 실행은 20/20 PASS, 수정 후 3개 추가해
+재실행 23/23 PASS).
+
+## 기존 관련 회귀 파일별 PASS/FAIL(전부 `.\.venv\Scripts\python.exe`로 실행)
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_pc_network_pagination.py | 23 | 0 | PASS |
+| tests/test_pc_network_browser_collector.py | 24 | 0 | PASS |
+| tests/test_pc_network_adaptive_settle.py | 15 | 0 | PASS |
+| tests/test_network_product_integration_no_live.py | 11 | 0 | PASS |
+| tests/test_pc_network_pipeline.py | 12 | 0 | PASS |
+| tests/test_ui_network_start.py | 15 | 0 | PASS |
+| tests/test_ui_network_wiring.py | 19 | 0 | PASS |
+
+**전체 PASS 합계: 119건, FAIL 0.** 모든 파일 exit code 0. 기존 24개
+collector 테스트·15개 adaptive settle 테스트가 수정 전/후 모두 100%
+그대로 통과해, per_query_limit이 첫 페이지 결과보다 큰 기존
+테스트들이 실제로 pagination 진입을 "시도"하더라도(frame API 없는
+FakePage/FakeAdaptivePage에서) 예외 없이 `pagination_exhausted`로
+안전하게 종료되어 기존 반환값이 전혀 달라지지 않음을 실증했다.
+
+## src/ui.py 무수정 확인
+`git diff -- src`에 `src/ui.py` 관련 변경 없음(무수정).
+
+## Excel·새로오픈·입력 정책 무변경 확인
+`_DEFAULT_COLLECTION_ENGINE`/`_DEFAULT_PER_QUERY_LIMIT`/
+`_DEFAULT_TARGET_COUNT`, 검색 조합당 1~300 입력 범위(LIMIT-300-A),
+전체 목표 저장 정책, Excel 11개 열, 새로오픈 체크박스 disabled,
+CAPTCHA·429 우회 금지, 재시도 0회 전부 무변경(페이지네이션은
+`NetworkBrowserCollector` 내부 동작으로만 추가됨).
+
+## 실제 네이버·Playwright live 미실행 확인
+확인됨 - app.py 실행, 실제 BrowserSession/Playwright 생성, 네이버
+접속, 페이지 번호 실제 클릭, Excel 생성 전부 하지 않았다. Fake 객체
+기반 테스트만 수행했다.
+
+## Git 상태(작업 종료 시점)
+```
+git status --short
+ M PROJECT_STATE.md
+ M src/pc/network_browser_collector.py
+?? tests/test_pc_network_pagination.py
+```
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+`scratchpad/`(Gemini 조사 파일 포함) 61개 항목은 전부 gitignore 대상.
+
+## 다음 단계
+PAGE-300-2B-2
+- 동일 검색어: 서울특별시 강동구 카페
+- per_query_limit=40, target_count=40
+- page 1→2만 허용(page 3 클릭 금지)
+- 실제 live 정확히 1회, 재시도 0회
+- CAPTCHA·429 안전 중단 확인
+- 실제 final_count=40 여부, pagination 진단 필드, Excel 정합성 검증
+
+# 2026-07-16 PAGE-300-2B-1 response 귀속 안전성 보완
+
+## 배경 - 커밋 전 독립 검토에서 발견된 미완료 결함
+직전(2026-07-16) PAGE-300-2B-1 구현은 아직 미커밋 상태에서 다음 4개
+결함이 남아있었다:
+1. 이전 페이지에서 늦게 도착한 candidate response를 다음 페이지 response로
+   잘못 인정할 수 있음.
+2. 최초 harvest와 다음 페이지 클릭 기준점 사이에 도착한 response가 어느
+   페이지에서도 처리되지 않고 누락될 수 있음.
+3. 페이지 버튼 클릭은 성공했지만 response timeout이면 pagination_click_count가
+   실제보다 적게 기록됨.
+4. 다음 페이지 response의 페이지 정체를 확인하지 않고 단순 candidate 개수
+   증가만으로 성공 판정함.
+
+## 저장된 probe 자료 재분석 - 페이지 식별 근거
+`page300_network_summary.json`/`page300_poc_report.md`/`page300_poc_b2_report.md`
+재확인 결과: page 2/3에 대한 실제 request/response는 probe에서 단 한 건도
+캡처되지 않았고(`responses` 배열은 page 1 1건뿐), `page_variable`/
+`display_variable`/`start_variable`도 전부 null이었다 - **request URL/response
+JSON으로 목표 page를 식별하는 것은 불가능**하다는 점을 재확인했다(A 배제).
+다만 page 1 DOM 캡처(`page300_network_summary.json`의 `dom_info[0]`)에서
+활성 페이지 버튼("1")만 다른 버튼과 다른 class(`mBN2s qxokY`)를 가진다는
+구조적 근거는 실측 데이터로 확인됐다 - **B: DOM 상태(클릭 전/후 class diff,
+리터럴 문자열 고정 아님) + 신규 response 결합**으로 판정하기로 했다. 클릭 후
+실제 전환 시 이 마커가 이동하는지는 probe가 `aria-current`만 조회해(이미
+B2 리포트에서 미존재로 확인된 값) 검증하지 못했으므로, 이 부분은 판정
+불가 시 `page_transition_unverified`/`next_page_identity_unverified`로
+안전 폴백하도록 구현했다(Gemini+Antigravity 보충 실측 없이 code-only로
+진행 - 근거 부족이 아니라 "확인 가능하면 사용, 불가능하면 안전 중단"
+경로가 이미 요청서 §5/§6에 설계돼 있어 C(검증 불가로 전면 보류)가 아닌
+B로 판정).
+
+## 수정한 response 큐·sequence·processed 계약
+- `_QueryObservationContext`에 `seen_response_ids`(object identity, `id()`)를
+  추가해 handler 레벨에서 동일 response 객체의 중복 등록·중복 JSON parse를
+  차단(§3).
+- `_ensure_parsed(index)` 메모이즈는 기존과 동일하게 유지하되, harvest 범위를
+  `harvested_up_to_index` 포인터로 관리해 각 candidate가 정확히 한 번만
+  disjoint 범위에서 처리되도록 함(page1 harvest → drain → page2 harvest →
+  drain → page3 harvest ... 서로 겹치지 않음).
+
+## pending response drain 방식(§4)
+목표 페이지 버튼을 찾아 클릭 준비가 끝난 직후, `_apply_pending_drain()`
+(내부적으로 `_drain_pending_responses()` 호출)로 미처리 candidate를
+"현재까지 확정된 페이지의 지연 도착분"으로 먼저 harvest하고
+`candidate_count_before_click` 기준점을 그 이후로 확정한다. 이어서 DOM
+`class_before`를 읽는 순간에도(실제 Playwright에서는 이 호출이 이벤트
+루프에 제어권을 넘길 수 있음) 새 candidate가 도착했을 수 있어, 한 번 더
+동일한 드레인을 수행해 클릭 직전까지 확실히 흡수한다(gpt-5.6-sol 1차
+재검토에서 지적된 좁은 손실 구간 - 수정 반영).
+
+## 지연된 이전 페이지 response 처리
+드레인으로 흡수된 candidate는 새 page로 카운트되지 않고 기존 local dedup
+집합에 병합되며, pagination_page_count/pagination_click_count에 영향을
+주지 않는다.
+
+## 목표 페이지 response 판별 방법(§5/§6)
+`candidate_response_count` 증가만으로 성공 판정하지 않는다. 클릭한 버튼
+locator의 `class` 속성을 클릭 전/후로 비교해(`_safe_get_attribute`, 리터럴
+클래스명 미사용) 실제로 달라졌는지만 확인한다. class를 읽을 수 없으면
+`pagination_stop_reason="next_page_identity_unverified"`, 읽었지만 변화가
+없으면(response와 DOM 불일치) `"page_transition_unverified"`로 안전
+중단하고 그 응답의 데이터는 rows에 포함하지 않는다 - 두 경우 모두
+`pagination_page_count`를 증가시키지 않는다. 진단 필드
+`pagination_unverified_candidate_count`/`pagination_drain_item_count`를
+신규로 추가했다.
+
+## DOM 보조 검증 방법
+클릭 전 `class_before`, 응답 확인 후 `class_after`를 같은 locator에서
+diff로만 비교한다. `page300_network_summary.json`의 page_1 DOM 캡처와
+같은 형태(`mBN2s` → `mBN2s qxokY`)를 정상 케이스로 재현했다.
+
+## processed response 중복 방지
+handler 레벨 object identity dedup(`seen_response_ids`) + `_ensure_parsed`
+인덱스 메모이즈 + harvest 범위 포인터(`harvested_up_to_index`)로 3중
+보장했다.
+
+## click count와 page count 의미(§7)
+`pagination_click_count`는 `target_locator.click()`이 예외 없이 반환된
+직후 증가(클릭 자체 성공 여부만 반영, 이후 timeout/identity 미확인과
+무관). `pagination_page_count`(`current_page_number`)는 §5/§6 기준으로
+identity가 확정된 페이지 수만 반영 - 클릭 성공만으로는 증가하지 않는다.
+
+## 부분 rows 보존
+새로 추가된 모든 안전 중단 경로(`page_transition_unverified`,
+`next_page_identity_unverified` 포함)에서 그때까지 확정된 rows만 반환하고
+미확인 candidate의 데이터는 병합하지 않는다.
+
+## 추가 테스트 사례(10개, 기존 23개 유지)
+1. `check_late_page1_response_after_click_not_accepted_as_page2`
+2. `check_gap_between_harvest_and_click_baseline_not_lost`
+3. `check_click_success_then_timeout_click_count_is_one`
+4. `check_confirmed_page2_identity_via_dom_class_diff`
+5. `check_unrelated_candidate_response_after_click_not_accepted`
+6. `check_duplicate_response_object_registered_twice_parsed_once`
+7. `check_processed_page1_candidate_not_reused_on_page2`
+8. `check_response_identity_completely_unverifiable`
+9. `check_dom_shows_transition_but_no_response_not_treated_as_success`
+10. `check_dom_transition_explicit_mismatch_preserves_partial_rows`
+
+## 신규 테스트 PASS/FAIL
+`tests\test_pc_network_pagination.py` 단독 실행 **33/33 PASS**(기존 23 +
+신규 10, FAIL 0).
+
+## 전체 관련 회귀 파일별 PASS/FAIL
+| 파일 | PASS | FAIL | 결과 |
+|---|---|---|---|
+| tests/test_pc_network_pagination.py | 33 | 0 | PASS |
+| tests/test_pc_network_browser_collector.py | 24 | 0 | PASS |
+| tests/test_pc_network_adaptive_settle.py | 15 | 0 | PASS |
+| tests/test_network_product_integration_no_live.py | 11 | 0 | PASS |
+| tests/test_pc_network_pipeline.py | 12 | 0 | PASS |
+| tests/test_ui_network_start.py | 15 | 0 | PASS |
+| tests/test_ui_network_wiring.py | 19 | 0 | PASS |
+
+**전체 PASS 합계: 129건, FAIL 0.** (이전 119건 + 신규 10건, 전부 exit code 0)
+
+## GPT-5.6-Sol(Codex MCP, read-only) 독립 재검토 결과
+1차 검토에서 HOLD 판정: "drain 종료와 click baseline 사이 응답 누락 및
+DOM 전환과 응답의 비결합 오귀속이 남아있음." 이 중 손실(누락) 결함은
+`_apply_pending_drain`을 클릭 직전(class_before 조회 이후)에 한 번 더
+호출하도록 수정해 해소했다. 2차 재검토 결과: 손실 구간은 닫혔음을 확인,
+**최종 판정 PASS - "누락 결함은 해소되었으며, 남은 응답 귀속 불확실성은
+현재 증거로 해결 불가능한 명시적 구조 한계임."**
+
+## 남은 높음·중간 위험(문서화된 구조적 한계, 코드 결함 아님)
+DOM class diff와 "새 response 도착"은 서로 인과관계로 묶여있지 않고 각각
+독립적으로 확인된다 - 클릭이 실제로 DOM을 전환시켰고 그 직후 우연히
+지연 도착한 이전 페이지 응답이 클릭 후 첫 신규 candidate가 되면, 오귀속될
+이론적 가능성이 남아있다. `_MAX_PAGINATION_PAGES`(5)와 per_query_limit이
+상한으로 작동해 폭주(runaway)는 없으나, "정확히 한 페이지만 오염된다"는
+보장은 아니다(gpt-5.6-sol 2차 재검토 지적 반영 - 최초 초안의 "오염은
+최대 1페이지" 서술을 정정함). 이를 완전히 닫으려면 실제 네이버에서
+"DOM 전환"과 "response 도착"의 순서 보장 여부를 live로 실측해야 하며,
+증거 없는 추가 휴리스틱은 페이지 번호 추측 금지 원칙에 위배되므로
+넣지 않았다.
+
+## 실제 live 미실행 확인
+확인됨 - app.py 실행, 실제 BrowserSession/Playwright 생성, 네이버 접속,
+페이지 번호 실제 클릭, Excel 생성 전부 하지 않았다. Fake 객체 기반 테스트와
+저장된 probe 재분석만 수행했다.
+
+## Git 상태(작업 종료 시점)
+```
+git status --short
+ M PROJECT_STATE.md
+ M src/pc/network_browser_collector.py
+?? tests/test_pc_network_pagination.py
+```
+git add/commit/push/reset/checkout/restore 전부 수행하지 않았다.
+
+## PAGE-300-2B-2 진입 가능 여부
+HOLD 사유(page identity 검증 불가) 없이 PASS 판정 - 문서화된 구조적
+한계(위 항목)를 인지한 상태로 PAGE-300-2B-2(실제 40건 live 1회)로 진입
+가능하다고 판단한다. 단, PAGE-300-2B-2 live 실행 중 반드시 관찰할 것:
+클릭 직후 도착하는 candidate response 개수(2개 이상이면 지연 응답
+오귀속 리스크가 실측으로 확인되는 신호), pagination_unverified_candidate_count/
+pagination_drain_item_count 값(0이 아니면 이번 세션에서 다루지 못한
+실제 경로가 발동한 것이므로 즉시 원인 분석 필요).
+과거 기록은 수정하거나 삭제하지 않았다.
