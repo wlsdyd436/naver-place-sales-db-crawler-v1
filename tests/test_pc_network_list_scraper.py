@@ -128,6 +128,62 @@ def check_extract_heuristic_graphql(reporter: ValidationReporter) -> None:
         reporter.fail(f"휴리스틱 추출 결과가 예상과 다름: {items}")
 
 
+# PAGE-300-2B-2A 실측: page 2 후보 응답의 JSON top-level이 object가 아니라
+# list(array)였다("[" 로 시작). 정확한 중첩 키 경로는 진단 보고서에 없으므로
+# (요청서 §10: 미확인 key를 임의로 만들지 않는다) 완전히 placeholder인 키
+# 이름만 사용해 "top-level list 재귀 순회" 일반 계약만 검증한다 - 실제 확인된
+# GraphQL 스키마를 추정/재현하는 fixture가 아니다.
+TOP_LEVEL_ARRAY_FIXTURE = [
+    {
+        "wrapper_unconfirmed": {
+            "nested_unconfirmed": [
+                {"id": "555555", "name": "카페 E", "category": "카페"},
+                {"id": "666666", "name": "카페 F", "category": "카페"},
+            ]
+        }
+    }
+]
+
+EMPTY_TOP_LEVEL_ARRAY_FIXTURE: list = []
+
+UNRELATED_TOP_LEVEL_ARRAY_FIXTURE = [1, 2, 3, {"foo": "bar"}, "text"]
+
+
+def check_extract_top_level_array_recurses_into_nested_list(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2B §10-1/2: JSON top-level이 list여도 내부에 중첩된
+    업체 배열을 예외 없이 찾아내야 한다(placeholder 키 - 실제 스키마 아님)."""
+    items = _extract_list_items(TOP_LEVEL_ARRAY_FIXTURE)
+    ok = (
+        len(items) == 2
+        and items[0]["id"] == "555555"
+        and items[1]["name"] == "카페 F"
+    )
+    if ok:
+        reporter.pass_("top-level list(placeholder 중첩 구조)에서도 휴리스틱 재귀로 업체 리스트 2건 추출")
+    else:
+        reporter.fail(f"top-level list 추출 결과가 예상과 다름: {items}")
+
+
+def check_extract_empty_top_level_array_is_safe(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2B §10-3: 빈 top-level list는 예외 없이 빈 목록을 반환해야
+    한다."""
+    items = _extract_list_items(EMPTY_TOP_LEVEL_ARRAY_FIXTURE)
+    if items == []:
+        reporter.pass_("빈 top-level list: 예외 없이 빈 목록 반환")
+    else:
+        reporter.fail(f"빈 top-level list 결과가 예상과 다름: {items}")
+
+
+def check_extract_unrelated_top_level_array_not_mistaken(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2B §10-4: 업체 항목처럼 보이지 않는 list(정수/문자열/무관한
+    dict 혼합)는 업체 목록으로 오인하지 않고 빈 목록을 반환해야 한다."""
+    items = _extract_list_items(UNRELATED_TOP_LEVEL_ARRAY_FIXTURE)
+    if items == []:
+        reporter.pass_("업체 항목처럼 보이지 않는 top-level list는 오인하지 않고 빈 목록 반환")
+    else:
+        reporter.fail(f"무관한 top-level list 결과가 예상과 다름: {items}")
+
+
 def check_map_item_to_row_11_columns(reporter: ValidationReporter) -> None:
     item = ALLSEARCH_FIXTURE["result"]["place"]["list"][0]
     row = _map_item_to_row(item, "2026-07-08")
@@ -669,6 +725,9 @@ def main() -> int:
 
     check_extract_known_path_allsearch(reporter)
     check_extract_heuristic_graphql(reporter)
+    check_extract_top_level_array_recurses_into_nested_list(reporter)
+    check_extract_empty_top_level_array_is_safe(reporter)
+    check_extract_unrelated_top_level_array_not_mistaken(reporter)
     check_map_item_to_row_11_columns(reporter)
     check_map_item_to_row_second_field_variant(reporter)
     check_map_item_to_row_missing_keys(reporter)

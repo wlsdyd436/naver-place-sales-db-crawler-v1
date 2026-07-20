@@ -1,6 +1,6 @@
 from pathlib import Path
-from types import SimpleNamespace
 import inspect
+import json
 import sys
 import tempfile
 import threading
@@ -85,18 +85,46 @@ class FakeLocator:
         return self._box
 
 
+class FakeRequest:
+    """PAGE-300-2B-2B: requestfinished/requestfailed 핸들러가 받는 request
+    객체를 흉내낸다(response와 양방향 참조)."""
+
+    def __init__(self, resource_type, method="GET"):
+        self.resource_type = resource_type
+        self.method = method
+        self.failure = None
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
 class FakeResponse:
-    def __init__(self, url, status, resource_type, json_data=None, json_error=None):
+    """PAGE-300-2B-2B: `.json()` 대신 `.body()`(bytes)로 candidate body를
+    노출한다."""
+
+    def __init__(self, url, status, resource_type, *, body=None, body_error=None,
+                 method="GET", simulate_request_failed=False, headers=None):
         self.url = url
         self.status = status
-        self.request = SimpleNamespace(resource_type=resource_type)
-        self._json_data = json_data
-        self._json_error = json_error
+        self.request = FakeRequest(resource_type, method=method)
+        self.request._response = self
+        self._body = body
+        self._body_error = body_error
+        self.body_call_count = 0
+        self.simulate_request_failed = simulate_request_failed
+        self.headers = headers if headers is not None else {}
 
-    def json(self):
-        if self._json_error is not None:
-            raise self._json_error
-        return self._json_data
+    def body(self):
+        self.body_call_count += 1
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
+
+    def text(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return (self._body or b"").decode("utf-8")
 
 
 class FakePage:
@@ -129,6 +157,12 @@ class FakePage:
         for response in self._responses:
             for handler in list(self._handlers.get("response", [])):
                 handler(response)
+            if getattr(response, "simulate_request_failed", False):
+                for handler in list(self._handlers.get("requestfailed", [])):
+                    handler(response.request)
+            else:
+                for handler in list(self._handlers.get("requestfinished", [])):
+                    handler(response.request)
 
     def wait_for_timeout(self, ms):
         self.wait_calls.append(ms)
@@ -145,7 +179,8 @@ CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
 
 def _place_response(item_ids_and_names, url=CANDIDATE_URL):
     items = [{"id": item_id, "name": name} for item_id, name in item_ids_and_names]
-    return FakeResponse(url, 200, "xhr", json_data={"result": {"place": {"list": items}}})
+    body = json.dumps({"result": {"place": {"list": items}}}).encode("utf-8")
+    return FakeResponse(url, 200, "xhr", body=body)
 
 
 class FakeInitialPage:

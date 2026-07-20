@@ -1,6 +1,6 @@
 from pathlib import Path
-from types import SimpleNamespace
 import inspect
+import json
 import sys
 
 
@@ -69,20 +69,47 @@ class FakeLocator:
         return self._box
 
 
+class FakeRequest:
+    """PAGE-300-2B-2B: requestfinished/requestfailed 핸들러가 받는 request
+    객체를 흉내낸다(response와 양방향 참조)."""
+
+    def __init__(self, resource_type, method="GET"):
+        self.resource_type = resource_type
+        self.method = method
+        self.failure = None
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
 class FakeResponse:
-    def __init__(self, url, status, resource_type, json_data=None, json_error=None):
+    """PAGE-300-2B-2B: `.json()` 대신 `.body()`(bytes)로 candidate body를
+    노출한다 - body_call_count로 requestfinished 시점 이후 재호출이 없는지
+    계측한다."""
+
+    def __init__(self, url, status, resource_type, *, body=None, body_error=None,
+                 method="GET", simulate_request_failed=False, headers=None):
         self.url = url
         self.status = status
-        self.request = SimpleNamespace(resource_type=resource_type)
-        self._json_data = json_data
-        self._json_error = json_error
-        self.json_call_count = 0
+        self.request = FakeRequest(resource_type, method=method)
+        self.request._response = self
+        self._body = body
+        self._body_error = body_error
+        self.body_call_count = 0
+        self.simulate_request_failed = simulate_request_failed
+        self.headers = headers if headers is not None else {}
 
-    def json(self):
-        self.json_call_count += 1
-        if self._json_error is not None:
-            raise self._json_error
-        return self._json_data
+    def body(self):
+        self.body_call_count += 1
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
+
+    def text(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return (self._body or b"").decode("utf-8")
 
 
 CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
@@ -90,7 +117,8 @@ CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
 
 def _place_response(item_ids_and_names, url=CANDIDATE_URL):
     items = [{"id": item_id, "name": name} for item_id, name in item_ids_and_names]
-    return FakeResponse(url, 200, "xhr", json_data={"result": {"place": {"list": items}}})
+    body = json.dumps({"result": {"place": {"list": items}}}).encode("utf-8")
+    return FakeResponse(url, 200, "xhr", body=body)
 
 
 def _page_items(prefix: str, count: int):
@@ -232,6 +260,14 @@ class FakePaginationPage:
             self._delivered_count += 1
             for handler in list(self._handlers.get("response", [])):
                 handler(response)
+            # 실제 Playwright의 response -> requestfinished(또는 requestfailed)
+            # 순서를 그대로 재현한다(같은 tick에서 바로 이어서 전달).
+            if getattr(response, "simulate_request_failed", False):
+                for handler in list(self._handlers.get("requestfailed", [])):
+                    handler(response.request)
+            else:
+                for handler in list(self._handlers.get("requestfinished", [])):
+                    handler(response.request)
 
     def _schedule_relative(self, delay_ms, response):
         absolute = self._elapsed_ms + delay_ms
@@ -577,11 +613,11 @@ def check_response_handler_never_calls_json(reporter: ValidationReporter) -> Non
     )
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     # handler가 직접 .json()을 호출했다면 harvest 단계와 합쳐 2회 이상이 됐을 것이다.
-    ok = p1.json_call_count == 1 and p2.json_call_count == 1 and result["pagination_click_count"] == 1
+    ok = p1.body_call_count == 1 and p2.body_call_count == 1 and result["pagination_click_count"] == 1
     if ok:
-        reporter.pass_("response callback 소스는 .json() 호출을 하지 않음(각 응답 json_call_count=1로 확인, 2페이지 시나리오)")
+        reporter.pass_("response callback 소스는 .json() 호출을 하지 않음(각 응답 body_call_count=1로 확인, 2페이지 시나리오)")
     else:
-        reporter.fail(f"json 호출 횟수가 예상과 다름: p1={p1.json_call_count}, p2={p2.json_call_count}, result={result}")
+        reporter.fail(f"json 호출 횟수가 예상과 다름: p1={p1.body_call_count}, p2={p2.body_call_count}, result={result}")
 
 
 # ---------------------------------------------------------------------------
@@ -602,15 +638,15 @@ def check_json_parsed_exactly_once_per_candidate_across_pages(reporter: Validati
     )
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     ok = (
-        p1.json_call_count == 1
-        and p2.json_call_count == 1
-        and p3.json_call_count == 1
+        p1.body_call_count == 1
+        and p2.body_call_count == 1
+        and p3.body_call_count == 1
         and result["pagination_click_count"] == 2
     )
     if ok:
         reporter.pass_("candidate response 3개(page1~3) 각각 JSON parse 정확히 1회")
     else:
-        reporter.fail(f"parse 횟수가 예상과 다름: p1={p1.json_call_count}, p2={p2.json_call_count}, p3={p3.json_call_count}")
+        reporter.fail(f"parse 횟수가 예상과 다름: p1={p1.body_call_count}, p2={p2.body_call_count}, p3={p3.body_call_count}")
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +924,7 @@ def check_gap_between_harvest_and_click_baseline_not_lost(reporter: ValidationRe
     )
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     ok = (
-        orphan_response.json_call_count == 1
+        orphan_response.body_call_count == 1
         and result["local_unique_count"] == 45
         and result["pagination_drain_item_count"] == 5
         and result["pagination_click_count"] == 1
@@ -897,7 +933,34 @@ def check_gap_between_harvest_and_click_baseline_not_lost(reporter: ValidationRe
     if ok:
         reporter.pass_("최초 harvest~클릭 기준점 사이 도착한 candidate(orphan) 누락 없이 이전 페이지 데이터로 1회 harvest(unique=45)")
     else:
-        reporter.fail(f"harvest gap 결과가 예상과 다름: {result}, orphan.json_call_count={orphan_response.json_call_count}")
+        reporter.fail(f"harvest gap 결과가 예상과 다름: {result}, orphan.body_call_count={orphan_response.body_call_count}")
+
+
+def check_drain_parse_error_counted_even_when_all_drained_items_fail(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 독립 검토 지적(PAGE-300-2B-2B) 회귀: 클릭 전 drain
+    단계(§4)에서 harvest된 candidate가 전부 파싱 실패(raw_items=[])해도
+    parse_error_count에 반영돼야 한다 - 수정 전에는 `_apply_pending_drain`이
+    `drain_result["raw_items"]`가 있을 때만 parse_error_count를 누적해,
+    drain된 candidate가 전부 실패하면 그 사실이 조용히 사라질 수 있었다."""
+    page1_items = _page_items("p1_", 20)
+    broken_orphan = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, _place_response(_page_items("p2_", 20)))]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items)), (950, broken_orphan)],
+        click_plan={"2": page2_spec},
+    )
+    result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
+    ok = (
+        result["parse_error_count"] == 1
+        and result["local_unique_count"] == 40
+        and result["pagination_click_count"] == 1
+        and result["pagination_page_count"] == 2
+    )
+    if ok:
+        reporter.pass_("drain 중 전부 파싱 실패한 candidate도 parse_error_count에 정상 반영됨(raw_items=[]이어도 누락되지 않음)")
+    else:
+        reporter.fail(f"drain parse_error_count 결과가 예상과 다름: {result}")
 
 
 def check_click_success_then_timeout_click_count_is_one(reporter: ValidationReporter) -> None:
@@ -991,14 +1054,14 @@ def check_duplicate_response_object_registered_twice_parsed_once(reporter: Valid
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     ok = (
         result["candidate_response_count"] == 1
-        and p1.json_call_count == 1
+        and p1.body_call_count == 1
         and result["raw_item_count"] == 20
         and len(result["rows"]) == 20
     )
     if ok:
-        reporter.pass_("동일 response 객체 중복 등록: object identity로 중복 제거(candidate=1, json_call_count=1, rows=20)")
+        reporter.pass_("동일 response 객체 중복 등록: object identity로 중복 제거(candidate=1, body_call_count=1, rows=20)")
     else:
-        reporter.fail(f"중복 등록 결과가 예상과 다름: {result}, json_call_count={p1.json_call_count}")
+        reporter.fail(f"중복 등록 결과가 예상과 다름: {result}, body_call_count={p1.body_call_count}")
 
 
 def check_processed_page1_candidate_not_reused_on_page2(reporter: ValidationReporter) -> None:
@@ -1016,8 +1079,8 @@ def check_processed_page1_candidate_not_reused_on_page2(reporter: ValidationRepo
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     ok = (
         result["raw_item_count"] == 40
-        and p1.json_call_count == 1
-        and p2.json_call_count == 1
+        and p1.body_call_count == 1
+        and p2.body_call_count == 1
         and result["per_page_diagnostics"][0]["raw_item_count"] == 20
         and result["per_page_diagnostics"][1]["raw_item_count"] == 20
     )
@@ -1109,6 +1172,47 @@ def check_dom_transition_explicit_mismatch_preserves_partial_rows(reporter: Vali
         reporter.fail(f"DOM 불일치 결과가 예상과 다름: {result}")
 
 
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-2B: PAGE-300-2B-2A 실제 live에서 확인된 page 2 body lifecycle
+# 실패(지연된 시점의 response.json()/body() 재호출이 "Response body is
+# unavailable"로 실패)를 페이지네이션 경로에서 직접 재현/회귀 고정한다.
+# ---------------------------------------------------------------------------
+
+
+def check_page2_late_body_access_would_fail_but_snapshot_cached(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2A 핵심 회귀(페이지네이션 경로): page2 response의 body()가
+    requestfinished 시점에는 성공하지만 이후(예: adaptive settle 도중) 재호출되면
+    "Response body is unavailable" 유사 예외를 던지도록 구성해도, harvest는
+    저장된 snapshot bytes만 재사용하므로 page2 데이터가 정상 수집돼야 한다."""
+    page2_response = _place_response(_page_items("p2_", 20))
+    original_body = page2_response.body
+    call_state = {"count": 0}
+
+    def flaky_body():
+        call_state["count"] += 1
+        if call_state["count"] > 1:
+            raise Exception("response.json: Response body is unavailable")
+        return original_body()
+
+    page2_response.body = flaky_body
+    page2_spec = {"count": 1, "visible": True, "enabled": True, "responses_after_click": [(0, page2_response)]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(_page_items("p1_", 20)))],
+        click_plan={"2": page2_spec},
+    )
+    result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
+    ok = (
+        result["pagination_page_count"] == 2
+        and len(result["rows"]) == 40
+        and call_state["count"] == 1
+        and result["parse_error_count"] == 0
+    )
+    if ok:
+        reporter.pass_("PAGE-300-2B-2A 페이지네이션 경로 회귀: page2 body가 requestfinished 시점 1회만 호출되고 harvest는 캐시된 snapshot으로 정상 처리(rows=40)")
+    else:
+        reporter.fail(f"page2 body 지연 재접근 결과가 예상과 다름: call_count={call_state['count']}, result={result}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -1138,6 +1242,7 @@ def main() -> int:
 
     check_late_page1_response_after_click_not_accepted_as_page2(reporter)
     check_gap_between_harvest_and_click_baseline_not_lost(reporter)
+    check_drain_parse_error_counted_even_when_all_drained_items_fail(reporter)
     check_click_success_then_timeout_click_count_is_one(reporter)
     check_confirmed_page2_identity_via_dom_class_diff(reporter)
     check_unrelated_candidate_response_after_click_not_accepted(reporter)
@@ -1146,6 +1251,7 @@ def main() -> int:
     check_response_identity_completely_unverifiable(reporter)
     check_dom_shows_transition_but_no_response_not_treated_as_success(reporter)
     check_dom_transition_explicit_mismatch_preserves_partial_rows(reporter)
+    check_page2_late_body_access_would_fail_but_snapshot_cached(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

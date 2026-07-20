@@ -1,5 +1,5 @@
 from pathlib import Path
-from types import SimpleNamespace
+import json
 import sys
 
 
@@ -62,18 +62,49 @@ class FakeLocator:
         return self._box
 
 
+class FakeRequest:
+    """PAGE-300-2B-2B: requestfinished/requestfailed 핸들러가 받는 request 객체를
+    흉내낸다. response와 양방향으로 참조해(response.request/request.response())
+    id(request) 기반 candidate 역참조를 재현할 수 있게 한다."""
+
+    def __init__(self, resource_type, method="GET"):
+        self.resource_type = resource_type
+        self.method = method
+        self.failure = None
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
 class FakeResponse:
-    def __init__(self, url, status, resource_type, json_data=None, json_error=None):
+    """PAGE-300-2B-2B: `.json()` 대신 `.body()`(bytes)/`.text()`(str)로 candidate
+    body를 노출한다 - production이 requestfinished 시점에만 이 메서드를
+    호출하고 harvest에서는 저장된 snapshot bytes만 쓰는지 검증하기 위해
+    `body_call_count`로 호출 횟수를 계측한다."""
+
+    def __init__(self, url, status, resource_type, *, body=None, body_error=None,
+                 method="GET", simulate_request_failed=False, headers=None):
         self.url = url
         self.status = status
-        self.request = SimpleNamespace(resource_type=resource_type)
-        self._json_data = json_data
-        self._json_error = json_error
+        self.request = FakeRequest(resource_type, method=method)
+        self.request._response = self
+        self._body = body
+        self._body_error = body_error
+        self.body_call_count = 0
+        self.simulate_request_failed = simulate_request_failed
+        self.headers = headers if headers is not None else {}
 
-    def json(self):
-        if self._json_error is not None:
-            raise self._json_error
-        return self._json_data
+    def body(self):
+        self.body_call_count += 1
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
+
+    def text(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return (self._body or b"").decode("utf-8")
 
 
 class FakePage:
@@ -104,6 +135,14 @@ class FakePage:
         for response in self._responses:
             for handler in list(self._handlers.get("response", [])):
                 handler(response)
+            # 실제 Playwright의 response -> requestfinished(또는 requestfailed)
+            # 순서를 그대로 재현한다(같은 tick에서 바로 이어서 전달).
+            if getattr(response, "simulate_request_failed", False):
+                for handler in list(self._handlers.get("requestfailed", [])):
+                    handler(response.request)
+            else:
+                for handler in list(self._handlers.get("requestfinished", [])):
+                    handler(response.request)
 
     def wait_for_timeout(self, ms):
         self.wait_calls.append(ms)
@@ -127,18 +166,22 @@ CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
 
 def _place_response(item_ids_and_names, url=CANDIDATE_URL):
     items = [{"id": item_id, "name": name} for item_id, name in item_ids_and_names]
-    return FakeResponse(url, 200, "xhr", json_data={"result": {"place": {"list": items}}})
+    body = json.dumps({"result": {"place": {"list": items}}}).encode("utf-8")
+    return FakeResponse(url, 200, "xhr", body=body)
 
 
 def check_listener_registered_once_and_removed(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2B: response/requestfinished/requestfailed 3개 리스너를
+    각각 정확히 1회 등록·해제해야 한다(합계 on=3/off=3)."""
     page = FakePage(responses=[_place_response([("p1", "업체1")])])
     collect_network_query(page, JOB, 10, collected_at="2026-07-14")
-    if page.on_call_count == 1 and page.off_call_count == 1 and len(page._handlers.get("response", [])) == 0:
-        reporter.pass_("listener 등록·해제: on 1회, off 1회, 잔여 handler 없음")
+    remaining = sum(len(page._handlers.get(evt, [])) for evt in ("response", "requestfinished", "requestfailed"))
+    if page.on_call_count == 3 and page.off_call_count == 3 and remaining == 0:
+        reporter.pass_("listener 등록·해제: response/requestfinished/requestfailed 각각 on 1회·off 1회, 잔여 handler 없음")
     else:
         reporter.fail(
             f"listener 등록·해제 결과가 예상과 다름: on={page.on_call_count}, off={page.off_call_count}, "
-            f"remaining={len(page._handlers.get('response', []))}"
+            f"remaining={remaining}"
         )
 
 
@@ -273,12 +316,15 @@ def check_zero_search_results_is_not_timeout(reporter: ValidationReporter) -> No
 
 
 def check_parse_error_does_not_crash(reporter: ValidationReporter) -> None:
-    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", json_error=ValueError("bad json"))
+    """PAGE-300-2B-2B: body snapshot 자체는 성공하지만(정상 candidate) 내용이
+    깨진 JSON이면 harvest 단계의 json.loads가 실패해 parse_error_count만
+    증가하고 나머지 후보는 계속 처리돼야 한다."""
+    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
     ok = _place_response([("p1", "업체1")])
     page = FakePage(responses=[broken, ok])
     result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
     if result["parse_error_count"] == 1 and len(result["rows"]) == 1 and result["rows"][0]["place_id"] == "p1":
-        reporter.pass_("parse error: json() 예외는 parse_error_count만 증가시키고 나머지 후보는 계속 처리됨")
+        reporter.pass_("parse error: 깨진 JSON body는 parse_error_count만 증가시키고 나머지 후보는 계속 처리됨")
     else:
         reporter.fail(f"parse error 결과가 예상과 다름: {result}")
 
@@ -297,6 +343,232 @@ def check_source_meta_preserved_on_rows(reporter: ValidationReporter) -> None:
         reporter.pass_("source_* 메타: job의 source_city/district/subregion/layer/query가 row에 유지됨")
     else:
         reporter.fail(f"source_* 메타 결과가 예상과 다름: {row}")
+
+
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-2B: candidate response body snapshot(requestfinished 시점 즉시
+# bytes 확보) 관련 신규 케이스. PAGE-300-2B-2A 실측 원인(지연된 시점의
+# response.json()/body() 재호출이 "Response body is unavailable"로 실패)을
+# 직접 재현/회귀 고정한다.
+# ---------------------------------------------------------------------------
+
+
+def check_late_body_access_would_fail_but_snapshot_cached(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2A 핵심 회귀: body()가 최초 호출(requestfinished 시점)에는
+    성공하지만 이후 재호출되면 예외를 던지도록 구성해도, harvest는 저장된
+    snapshot bytes만 재사용하므로 정상 파싱돼야 한다(body() 재호출 자체가
+    없어야 함 - call_state["count"]==1로 확인)."""
+    response = _place_response([("p1", "업체1")])
+    original_body = response.body
+    call_state = {"count": 0}
+
+    def flaky_body():
+        call_state["count"] += 1
+        if call_state["count"] > 1:
+            raise Exception("response.json: Response body is unavailable")
+        return original_body()
+
+    response.body = flaky_body
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and call_state["count"] == 1
+        and result["parse_error_count"] == 0
+    ):
+        reporter.pass_("body 지연 재접근 시뮬레이션(PAGE-300-2B-2A 재현): snapshot이 requestfinished 시점 1회만 호출되고 harvest는 캐시된 bytes로 정상 파싱됨")
+    else:
+        reporter.fail(f"body 지연 재접근 결과가 예상과 다름: call_count={call_state['count']}, result={result}")
+
+
+def check_requestfinished_snapshot_failure_records_parse_error(reporter: ValidationReporter) -> None:
+    """requestfinished 시점에 body()/text() 둘 다 실패하면 해당 candidate는
+    parse_error로 안전하게 처리되고(예외 유출 없음) 나머지 후보는 정상 처리돼야
+    한다."""
+    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body_error=Exception("Response body is unavailable"))
+    ok = _place_response([("p1", "업체1")])
+    page = FakePage(responses=[broken, ok])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and result["body_snapshot_success_count"] == 1
+        and len(result["rows"]) == 1
+    ):
+        reporter.pass_("requestfinished snapshot 실패: parse_error_count/body_snapshot_error_count=1, 나머지 candidate 정상 처리")
+    else:
+        reporter.fail(f"snapshot 실패 결과가 예상과 다름: {result}")
+
+
+def check_requestfailed_marks_candidate_failed_partial_rows_preserved(reporter: ValidationReporter) -> None:
+    """requestfailed 이벤트가 오면 해당 candidate는 body()를 아예 호출하지
+    않고 실패로 기록하며, 이미 확보한 다른 candidate의 rows는 보존돼야 한다."""
+    failed = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"unused", simulate_request_failed=True)
+    failed.request.failure = "net::ERR_ABORTED"
+    ok = _place_response([("p1", "업체1")])
+    page = FakePage(responses=[ok, failed])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and failed.body_call_count == 0
+    ):
+        reporter.pass_("requestfailed 안전 처리: body() 미호출, 실패로 기록, 정상 candidate의 rows 보존됨(재시도 없음)")
+    else:
+        reporter.fail(f"requestfailed 결과가 예상과 다름: body_call_count={failed.body_call_count}, result={result}")
+
+
+def check_requestfailed_without_prior_response_is_still_counted(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 2차 독립 검토 지적 회귀: 실제 네트워크 레벨 실패(response
+    이벤트가 한 번도 발생하지 않고 requestfailed만 발생)의 표준 경로에서도,
+    URL/resource_type 기준으로 candidate였던 request라면 실패로 집계돼야
+    한다 - 다른 candidate가 정상 성공해 per_query_limit에 도달해도 이 실패가
+    parse_error_count/body_snapshot_error_count 어디에도 반영되지 않고
+    조용히 사라지면 거짓 성공처럼 보일 위험이 있었다."""
+    never_responded_request = FakeRequest("xhr")
+    never_responded_request.url = CANDIDATE_URL
+    never_responded_request.failure = "net::ERR_CONNECTION_RESET"
+
+    class RequestFailedOnlyPage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            ok_response = _place_response([("p1", "업체1")])
+            for handler in list(self._handlers.get("response", [])):
+                handler(ok_response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(ok_response.request)
+            # response 이벤트 없이 requestfailed만 발생(실제 네트워크 실패의
+            # 표준 경로 - 이 request는 ctx.request_id_to_candidate에 등록될
+            # 기회가 전혀 없었다).
+            for handler in list(self._handlers.get("requestfailed", [])):
+                handler(never_responded_request)
+
+    page = RequestFailedOnlyPage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        result["candidate_response_count"] == 2
+        and result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and len(result["rows"]) == 1
+    ):
+        reporter.pass_("response 이벤트 없이 requestfailed만 발생한 candidate도 실패로 집계됨(정상 candidate와 공존해도 누락되지 않음)")
+    else:
+        reporter.fail(f"response 없는 requestfailed 결과가 예상과 다름: {result}")
+
+
+def check_candidate_body_too_large_is_rejected_safely(reporter: ValidationReporter) -> None:
+    """_MAX_CANDIDATE_BODY_BYTES를 초과하는 candidate body는 저장하지 않고
+    BodyTooLarge로 안전하게 실패 처리해야 한다(나머지 candidate는 영향 없음)."""
+    huge_body = b"[" + b"1" * (network_browser_collector._MAX_CANDIDATE_BODY_BYTES + 1) + b"]"
+    huge = FakeResponse(CANDIDATE_URL, 200, "xhr", body=huge_body)
+    ok = _place_response([("p1", "업체1")])
+    page = FakePage(responses=[huge, ok])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and len(result["rows"]) == 1
+    ):
+        reporter.pass_("candidate body 크기 상한 초과: BodyTooLarge로 안전 실패, 나머지 candidate 정상 처리")
+    else:
+        reporter.fail(f"body 크기 상한 결과가 예상과 다름: {result}")
+
+
+def check_content_length_header_rejects_before_body_call(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 독립 검토 지적 반영: content-length 헤더가 상한을 넘으면
+    body()/text()를 아예 호출하지 않고(전체 body를 메모리에 만들지 않고)
+    BodyTooLarge로 조기에 거절해야 한다."""
+    huge = FakeResponse(
+        CANDIDATE_URL, 200, "xhr",
+        headers={"content-length": str(network_browser_collector._MAX_CANDIDATE_BODY_BYTES + 1)},
+    )
+    ok = _place_response([("p1", "업체1")])
+    page = FakePage(responses=[huge, ok])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        result["body_snapshot_error_count"] == 1
+        and result["parse_error_count"] == 1
+        and huge.body_call_count == 0
+        and len(result["rows"]) == 1
+    ):
+        reporter.pass_("content-length 헤더 상한 초과: body() 호출 없이 조기에 BodyTooLarge로 거절됨")
+    else:
+        reporter.fail(f"content-length 조기 거절 결과가 예상과 다름: body_call_count={huge.body_call_count}, result={result}")
+
+
+def check_duplicate_requestfinished_event_snapshots_once(reporter: ValidationReporter) -> None:
+    """같은 request에 대해 requestfinished가 중복으로 발생해도(이론상 발생하지
+    않아야 하지만) body snapshot은 1회만 수행돼야 한다(idempotent)."""
+    response = _place_response([("p1", "업체1")])
+
+    class DuplicateFinishPage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            for handler in list(self._handlers.get("response", [])):
+                handler(response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)  # 중복 이벤트
+
+    page = DuplicateFinishPage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if response.body_call_count == 1 and len(result["rows"]) == 1:
+        reporter.pass_("동일 requestfinished 이벤트 2회: body snapshot 1회만 수행됨(idempotent)")
+    else:
+        reporter.fail(f"중복 requestfinished 결과가 예상과 다름: body_call_count={response.body_call_count}, result={result}")
+
+
+def check_no_raw_body_leak_in_result(reporter: ValidationReporter) -> None:
+    """반환 dict의 rows/per_page_diagnostics를 제외한 나머지 값 어디에도 raw
+    body 원문(파싱된 업체명 등)이 그대로 노출되면 안 된다 - size/타입/예외
+    유형만 진단으로 허용한다."""
+    marker = "고유업체마커XYZ"
+    response = _place_response([(marker, marker)])
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    leaked = any(
+        marker in str(value)
+        for key, value in result.items()
+        if key not in ("rows", "per_page_diagnostics")
+    )
+    if not leaked:
+        reporter.pass_("raw body 미노출: rows/per_page_diagnostics를 제외한 반환값 어디에도 원문 데이터가 없음")
+    else:
+        reporter.fail("raw body 미노출 검증 실패: rows 외 필드에서 원문 데이터가 발견됨")
+
+
+def check_unicode_json_bytes_decoded_correctly(reporter: ValidationReporter) -> None:
+    """UTF-8 한글 JSON bytes가 snapshot -> decode -> json.loads 경로에서
+    깨지지 않고 정상 처리돼야 한다."""
+    response = _place_response([("p1", "카페상호명")])
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if result["rows"] and result["rows"][0]["업체명"] == "카페상호명":
+        reporter.pass_("UTF-8 JSON bytes: 한글 업체명이 깨지지 않고 정상 decode됨")
+    else:
+        reporter.fail(f"UTF-8 decode 결과가 예상과 다름: {result.get('rows')}")
+
+
+def check_json_decode_error_diagnostic_field(reporter: ValidationReporter) -> None:
+    """body snapshot은 성공했지만 JSON decode 자체가 실패하는 경우
+    json_decode_error_count(신규 진단 필드)가 증가해야 한다(body_snapshot_error_count와
+    구분됨 - snapshot 실패와 JSON decode 실패는 서로 다른 원인이다)."""
+    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
+    page = FakePage(responses=[broken])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
+    if (
+        result["json_decode_error_count"] == 1
+        and result["body_snapshot_success_count"] == 1
+        and result["body_snapshot_error_count"] == 0
+        and result["parse_error_count"] == 1
+    ):
+        reporter.pass_("json_decode_error_count 진단 필드: snapshot 성공 + JSON decode 실패를 body_snapshot_error_count와 구분해 집계함")
+    else:
+        reporter.fail(f"json_decode_error_count 결과가 예상과 다름: {result}")
 
 
 class FakeLifecyclePage:
@@ -706,6 +978,16 @@ def main() -> int:
     check_zero_search_results_is_not_timeout(reporter)
     check_parse_error_does_not_crash(reporter)
     check_source_meta_preserved_on_rows(reporter)
+    check_late_body_access_would_fail_but_snapshot_cached(reporter)
+    check_requestfinished_snapshot_failure_records_parse_error(reporter)
+    check_requestfailed_marks_candidate_failed_partial_rows_preserved(reporter)
+    check_requestfailed_without_prior_response_is_still_counted(reporter)
+    check_candidate_body_too_large_is_rejected_safely(reporter)
+    check_content_length_header_rejects_before_body_call(reporter)
+    check_duplicate_requestfinished_event_snapshots_once(reporter)
+    check_no_raw_body_leak_in_result(reporter)
+    check_unicode_json_bytes_decoded_correctly(reporter)
+    check_json_decode_error_diagnostic_field(reporter)
     check_session_and_context_shared_across_jobs(reporter)
     check_new_page_created_per_query(reporter)
     check_each_page_closed_exactly_once(reporter)

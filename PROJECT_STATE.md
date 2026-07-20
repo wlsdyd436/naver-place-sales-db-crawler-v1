@@ -5624,3 +5624,167 @@ HOLD - PAGE-300-2B-3(page 1~5 최대 100건 live)로 임의 진입하지 않는�
 - Git 상태: Clean (작업 전 기준)
 - 추천 다음 단계: Claude Sonnet 5를 사용하여 response 수신 직후 바디를 미리 복사해두거나, 파싱 시점을 앞당기도록 
 etwork_browser_collector.py 수정 (PAGE-300-2B-3)
+
+# 2026-07-20 PAGE-300-2B-2B candidate body snapshot no-live 구현
+
+## PAGE-300-2B-2A 원인(재확인)
+page 1(allSearch, JSON object, ~78KB)은 정상 파싱되지만 page 2(graphql
+POST, JSON array, ~414KB)는 production의 `_ensure_parsed`가 adaptive
+settle 폴링 중 지연된 시점에 `response.json()`을 호출해
+`playwright._impl._errors.Error: response.json: Response body is
+unavailable`로 실패했다(response body lifecycle 문제, matcher/parser
+호환성 문제 아님).
+
+## 선택한 event 구조 / requestfinished snapshot / response callback 역할
+- `_QueryObservationContext`가 raw response 객체 리스트 대신 candidate
+  entry(dict) 리스트(`ctx.candidates`)와 `id(request) -> entry` 역참조
+  맵(`ctx.request_id_to_candidate`)을 갖도록 변경.
+- 리스너 3개로 확장:
+  - `response`(`_make_response_handler`): 상태 확인(429) + candidate 판별
+    (`is_candidate_response`) + entry 등록만. body 접근 없음(기존과 동일,
+    정적 검사로 회귀 고정).
+  - `requestfinished`(`_make_request_finished_handler`, 신규): `request.
+    response()` → `response.body()`(실패 시 `response.text().encode()`
+    fallback)로 즉시 bytes snapshot. content-length 헤더가 있고 상한을
+    넘으면 body()조차 호출하지 않고 조기 거절(2차 검토 반영). 상한
+    (`_MAX_CANDIDATE_BODY_BYTES`=2MB) 초과 시 BodyTooLarge로 안전 실패,
+    원문은 저장하지 않음. 이미 resolve된 entry는 idempotent하게 무시.
+  - `requestfailed`(`_make_request_failed_handler`, 신규): entry가 있으면
+    RequestFailed로 표시. entry가 없어도(= response를 한 번도 받지 못하고
+    실패한 표준 네트워크 실패 경로) `request.url`/`resource_type`만으로
+    candidate 여부를 재판별해(2차 독립 검토 지적 반영) candidate였다면
+    새 entry를 만들어 즉시 실패로 확정 - 정상 candidate가 per_query_limit에
+    도달해도 이 실패가 진단에서 사라지지 않게 한다.
+- 세 리스너 등록을 순회 구조로 바꿔, 등록 도중 예외가 발생하면 이미
+  등록된 리스너를 즉시 해제하고 원 예외를 재전파(1차 독립 검토 지적,
+  Low 등급, 반영).
+
+## body 크기 상한 / snapshot·decode·JSON 오류 구분
+`_MAX_CANDIDATE_BODY_BYTES = 2 * 1024 * 1024`. candidate entry는
+`body_snapshot_ready`/`body_snapshot_error_type`/`body_snapshot_error_
+message`/`body_snapshot_size`를 갖는다. harvest(`_ensure_parsed`)는
+entry의 snapshot bytes에만 `json.loads`를 적용하고 Playwright Response
+객체에는 다시 접근하지 않는다 - response는 왔지만 requestfinished/
+requestfailed가 아직 안 온 "진짜 pending" 상태는 memoize하지 않고 다음
+tick에 재확인하며, 실제 harvest 지점(`_ensure_parsed_final`, 최초 page1
+harvest/per-page harvest/`_drain_pending_responses` harvest 3곳)에서만
+pending을 최종적으로 error로 확정한다(candidate당 JSON parse 정확히
+1회 계약 유지). 신규 진단 필드 4개(`body_snapshot_success_count`/
+`body_snapshot_error_count`/`body_snapshot_total_bytes`/
+`json_decode_error_count`)를 추가했고 기존 `parse_error_count`는 하위
+호환 유지.
+
+## GraphQL top-level list parser 검증
+`src/pc/network_list_scraper.py`는 **수정하지 않았다**. `_extract_list_
+items`/`_find_item_lists`의 기존 일반 재귀가 top-level list도 이미
+안전하게 처리함을 `tests/test_pc_network_list_scraper.py`에 신규 추가한
+placeholder 키 기반 synthetic fixture(실제 미확인 GraphQL 스키마를
+추정하지 않음) 3건으로 확인했다(top-level list 재귀 순회/빈 list/무관한
+list 오인 방지).
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`(핵심 변경)
+- `tests/test_pc_network_pagination.py`, `tests/test_pc_network_adaptive_
+  settle.py`, `tests/test_pc_network_browser_collector.py`,
+  `tests/test_network_product_integration_no_live.py`(Fake `.json()` →
+  `.body()`/`.text()` + `FakeRequest` 승격, requestfinished/requestfailed
+  전달 확장 - 마지막 파일은 원래 수정 허용 목록에 명시되지 않았으나 동일한
+  이벤트 계약 변경으로 인해 기존 회귀(11 PASS) 유지에 필수적이라 판단해
+  동일한 최소 패턴으로 갱신했다),
+  `tests/test_pc_network_list_scraper.py`(GraphQL top-level list 검증
+  3건 추가)
+- `src/pc/network_list_scraper.py`: 무수정(검증 결과 불필요)
+
+## GPT-5.6-Sol(Codex MCP, read-only) 독립 검토 결과(3라운드)
+1차 검토 HOLD - Medium 3건(드레인 시 `_apply_pending_drain`이
+`if drain_result["raw_items"]:` 조건 안에서만 `parse_error_count`를
+누적해 drain된 candidate가 전부 실패하면 조용히 사라질 수 있음/
+content-length 사전 확인 없이 전체 body를 할당한 뒤 크기를 검사해
+실질적 메모리 상한이 아님/response 없이 실패한 request는
+`request_id_to_candidate`에 없어 requestfailed가 사실상 트리거되지
+않음), Low 1건(리스너 등록 도중 예외 시 이미 등록된 리스너 미해제).
+Medium 3건과 Low 1건을 모두 수정 반영(위 "선택한 event 구조" 절 참고).
+2차 재검토에서 drain 수정과 listener 정리는 PASS로 확인했으나,
+requestfailed 미해결 부분에서 "정상 candidate가 per_query_limit에
+도달해도 실패한 candidate가 진단에서 사라진다"는 거짓 성공 재현을
+추가로 제시해 HOLD 유지 - 이를 반영해 requestfailed 핸들러가 미등록
+request도 URL/resource_type으로 재판별하도록 추가 수정. 3차 재검토
+**최종 판정: PASS** - "정상 candidate가 목표를 채워도 실패 candidate가
+진단에서 사라지지 않음을 재현으로 확인, 새로운 회귀(중복 entry 생성,
+성공 entry를 실패로 덮어쓰기 등) 없음."
+
+## 남은 위험(문서화된 알려진 한계, 코드 결함 아님)
+- **드레인(200ms) 중 정말로 늦게 완료되는 body**: `_drain_pending_
+  responses`는 candidate 개수 변화만 200ms 관찰하고 body_snapshot_ready
+  자체를 기다리지 않는다 - 이 200ms 안에 requestfinished가 끝나지 않으면
+  `_ensure_parsed_final`이 그 시점에 최종적으로 error로 확정하며, 이후
+  실제로 requestfinished가 도착해도 이미 error가 있어 snapshot을 하지
+  않는다(§4). gpt-5.6-sol 3차 확인: 이 경로는 이제 항상
+  `parse_error_count`/`body_snapshot_error_count`에 반영되므로(거짓
+  성공 아님) fail-closed 동작이지만, 실제로 늦게 도착했을 body의 데이터
+  자체는 수집하지 못한다(page 2처럼 큰 body가 200ms보다 오래 걸리면
+  drain 경로에서 재현될 수 있음 - 다음 live에서 관찰 필요).
+- **content-length 사전 검사는 완전한 메모리 hard cap이 아님**: 헤더가
+  없거나, 실제보다 작게 보고되거나(과소값), 압축 응답(Content-Length가
+  전송 크기이고 body()가 압축 해제 크기)인 경우 여전히 body() 호출 시
+  전체 크기가 먼저 메모리에 올라간 뒤에야 상한 검사가 이뤄진다. 다만
+  모든 초과/불일치 경로는 명시적 오류로 귀결되므로(조용한 데이터 손실이나
+  거짓 성공 없음) 실측 body 크기(~414KB)와 상한(2MB) 격차를 고려하면
+  이번 단계의 live 진입을 막을 사유는 아니라고 gpt-5.6-sol이 확인했다.
+- **`candidate_response_count`의 의미가 미세하게 넓어짐**: response 없이
+  실패한 candidate도 이제 이 카운트에 포함되므로, "response 이벤트 수"가
+  아니라 "candidate entry 수"에 더 가깝다. 성공으로 오인되지는 않지만
+  다음 단계에서 이 필드를 해석할 때 참고해야 한다.
+
+## 신규/변경 테스트 요약
+- pagination: 34 → 35 PASS(신규: page2 body 지연 재접근 PAGE-300-2B-2A
+  재현 회귀, drain 전부 실패 시 parse_error_count 반영 회귀).
+- adaptive_settle: 15 → 18 PASS(신규: pending snapshot이 quiet period를
+  시작시키지 않음, requestfailed candidate 단독 안전 처리, body 크기
+  상한 단독 안전 처리; 기존 2건은 body_call_count 기준으로 갱신).
+- browser_collector: 24 → 34 PASS(신규 10건: PAGE-300-2B-2A 재현, snapshot
+  실패, requestfailed 안전 처리, body 크기 상한, 중복 requestfinished,
+  raw body 미노출, UTF-8 decode, json_decode_error_count 진단,
+  content-length 조기 거절, response 없는 requestfailed 집계).
+- network_product_integration_no_live: 11 → 11 PASS(Fake 인프라만 갱신,
+  신규 케이스 없음).
+- network_list_scraper(7개 회귀 파일에는 미포함, 별도 확인): 39 → 42
+  PASS(GraphQL top-level list 재귀/빈 list/무관 list 3건 추가).
+
+## 전체 관련 회귀 파일별 PASS/FAIL(최종)
+| 파일 | PASS | FAIL |
+|---|---|---|
+| tests/test_pc_network_pagination.py | 35 | 0 |
+| tests/test_pc_network_browser_collector.py | 34 | 0 |
+| tests/test_pc_network_adaptive_settle.py | 18 | 0 |
+| tests/test_network_product_integration_no_live.py | 11 | 0 |
+| tests/test_pc_network_pipeline.py | 12 | 0 |
+| tests/test_ui_network_start.py | 15 | 0 |
+| tests/test_ui_network_wiring.py | 19 | 0 |
+
+**전체 PASS 합계: 144건, FAIL 0.**(작업 전 129건 대비 신규 15건 -
+requestfailed 미관측 수정에 따른 회귀 1건 포함)
+
+## 실제 live 미실행 확인
+확인됨 - BrowserSession/Playwright 실행, 네이버 접속, 실제 40건 재검증,
+100건 검증, Excel 생성 전부 하지 않았다. Fake 객체와 synthetic JSON
+bytes만으로 검증했다.
+
+## Git 상태
+`git status --short` 기준 변경 파일은 `src/pc/network_browser_collector.py`
++ 위 5개 테스트 파일 + 이 `PROJECT_STATE.md` append뿐이다. `src/ui.py`,
+`src/exporter.py`, `src/pc/network_pipeline.py`, `src/pc/browser_session.py`,
+`app.py`, `src/pc/network_list_scraper.py`는 무수정. git add/commit/push/
+reset/checkout/restore 전부 수행하지 않았다.
+
+## PAGE-300-2B-2C 진입 가능 여부
+gpt-5.6-sol 3차 최종 판정 PASS - PAGE-300-2B-2C(동일 검색어, page 1→2,
+per_query_limit=40, target_count=40, 실제 live 정확히 1회, retry 0,
+page 3 접근 금지)로 진입 가능하다고 판단한다. 다만 gpt-5.6-sol이 제시한
+live PASS 최소 조건을 그대로 채택한다: 최종 unique rows=40,
+`parse_error_count==0`, `body_snapshot_error_count==0`,
+`json_decode_error_count==0`, `body_snapshot_success_count==
+candidate_response_count`, CAPTCHA·429·timeout·navigation_error 없음,
+page 2 DOM 전환 확인 및 `pagination_unverified_candidate_count==0`.
+하나라도 어긋나면 조건부 PASS가 아니라 즉시 HOLD로 판정한다. 과거 PAGE
+기록은 수정하거나 삭제하지 않았다.

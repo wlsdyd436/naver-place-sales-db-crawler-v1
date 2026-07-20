@@ -1,6 +1,6 @@
 from pathlib import Path
-from types import SimpleNamespace
 import inspect
+import json
 import sys
 
 
@@ -68,20 +68,47 @@ class FakeLocator:
         return self._box
 
 
+class FakeRequest:
+    """PAGE-300-2B-2B: requestfinished/requestfailed 핸들러가 받는 request
+    객체를 흉내낸다(response와 양방향 참조)."""
+
+    def __init__(self, resource_type, method="GET"):
+        self.resource_type = resource_type
+        self.method = method
+        self.failure = None
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
 class FakeResponse:
-    def __init__(self, url, status, resource_type, json_data=None, json_error=None):
+    """PAGE-300-2B-2B: `.json()` 대신 `.body()`(bytes)로 candidate body를
+    노출한다 - body_call_count로 requestfinished 시점 이후 재호출이 없는지
+    계측한다."""
+
+    def __init__(self, url, status, resource_type, *, body=None, body_error=None,
+                 method="GET", simulate_request_failed=False, headers=None):
         self.url = url
         self.status = status
-        self.request = SimpleNamespace(resource_type=resource_type)
-        self._json_data = json_data
-        self._json_error = json_error
-        self.json_call_count = 0
+        self.request = FakeRequest(resource_type, method=method)
+        self.request._response = self
+        self._body = body
+        self._body_error = body_error
+        self.body_call_count = 0
+        self.simulate_request_failed = simulate_request_failed
+        self.headers = headers if headers is not None else {}
 
-    def json(self):
-        self.json_call_count += 1
-        if self._json_error is not None:
-            raise self._json_error
-        return self._json_data
+    def body(self):
+        self.body_call_count += 1
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
+
+    def text(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return (self._body or b"").decode("utf-8")
 
 
 CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
@@ -89,25 +116,42 @@ CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
 
 def _place_response(item_ids_and_names, url=CANDIDATE_URL):
     items = [{"id": item_id, "name": name} for item_id, name in item_ids_and_names]
-    return FakeResponse(url, 200, "xhr", json_data={"result": {"place": {"list": items}}})
+    body = json.dumps({"result": {"place": {"list": items}}}).encode("utf-8")
+    return FakeResponse(url, 200, "xhr", body=body)
 
 
 def _broken_response(url=CANDIDATE_URL):
-    return FakeResponse(url, 200, "xhr", json_error=ValueError("bad json"))
+    """body snapshot은 성공하지만(정상 candidate) 내용이 깨진 JSON이라 harvest
+    단계의 json.loads가 실패하는 candidate."""
+    return FakeResponse(url, 200, "xhr", body=b"not valid json {{{")
 
 
 class FakeAdaptivePage:
     """wait_for_timeout(ms) 호출마다 누적 경과시간(_elapsed_ms)을 추적하고,
     그 경과시간을 기준으로 예약된 response를 그 시점에 "도착"시키는 fake clock
-    기반 page. delivery_schedule은 [(deliver_after_ms, response), ...] 형태 -
-    누적 elapsed_ms가 deliver_after_ms 이상이 되는 첫 wait_for_timeout(또는
-    goto) 호출 시점에 해당 response의 핸들러를 호출한다. 실제 시간 대기는
-    전혀 하지 않는다(테스트가 즉시 끝남)."""
+    기반 page. delivery_schedule 항목은 (deliver_after_ms, response) 2-tuple
+    (기본값 - response와 같은 tick에 requestfinished/requestfailed도 함께
+    전달, 실제 Playwright의 response->requestfinished 순서 보장을 재현) 또는
+    (deliver_after_ms, response, finish_delay_ms) 3-tuple(PAGE-300-2B-2B:
+    requestfinished를 response보다 finish_delay_ms만큼 늦게 전달 - "snapshot이
+    아직 pending인 상태"를 결정적으로 재현하기 위함)을 허용한다. 누적
+    elapsed_ms가 deliver_after_ms 이상이 되는 첫 wait_for_timeout(또는 goto)
+    호출 시점에 해당 response의 핸들러를 호출한다. 실제 시간 대기는 전혀
+    하지 않는다(테스트가 즉시 끝남)."""
 
     def __init__(self, delivery_schedule, *, captcha_selectors=None, goto_error=None):
         self._handlers: dict = {}
-        self._schedule = sorted(delivery_schedule, key=lambda pair: pair[0])
+        normalized = []
+        for entry in delivery_schedule:
+            if len(entry) == 2:
+                deliver_ms, response = entry
+                finish_delay_ms = 0
+            else:
+                deliver_ms, response, finish_delay_ms = entry
+            normalized.append((deliver_ms, response, finish_delay_ms))
+        self._schedule = sorted(normalized, key=lambda triple: triple[0])
         self._delivered_count = 0
+        self._pending_finishes: list = []
         self._elapsed_ms = 0
         self._captcha_selectors = captcha_selectors or {}
         self._goto_error = goto_error
@@ -133,12 +177,29 @@ class FakeAdaptivePage:
         self._elapsed_ms += ms
         self._deliver_due()
 
+    def _fire_finish(self, response):
+        event = "requestfailed" if getattr(response, "simulate_request_failed", False) else "requestfinished"
+        for handler in list(self._handlers.get(event, [])):
+            handler(response.request)
+
     def _deliver_due(self):
         while self._delivered_count < len(self._schedule) and self._schedule[self._delivered_count][0] <= self._elapsed_ms:
-            _, response = self._schedule[self._delivered_count]
+            deliver_ms, response, finish_delay_ms = self._schedule[self._delivered_count]
             self._delivered_count += 1
             for handler in list(self._handlers.get("response", [])):
                 handler(response)
+            if finish_delay_ms <= 0:
+                self._fire_finish(response)
+            else:
+                self._pending_finishes.append((self._elapsed_ms + finish_delay_ms, response))
+
+        still_pending = []
+        for finish_at, response in self._pending_finishes:
+            if finish_at <= self._elapsed_ms:
+                self._fire_finish(response)
+            else:
+                still_pending.append((finish_at, response))
+        self._pending_finishes = still_pending
 
     def locator(self, selector):
         return self._captcha_selectors.get(selector, FakeLocator(count=0))
@@ -306,24 +367,24 @@ def check_candidate_just_before_hard_cap_is_still_harvested(reporter: Validation
 
 
 def check_response_json_called_exactly_once_per_candidate(reporter: ValidationReporter) -> None:
-    """반대 검토 확인 사항: 폴링 루프의 peek 확인과 이후 harvest 단계가
-    parsed_cache를 공유해, candidate 응답당 response.json()이 정확히 1회만
-    호출되고 parse_error_count가 중복 집계되지 않아야 한다."""
+    """반대 검토 확인 사항 + PAGE-300-2B-2B: body snapshot(requestfinished
+    시점)이 candidate당 정확히 1회만 호출되고(폴링 루프의 peek과 harvest가
+    parsed_cache를 공유), parse_error_count가 중복 집계되지 않아야 한다."""
     valid = _place_response([("p1", "업체1")])
     broken = _broken_response()
     page = FakeAdaptivePage([(0, broken), (0, valid)])
     result = collect_network_query(page, JOB, 10, collected_at="2026-07-16")
 
     ok = (
-        valid.json_call_count == 1
-        and broken.json_call_count == 1
+        valid.body_call_count == 1
+        and broken.body_call_count == 1
         and result["parse_error_count"] == 1
         and result["raw_item_count"] == 1
     )
     if ok:
-        reporter.pass_("response.json() 호출 횟수: candidate당 정확히 1회(peek/harvest 공유), parse_error_count 중복 집계 없음")
+        reporter.pass_("body snapshot 호출 횟수: candidate당 정확히 1회(peek/harvest 공유), parse_error_count 중복 집계 없음")
     else:
-        reporter.fail(f"json() 호출 횟수 결과가 예상과 다름: valid.json_call_count={valid.json_call_count}, broken.json_call_count={broken.json_call_count}, result={result}")
+        reporter.fail(f"body snapshot 호출 횟수 결과가 예상과 다름: valid.body_call_count={valid.body_call_count}, broken.body_call_count={broken.body_call_count}, result={result}")
 
 
 def check_empty_list_candidate_is_not_treated_as_valid(reporter: ValidationReporter) -> None:
@@ -422,26 +483,97 @@ def check_non_candidate_429_during_quiet_period_is_detected(reporter: Validation
         and result["adaptive_settle_early_exit"] is True
         and result["adaptive_settle_wait_ms"] < 5000
         and len(page.wait_calls) == expected_ticks
-        and non_candidate_429.json_call_count == 0
+        and non_candidate_429.body_call_count == 0
     )
     if ok:
         reporter.pass_(
             f"quiet period 중 non-candidate 429: status_429_seen=True로 감지되지만 "
             f"candidate_response_count는 그대로(1)이고 quiet 타이머도 재시작되지 않아 "
-            f"{expected_ticks}틱에 정상 조기 종료(429 응답 json() 미호출 확인)"
+            f"{expected_ticks}틱에 정상 조기 종료(429 응답 body snapshot 미호출 확인)"
         )
     else:
         reporter.fail(f"quiet period 중 non-candidate 429 결과가 예상과 다름: wait_calls={len(page.wait_calls)}, result={result}")
 
 
 def check_response_handler_does_not_call_json(reporter: ValidationReporter) -> None:
-    """규칙 7: response callback(handle_response) 안에서는 무거운 JSON
-    파싱을 하지 않아야 한다 - 소스에 .json( 호출이 없는지 정적으로 확인."""
+    """규칙 7 + work order §11-14: response callback(handle_response) 안에서는
+    .json(/.body(/.text( 어느 것도 호출하지 않아야 한다 - body snapshot은
+    requestfinished handler의 책임이다(정적 소스 검사)."""
     source = inspect.getsource(network_browser_collector._make_response_handler)
-    if ".json(" not in source:
-        reporter.pass_("response callback 소스에 .json( 호출이 없음(status/url/resource_type만 확인, 무거운 파싱은 폴링 루프 메인 흐름에서만 발생)")
+    forbidden = [token for token in (".json(", ".body(", ".text(") if token in source]
+    if not forbidden:
+        reporter.pass_("response callback 소스에 .json(/.body(/.text( 호출이 없음(status/url/resource_type만 확인, body snapshot은 requestfinished handler 책임)")
     else:
-        reporter.fail(f"response callback 소스에 .json( 호출이 발견됨:\n{source}")
+        reporter.fail(f"response callback 소스에 금지된 호출이 발견됨({forbidden}):\n{source}")
+
+
+def check_pending_snapshot_does_not_start_quiet_period(reporter: ValidationReporter) -> None:
+    """work order §8: response는 도착했지만 requestfinished(body snapshot)가
+    아직 오지 않은 candidate는 valid로 취급되면 안 된다(quiet period 시작
+    금지) - requestfinished가 늦게(quiet period보다 늦게) 도착해도 hard cap
+    안에서는 안전하게 harvest돼야 한다(데이터 유실 없음, 조기 종료 혜택만
+    없음 - 알려진 트레이드오프)."""
+    # response는 0ms에 도착하지만 requestfinished(body snapshot)는 1000ms
+    # 늦게 도착한다 - quiet period(750ms)보다 늦으므로 조기 종료 혜택은
+    # 받지 못하지만, hard cap(5000ms) 안에서는 정상 harvest돼야 한다.
+    page = FakeAdaptivePage([(0, _place_response([("p1", "업체1")]), 1000)])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-16")
+
+    ok = (
+        len(page.wait_calls) == _HARD_CAP_TICKS
+        and result["adaptive_settle_early_exit"] is False
+        and len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and result["parse_error_count"] == 0
+    )
+    if ok:
+        reporter.pass_("pending snapshot: requestfinished가 지연 도착해도 조기 종료는 되지 않지만(hard cap 대기) 데이터는 유실 없이 정상 harvest됨")
+    else:
+        reporter.fail(f"pending snapshot 결과가 예상과 다름: wait_calls={len(page.wait_calls)}, result={result}")
+
+
+def check_requestfailed_candidate_falls_back_to_hard_cap_no_crash(reporter: ValidationReporter) -> None:
+    """requestfailed candidate 하나만 있으면(유효 데이터 없음) 예외 없이
+    hard cap까지 안전하게 대기해야 한다(parse_error_count=1, rows=[])."""
+    failed_response = _place_response([("p1", "업체1")])
+    failed_response.simulate_request_failed = True
+    failed_response.request.failure = "net::ERR_ABORTED"
+    page = FakeAdaptivePage([(0, failed_response)])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-16")
+
+    ok = (
+        len(page.wait_calls) == _HARD_CAP_TICKS
+        and result["adaptive_settle_early_exit"] is False
+        and result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and result["rows"] == []
+        and failed_response.body_call_count == 0
+    )
+    if ok:
+        reporter.pass_("requestfailed candidate 단독: body() 미호출, hard cap까지 안전 대기, parse_error_count=1")
+    else:
+        reporter.fail(f"requestfailed candidate 결과가 예상과 다름: wait_calls={len(page.wait_calls)}, result={result}")
+
+
+def check_candidate_body_over_cap_falls_back_to_hard_cap_no_crash(reporter: ValidationReporter) -> None:
+    """_MAX_CANDIDATE_BODY_BYTES를 초과하는 candidate만 있으면 BodyTooLarge로
+    안전하게 처리되고(원문 저장 없음) hard cap까지 예외 없이 대기해야 한다."""
+    huge_body = b"[" + b"1" * (network_browser_collector._MAX_CANDIDATE_BODY_BYTES + 1) + b"]"
+    huge = FakeResponse(CANDIDATE_URL, 200, "xhr", body=huge_body)
+    page = FakeAdaptivePage([(0, huge)])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-16")
+
+    ok = (
+        len(page.wait_calls) == _HARD_CAP_TICKS
+        and result["adaptive_settle_early_exit"] is False
+        and result["parse_error_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and result["rows"] == []
+    )
+    if ok:
+        reporter.pass_("candidate body 크기 상한 초과 단독: BodyTooLarge로 안전 처리, hard cap까지 예외 없이 대기")
+    else:
+        reporter.fail(f"body 크기 상한 결과가 예상과 다름: wait_calls={len(page.wait_calls)}, result={result}")
 
 
 def main() -> int:
@@ -462,6 +594,9 @@ def main() -> int:
     check_captcha_detection_unaffected_by_adaptive_loop(reporter)
     check_non_candidate_429_during_quiet_period_is_detected(reporter)
     check_response_handler_does_not_call_json(reporter)
+    check_pending_snapshot_does_not_start_quiet_period(reporter)
+    check_requestfailed_candidate_falls_back_to_hard_cap_no_crash(reporter)
+    check_candidate_body_over_cap_falls_back_to_hard_cap_no_crash(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

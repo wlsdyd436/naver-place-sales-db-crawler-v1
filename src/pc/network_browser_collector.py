@@ -26,6 +26,7 @@
 # 이미 닫힘(Target closed)"·"브라우저 실행 장애"·"일반 navigation 오류" 등
 # 그 외 예외는 timeout으로 위장하지 않고 navigation_error로 별도 분류한다
 # (browser_session.goto와 동일하게 PlaywrightTimeoutError만 관용적으로 흡수).
+import json
 from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -72,6 +73,11 @@ _MAX_PAGINATION_PAGES = 5
 # 없다.
 _PENDING_DRAIN_QUIET_MS = 200
 
+# PAGE-300-2B-2B: candidate response body의 안전 상한(바이트). PAGE-300-2B-2A
+# 실측(page 2 candidate 응답 약 414KB)보다 넉넉한 여유를 두되, 메모리 폭주를
+# 막기 위한 상한이다 - 초과하면 body 자체는 저장하지 않고 에러로만 기록한다.
+_MAX_CANDIDATE_BODY_BYTES = 2 * 1024 * 1024
+
 
 class _QueryObservationContext:
     """쿼리 1회 호출에 국한된 로컬 상태(전역/클래스 공용 상태를 두지 않기 위함).
@@ -83,22 +89,40 @@ class _QueryObservationContext:
     """
 
     def __init__(self):
-        self.candidate_responses: list = []
+        # PAGE-300-2B-2B: candidate 하나당 raw response 객체 대신 candidate
+        # entry(dict)를 담는다(§candidate entry 계약) - 인덱스 순서(도착 순서)
+        # 의미는 기존과 동일하게 유지하면서, 내용물만 "나중에 body에 다시
+        # 접근 가능한 response 객체"에서 "이미 확보한 snapshot(bytes) 여부를
+        # 담은 entry"로 바뀐다.
+        self.candidates: list = []
         self.candidate_response_count = 0
         self.status_429_seen = False
         # PAGE-300-2B-1-FIX §3: 같은 response 객체가 브라우저에서 'response'
         # 이벤트를 중복 발생시키는 극단적인 경우에도 object identity(id())로
         # 한 번만 기록한다 - 인덱스가 아니라 객체 자체를 키로 써야, 동일 객체가
         # 두 번 append돼 서로 다른 인덱스로 두 번 harvest(JSON parse 2회)되는
-        # 것을 막을 수 있다. response 객체는 candidate_responses에 계속
-        # 참조로 남아있으므로(쿼리 종료 전까지) id() 재사용(GC) 위험이 없다.
+        # 것을 막을 수 있다. response 객체는 candidates에 계속 참조로 남아있으므로
+        # (쿼리 종료 전까지) id() 재사용(GC) 위험이 없다.
         self.seen_response_ids: set = set()
+        # PAGE-300-2B-2B: requestfinished/requestfailed는 request 객체를 받으므로
+        # (response가 아니라), id(request) -> candidate entry로 역참조할 수 있어야
+        # 한다. response 이벤트가 먼저 도착해 candidate로 판별될 때만 이 맵에
+        # 등록되므로, candidate가 아닌 request는 이 맵에 없고 두 핸들러는 즉시
+        # no-op으로 반환한다.
+        self.request_id_to_candidate: dict = {}
+        # PAGE-300-2B-2B: 순수 진단용 로컬 라벨(§candidate entry의 generation) -
+        # "지금까지 확정된 페이지 수 + 1"을 기록할 뿐, response 내용으로 실제
+        # 네이버 page를 추측하는 것과 무관하다(우리가 클릭을 시도한 시점 기준
+        # 로컬 카운터일 뿐이라 "페이지 번호 추측 금지" 원칙과 충돌하지 않는다).
+        self.current_generation = 1
 
 
 def _make_response_handler(ctx: _QueryObservationContext):
-    """response handler는 최소 작업만 한다(상태 확인 + 후보 저장) - json 파싱은
-    settle 종료 후 별도로 수행해 callback 블로킹을 피하고 parse_error_count를
-    명확히 집계한다."""
+    """response handler는 최소 작업만 한다(상태 확인 + candidate entry 등록) -
+    PAGE-300-2B-2B: body snapshot도 JSON 파싱도 이 handler에서 하지 않는다
+    (response 본문을 읽는 메서드는 전혀 호출하지 않음 - 정적 검사로 회귀
+    고정). body snapshot은 requestfinished handler가, JSON 파싱은 harvest
+    단계가 각각 책임진다."""
 
     def handle_response(response) -> None:
         try:
@@ -108,7 +132,12 @@ def _make_response_handler(ctx: _QueryObservationContext):
             pass
 
         try:
-            resource_type = response.request.resource_type
+            request = response.request
+        except Exception:
+            request = None
+
+        try:
+            resource_type = request.resource_type if request is not None else ""
         except Exception:
             resource_type = ""
         url = response.url or ""
@@ -116,14 +145,186 @@ def _make_response_handler(ctx: _QueryObservationContext):
         try:
             if is_candidate_response(url, resource_type):
                 response_id = id(response)
-                if response_id not in ctx.seen_response_ids:
-                    ctx.seen_response_ids.add(response_id)
-                    ctx.candidate_response_count += 1
-                    ctx.candidate_responses.append(response)
+                if response_id in ctx.seen_response_ids:
+                    return
+                ctx.seen_response_ids.add(response_id)
+                # 방어적 dedupe: 같은 request가 이미 candidate로 등록돼 있으면
+                # (이론상 발생하지 않아야 하지만) entry를 중복 생성하지 않는다.
+                if request is not None and id(request) in ctx.request_id_to_candidate:
+                    return
+                try:
+                    status = response.status
+                except Exception:
+                    status = None
+                try:
+                    method = request.method if request is not None else ""
+                except Exception:
+                    method = ""
+                entry = {
+                    "sequence_id": ctx.candidate_response_count,
+                    "response": response,
+                    "request": request,
+                    "url": url,
+                    "method": method,
+                    "resource_type": resource_type,
+                    "status": status,
+                    "body_snapshot": None,
+                    "body_snapshot_ready": False,
+                    "body_snapshot_error_type": "",
+                    "body_snapshot_error_message": "",
+                    "body_snapshot_size": 0,
+                    "processed": False,
+                    "generation": ctx.current_generation,
+                }
+                ctx.candidates.append(entry)
+                ctx.candidate_response_count += 1
+                if request is not None:
+                    ctx.request_id_to_candidate[id(request)] = entry
         except Exception:
             pass
 
     return handle_response
+
+
+def _make_request_finished_handler(ctx: _QueryObservationContext):
+    """PAGE-300-2B-2B: requestfinished 시점에 candidate body를 즉시 bytes로
+    snapshot한다(PAGE-300-2B-2A 실측 원인 - 지연된 시점의 response.json()/
+    body()는 "Response body is unavailable"로 실패할 수 있으므로, 완료
+    직후 안전한 시점에만 접근한다). candidate가 아닌 request는 즉시 무시하고,
+    이미 resolve된 entry(중복 이벤트)도 idempotent하게 무시한다. 어떤 예외도
+    밖으로 던지지 않는다."""
+
+    def handle_request_finished(request) -> None:
+        try:
+            entry = ctx.request_id_to_candidate.get(id(request))
+            if entry is None:
+                return
+            if entry["body_snapshot_ready"] or entry["body_snapshot_error_type"]:
+                return
+            try:
+                response = request.response()
+            except Exception as exc:
+                entry["body_snapshot_error_type"] = type(exc).__name__
+                entry["body_snapshot_error_message"] = str(exc)[:200]
+                return
+            if response is None:
+                entry["body_snapshot_error_type"] = "NoResponse"
+                entry["body_snapshot_error_message"] = "request.response()가 None을 반환함"
+                return
+            # PAGE-300-2B-2B(gpt-5.6-sol 독립 검토 지적): response.body()는
+            # 전체 body를 메모리에 만든 뒤에야 길이를 알 수 있어 크기 검사
+            # 만으로는 할당 자체를 막지 못한다 - content-length 헤더를 먼저
+            # 확인할 수 있으면 body()를 아예 호출하지 않고 조기에 거른다
+            # (헤더가 없거나 파싱 불가하면 기존처럼 body() 이후 길이로만 판단).
+            try:
+                content_length_header = response.headers.get("content-length")
+            except Exception:
+                content_length_header = None
+            if content_length_header is not None:
+                try:
+                    content_length = int(content_length_header)
+                except (TypeError, ValueError):
+                    content_length = None
+                if content_length is not None and content_length > _MAX_CANDIDATE_BODY_BYTES:
+                    entry["body_snapshot_error_type"] = "BodyTooLarge"
+                    entry["body_snapshot_error_message"] = (
+                        f"content-length {content_length} bytes exceeds {_MAX_CANDIDATE_BODY_BYTES} bytes cap"
+                    )
+                    entry["body_snapshot_size"] = content_length
+                    return
+            try:
+                body = response.body()
+            except Exception:
+                try:
+                    body = response.text().encode("utf-8")
+                except Exception as exc2:
+                    entry["body_snapshot_error_type"] = type(exc2).__name__
+                    entry["body_snapshot_error_message"] = str(exc2)[:200]
+                    return
+            if len(body) > _MAX_CANDIDATE_BODY_BYTES:
+                entry["body_snapshot_error_type"] = "BodyTooLarge"
+                entry["body_snapshot_error_message"] = (
+                    f"{len(body)} bytes exceeds {_MAX_CANDIDATE_BODY_BYTES} bytes cap"
+                )
+                entry["body_snapshot_size"] = len(body)
+                return
+            entry["body_snapshot"] = body
+            entry["body_snapshot_ready"] = True
+            entry["body_snapshot_size"] = len(body)
+        except Exception:
+            pass
+
+    return handle_request_finished
+
+
+def _make_request_failed_handler(ctx: _QueryObservationContext):
+    """PAGE-300-2B-2B: requestfailed 시점에 candidate를 실패로 표시한다(retry는
+    하지 않는다 - 사실만 기록). idempotent하게, 이미 resolve된 entry는
+    건드리지 않는다.
+
+    gpt-5.6-sol 독립 검토 지적(2차) 반영: response를 전혀 받지 못하고 실패한
+    request는 'response' 이벤트가 한 번도 발생하지 않으므로
+    ctx.request_id_to_candidate에 등록될 기회가 없었다 - 다른 candidate가
+    정상 성공해 per_query_limit에 도달하면 이 실패가 진단에서 완전히
+    사라져(parse_error_count/body_snapshot_error_count 어디에도 반영되지
+    않음) 거짓 성공처럼 보일 위험이 있었다. 이제 등록된 적 없는 request도
+    request.url/resource_type만으로 candidate 여부를 판별해(§response
+    handler와 동일한 is_candidate_response 판정 - response 객체 접근은
+    필요 없다), candidate였다면 실패 entry를 새로 만들어 harvest 시점에
+    parse_error_count/body_snapshot_error_count에 반영되게 한다."""
+
+    def handle_request_failed(request) -> None:
+        try:
+            entry = ctx.request_id_to_candidate.get(id(request))
+            if entry is not None:
+                if entry["body_snapshot_ready"] or entry["body_snapshot_error_type"]:
+                    return
+            else:
+                try:
+                    url = request.url or ""
+                except Exception:
+                    url = ""
+                try:
+                    resource_type = request.resource_type
+                except Exception:
+                    resource_type = ""
+                if not is_candidate_response(url, resource_type):
+                    return
+                try:
+                    method = request.method
+                except Exception:
+                    method = ""
+                entry = {
+                    "sequence_id": ctx.candidate_response_count,
+                    "response": None,
+                    "request": request,
+                    "url": url,
+                    "method": method,
+                    "resource_type": resource_type,
+                    "status": None,
+                    "body_snapshot": None,
+                    "body_snapshot_ready": False,
+                    "body_snapshot_error_type": "",
+                    "body_snapshot_error_message": "",
+                    "body_snapshot_size": 0,
+                    "processed": False,
+                    "generation": ctx.current_generation,
+                }
+                ctx.candidates.append(entry)
+                ctx.candidate_response_count += 1
+                ctx.request_id_to_candidate[id(request)] = entry
+
+            entry["body_snapshot_error_type"] = "RequestFailed"
+            try:
+                failure = request.failure
+                message = str(failure) if failure else ""
+            except Exception:
+                message = ""
+            entry["body_snapshot_error_message"] = message[:200]
+        except Exception:
+            pass
+
+    return handle_request_failed
 
 
 def _probe_captcha_state(page) -> dict:
@@ -445,8 +646,29 @@ def collect_network_query(
       "클릭은 성공했지만 페이지 확정은 실패"한 경우를 구분할 수 있게 됐다).
     """
     ctx = _QueryObservationContext()
-    handler = _make_response_handler(ctx)
-    page.on("response", handler)
+    response_handler = _make_response_handler(ctx)
+    request_finished_handler = _make_request_finished_handler(ctx)
+    request_failed_handler = _make_request_failed_handler(ctx)
+    # PAGE-300-2B-2B(gpt-5.6-sol 독립 검토 지적, 수정 반영): 세 리스너 중
+    # 두 번째/세 번째 등록(page.on)이 예외를 던지면, 이미 등록된 앞선
+    # 리스너가 해제되지 않고 page에 남을 수 있었다 - 등록 도중 실패하면
+    # 그때까지 등록된 리스너를 즉시 해제하고 원래 예외를 그대로 전파한다.
+    _registered_listeners: list = []
+    try:
+        for _event, _handler in (
+            ("response", response_handler),
+            ("requestfinished", request_finished_handler),
+            ("requestfailed", request_failed_handler),
+        ):
+            page.on(_event, _handler)
+            _registered_listeners.append((_event, _handler))
+    except Exception:
+        for _event, _handler in _registered_listeners:
+            try:
+                page.off(_event, _handler)
+            except Exception:
+                pass
+        raise
 
     goto_timed_out = False
     navigation_error = False
@@ -493,24 +715,59 @@ def collect_network_query(
                 "pagination_unverified_candidate_count": 0,
                 "pagination_drain_item_count": 0,
                 "per_page_diagnostics": [],
+                "body_snapshot_success_count": 0,
+                "body_snapshot_error_count": 0,
+                "body_snapshot_total_bytes": 0,
+                "json_decode_error_count": 0,
             }
 
-        # PERF-1A 적응형 settle: parsed_cache는 candidate 응답 하나당
-        # response.json()/_extract_list_items()를 정확히 1회만 호출하도록
-        # 메모이즈한다(폴링 루프의 "peek" 확인과 아래 harvest 단계가 결과를
-        # 공유 - 중복 파싱/중복 parse_error 집계를 방지).
+        # PAGE-300-2B-2B: parsed_cache는 candidate 하나당 JSON 파싱을 정확히
+        # 1회만 수행하도록 메모이즈한다(폴링 루프의 "peek" 확인과 아래 harvest
+        # 단계가 결과를 공유 - 중복 파싱/중복 parse_error 집계 방지). harvest는
+        # Playwright Response 객체에 다시 접근하지 않고 requestfinished가 이미
+        # 확보해 둔 candidate entry의 body_snapshot(bytes)만 사용한다.
         parsed_cache: dict = {}
 
         def _ensure_parsed(index: int) -> dict:
-            if index not in parsed_cache:
-                response = ctx.candidate_responses[index]
+            """peek 전용 - candidate가 아직 pending(response는 왔지만
+            requestfinished/requestfailed가 아직 도착하지 않음)이면 memoize하지
+            않고 그대로 반환한다(다음 tick에 다시 확인하기 위함). 정말로
+            resolve된 경우(성공 snapshot 또는 영구 실패)만 parsed_cache에
+            영구 기록한다."""
+            if index in parsed_cache:
+                return parsed_cache[index]
+            entry = ctx.candidates[index]
+            if entry["body_snapshot_ready"]:
                 try:
-                    data = response.json()
+                    text = entry["body_snapshot"].decode("utf-8-sig")
+                    data = json.loads(text)
                     items = _extract_list_items(data)
                     parsed_cache[index] = {"items": items, "error": False}
                 except Exception:
                     parsed_cache[index] = {"items": [], "error": True}
-            return parsed_cache[index]
+                entry["processed"] = True
+                return parsed_cache[index]
+            if entry["body_snapshot_error_type"]:
+                parsed_cache[index] = {"items": [], "error": True}
+                entry["processed"] = True
+                return parsed_cache[index]
+            # 아직 진짜 pending 상태 - memoize하지 않는다.
+            return {"items": [], "error": False, "pending": True}
+
+        def _ensure_parsed_final(index: int) -> dict:
+            """실제 harvest(추출) 지점 전용 - peek에서 pending으로 남아있던
+            candidate를 이 시점에 최종적으로 error로 확정한다(더 이상 기다리지
+            않는다는 뜻이므로, 이후에는 같은 index를 다시 pending으로 보지
+            않는다 - "candidate당 JSON parse 정확히 1회" 계약 유지)."""
+            parsed = _ensure_parsed(index)
+            if parsed.get("pending"):
+                parsed_cache[index] = {"items": [], "error": True}
+                entry = ctx.candidates[index]
+                if not entry["body_snapshot_error_type"]:
+                    entry["body_snapshot_error_type"] = "SnapshotPendingAtHarvest"
+                entry["processed"] = True
+                return parsed_cache[index]
+            return parsed
 
         elapsed_ms = 0
         last_seen_count = 0
@@ -544,8 +801,8 @@ def collect_network_query(
 
         raw_items: list = []
         parse_error_count = 0
-        for index in range(len(ctx.candidate_responses)):
-            parsed = _ensure_parsed(index)
+        for index in range(len(ctx.candidates)):
+            parsed = _ensure_parsed_final(index)
             if parsed["error"]:
                 parse_error_count += 1
             else:
@@ -598,7 +855,14 @@ def collect_network_query(
             그대로 전파 - 호출자가 pagination_click_error로 안전하게 흡수한다).
             """
             nonlocal total_mapped_count, parse_error_count, pagination_drain_item_count
-            drain_result = _drain_pending_responses(page, ctx, _ensure_parsed, from_index)
+            drain_result = _drain_pending_responses(page, ctx, _ensure_parsed_final, from_index)
+            # PAGE-300-2B-2B(gpt-5.6-sol 독립 검토 지적, 수정 반영): drain된
+            # candidate가 전부 실패(raw_items=[])해도 parse_error_count는
+            # 반드시 반영해야 한다 - 이전에는 이 라인이 raw_items가 있을 때만
+            # 실행되는 조건문 안에 있어, drain 중 body snapshot이 끝내
+            # 확정(_ensure_parsed_final)돼도 error로만 끝나면 parse_error_count가
+            # 증가하지 않고 조용히 사라질 수 있었다(§9/§10 위험 - 거짓 성공 가능성).
+            parse_error_count += drain_result["parse_error_count"]
             if drain_result["raw_items"]:
                 drain_mapped_rows = []
                 for item in drain_result["raw_items"]:
@@ -612,7 +876,6 @@ def collect_network_query(
                 unique_rows.extend(drain_newly_unique)
                 total_mapped_count += len(drain_mapped_rows)
                 raw_items.extend(drain_result["raw_items"])
-                parse_error_count += drain_result["parse_error_count"]
                 pagination_drain_item_count += len(drain_result["raw_items"])
             return drain_result["final_count"]
 
@@ -642,6 +905,9 @@ def collect_network_query(
                     break
 
                 target_page_number = current_page_number + 1
+                # PAGE-300-2B-2B: 순수 진단 라벨 - 지금부터 도착하는 candidate는
+                # "target_page_number를 시도 중인 시점"에 관측된 것으로 기록한다.
+                ctx.current_generation = target_page_number
                 button_locator = _find_page_button(frame, target_page_number)
                 try:
                     button_count = button_locator.count() if button_locator is not None else 0
@@ -775,7 +1041,7 @@ def collect_network_query(
                 page_raw_items: list = []
                 page_parse_errors = 0
                 for index in range(candidate_count_before_click, wait_result["final_count"]):
-                    parsed = _ensure_parsed(index)
+                    parsed = _ensure_parsed_final(index)
                     if parsed["error"]:
                         page_parse_errors += 1
                     else:
@@ -865,12 +1131,24 @@ def collect_network_query(
             "pagination_unverified_candidate_count": pagination_unverified_candidate_count,
             "pagination_drain_item_count": pagination_drain_item_count,
             "per_page_diagnostics": per_page_diagnostics,
+            "body_snapshot_success_count": sum(1 for e in ctx.candidates if e["body_snapshot_ready"]),
+            "body_snapshot_error_count": sum(1 for e in ctx.candidates if not e["body_snapshot_ready"]),
+            "body_snapshot_total_bytes": sum(e["body_snapshot_size"] for e in ctx.candidates if e["body_snapshot_ready"]),
+            "json_decode_error_count": sum(
+                1 for idx, e in enumerate(ctx.candidates)
+                if e["body_snapshot_ready"] and parsed_cache.get(idx, {}).get("error")
+            ),
         }
     finally:
-        try:
-            page.off("response", handler)
-        except Exception:
-            pass
+        for event, event_handler in (
+            ("response", response_handler),
+            ("requestfinished", request_finished_handler),
+            ("requestfailed", request_failed_handler),
+        ):
+            try:
+                page.off(event, event_handler)
+            except Exception:
+                pass
 
 
 def _default_session_factory():
