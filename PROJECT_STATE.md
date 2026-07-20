@@ -6234,3 +6234,119 @@ live) 진입을 다음 단계로 권장한다. 단, 이번 실측에서 page 2�
 단계의 참고 사항으로 기록, 이번 단계 판정을 바꾸지 않음). 100건 live를 이번
 보고에서 임의로 시작하지 않고 중단한다. 과거 PAGE 기록은 수정하거나
 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-3 실제 최대 100건 live 검증
+
+## 기준/실행 정보
+- 기준 커밋: `a42af98b2d509e34e1f8f8e214c5ca547242778c`(검증: page 2 추가
+  수집으로 단일 조합 40건 달성) - 작업 전/후 동일, 변경 없음
+- 검색어: "서울특별시 강동구 카페", query_count=1, per_query_limit=100,
+  target_count=100, settle_ms=5000
+- 실행 마커: `scratchpad/arch300_page300_probe/results/page300_2b3/
+  PAGE300_2B3_LIVE_STARTED.marker`(원자 생성, 삭제하지 않음)
+- live 실행 횟수: 정확히 1회(20260720_172602), retry_count=0, 재실행 없음
+- production `_MAX_PAGINATION_PAGES`: **override 없이 production 기본값
+  5 그대로 사용**(live_override_used=False, 실행 전/후 동일하게 5)
+
+## harness/사전 검증
+- harness: `scratchpad/arch300_page300_probe/page300_2b3_live_100.py`(신규,
+  page300_2b2e_live_40.py 구조를 재사용하되 그 harness는 수정하지 않음)
+- 컴파일: `py_compile` PASS
+- `--check-config`: PASS(production _MAX_PAGINATION_PAGES=5 확인, PAGE-300-2B-2D
+  신규 진단 필드 10개 소스 존재 정적 확인, 네이버 접속 없음, 마커 미생성)
+- 사전 회귀(7개 파일): 전부 PASS, 합계 161건(직전 PAGE-300-2B-2E 기록과 동일)
+- parser 회귀: 42 PASS(동일)
+
+## 접근 페이지 / CAPTCHA·429
+- 접근 페이지: **page 1, 2, 3**(page 4·5는 방문하지 않음 - page 3에서 이미
+  누적 unique 100건에 도달해 정상 조기 중단, work order §11 "page 5까지
+  방문하지 않았다는 이유로 실패 처리하지 않는다" 그대로 적용)
+- page 6 이상 접근: 없음(`pagination_page_count=3`, production 상한 5 이내)
+- CAPTCHA·HTTP 429·timeout·navigation_error: 전부 발생 안 함(False)
+
+## candidate/snapshot 결과
+- candidate_response_count=**3**, body_snapshot_success_count=3, error/empty/
+  pending=0/0/0
+- snapshot_classified_count(3) == candidate_response_count(3): **일치**
+- body_snapshot_total_bytes=**908,004**
+- success_diag_bytes(candidate_snapshot_diagnostics success entry 합) =
+  **908,004** → **정확히 일치**
+- unmatched_requestfinished_count=0, ambiguous_request_mapping_count=0
+- json_decode_error_count=0, parse_error_count=0
+- 3개 candidate 전부 body_snapshot_state=success, size>0, processed=true,
+  json_decode_error_type=""
+
+## candidate별 안전 진단(generation 기준 집계)
+- generation 1(all_search, GET, xhr): success, size=78,390, object, "{"
+- generation 2(graphql_candidate, POST, fetch): success, size=412,592, array,
+  "["(page 2 실측과 거의 동일 - 이전 40건 단계 412,573과 19바이트 차이,
+  실측 변동 범위 내)
+- generation 3(graphql_candidate, POST, fetch): success, size=417,022, array,
+  "["(page 3도 page 2와 동일한 graphql 엔드포인트 패턴)
+
+## 페이지별 raw·new unique·duplicate
+- page 1: candidate=1, raw=20, new_unique=20, duplicate=0, adaptive_wait_ms=1700
+- page 2: candidate=1, raw=70, new_unique=70, duplicate=0, adaptive_wait_ms=5000
+- page 3: candidate=1, raw=70, new_unique=70, duplicate=0, adaptive_wait_ms=5000
+  (단, 누적 unique가 100에 도달하는 시점에서 orchestrator가 target_reached로
+  최종 rows를 100으로 trim - page 3 raw 70건 중 실제로 최종 export에 반영된
+  신규 기여분은 10건뿐)
+- pagination_unverified_candidate_count=0, pagination_drain_item_count=0(§4/§6
+  DOM identity 문제 없음)
+
+## 페이지 간 ID 중복 / 누적 unique
+- cumulative_by_page: page1(unique 20, 누적 20) → page2(unique 70, 누적 90)
+  → page3(unique 10, 누적 100 - trim 이후 최종 rows 기준 신규 기여분)
+- total_cross_page_duplicate_count=0(페이지 간 중복 ID 없음)
+- total_unique_id_count=100(Excel place_id 중복 0건과 일치)
+
+## final_count / stop reason
+- before_trim_count=100, final_count=**100**
+- orchestrator stop_reason=`target_reached`
+- pagination_stop_reason=`per_query_limit_reached`(쿼리 내부 per_query_limit=100
+  도달로 인한 정상 종료)
+
+## exporter/Excel
+- exporter_call_count=1(정확히 1회)
+- Excel 헤더 11개, MERGED_COLUMNS와 완전 일치, data_row_count=**100**(final_count와
+  일치), 새로오픈여부 전부 빈칸, 업체명 빈값 0건, 플레이스 URL 중복 0건(고유
+  100건), 내부 필드 미노출
+
+## 성능
+session_ready_seconds=0.80, orchestrator_seconds=16.63,
+session_teardown_seconds=0.26, export_seconds=0.03, total_wall_seconds=17.74
+(참고: page 2·3 모두 adaptive_wait_ms=5000으로 hard cap 전체 대기 - quiet
+period 조기 종료가 발생하지 않음, 다음 성능 최적화 검토 시 참고)
+
+## 최종 판정: **FULL PASS**
+work order §11 FULL PASS 조건 전부 충족: fail_conditions 전부 False,
+hold_conditions 전부 False, full_pass_conditions 23개 전부 True(최대 page
+5 이내, snapshot 불변식 성립, error/empty/pending/unmatched/ambiguous/
+json_decode_error/parse_error 전부 0, before_trim_count>=100, final_count=100,
+stop_reason=target_reached, pagination_stop_reason=per_query_limit_reached,
+exporter 1회, Excel 100행/11열, 새로오픈 전부 빈칸, 내부 필드 미노출,
+unverified_candidate=0). page 4·5를 방문하지 않은 것은 work order §11에 따라
+실패 사유가 아니다 - page 3에서 이미 목표에 도달했다는 뜻이다.
+
+## production·tests 무수정 확인
+`git status --short`/`git diff --name-status`/`git diff --stat`/
+`git diff --check` 전부 출력 없음(live 실행 직후 기준, PROJECT_STATE.md
+append 전) - `scratchpad/`는 `.gitignore`로 전체 무시되므로 신규 harness/
+결과 JSON/Excel/마커도 tracked 변경으로 나타나지 않는다. 이 PROJECT_STATE.md
+append만이 유일한 tracked 변경이다. `src/*`, `tests/*` 전부 무수정.
+
+## 결과 파일(Git 미포함)
+- `scratchpad/arch300_page300_probe/results/page300_2b3/
+  PAGE300_2B3_LIVE_STARTED.marker`
+- `scratchpad/arch300_page300_probe/results/page300_2b3/
+  page300_2b3_live_100_result_20260720_172602.json`
+- `scratchpad/arch300_page300_probe/results/page300_2b3/
+  page300_2b3_live_100_20260720_172602.xlsx`
+
+## 다음 단계
+FULL PASS - work order §18에 따라 다음 단계는 **PAGE-300-3(page 6~10 다음
+페이지 번호 묶음 전환 설계)**이며, 이는 먼저 별도 PoC와 no-live 구현으로
+진행해야 한다. **100건 성공 직후 곧바로 300건 live를 실행하지 않는다**(work
+order §18 명시 주의사항). 이번 보고에서 page 6 이상 접근이나 300건 live를
+임의로 시작하지 않고 여기서 중단한다. 과거 PAGE 기록은 수정하거나 삭제하지
+않았다.
