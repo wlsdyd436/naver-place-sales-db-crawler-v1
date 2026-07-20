@@ -78,6 +78,136 @@ _PENDING_DRAIN_QUIET_MS = 200
 # 막기 위한 상한이다 - 초과하면 body 자체는 저장하지 않고 에러로만 기록한다.
 _MAX_CANDIDATE_BODY_BYTES = 2 * 1024 * 1024
 
+# PAGE-300-2B-2D §4: candidate별 안전 진단(candidate_snapshot_diagnostics)에서
+# 원본 body를 노출하지 않고도 인코딩/구조 단서를 남기기 위한 순수 분류
+# 헬퍼들이다. 셋 다 raw byte prefix 자체를 반환하지 않고 enum 성격의 짧은
+# 문자열만 반환한다 - 압축 해제나 charset 추측 재시도는 절대 하지 않는다
+# (§6, 실제 magic/header 근거가 확인되기 전까지 decompression 구현 금지).
+_BOM_PREFIXES = (
+    (b"\xff\xfe\x00\x00", "utf32_le"),
+    (b"\x00\x00\xfe\xff", "utf32_be"),
+    (b"\xef\xbb\xbf", "utf8"),
+    (b"\xff\xfe", "utf16_le"),
+    (b"\xfe\xff", "utf16_be"),
+)
+_WHITESPACE_BYTES = (0x20, 0x09, 0x0A, 0x0D, 0x00)
+
+
+def _url_kind(url: str) -> str:
+    """candidate URL을 안전한 enum 라벨로만 요약한다(전체 query string은
+    진단에 남기지 않는다 - §4)."""
+    lowered = (url or "").lower()
+    if "allsearch" in lowered:
+        return "all_search"
+    if "graphql" in lowered:
+        return "graphql_candidate"
+    return "other_candidate"
+
+
+def _classify_bom(body: bytes) -> str:
+    for prefix, label in _BOM_PREFIXES:
+        if body.startswith(prefix):
+            return label
+    return "none"
+
+
+def _classify_compression_magic(body: bytes) -> str:
+    if body.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if len(body) >= 2 and body[0] == 0x78 and body[1] in (0x01, 0x5E, 0x9C, 0xDA):
+        return "zlib"
+    if body and body[0] >= 0x80:
+        return "unknown_binary"
+    return "none"
+
+
+def _classify_first_non_whitespace_character(body: bytes) -> str:
+    """§4: BOM 접두부와 ASCII 공백을 건너뛴 뒤 첫 바이트만 4가지 enum으로
+    분류한다. body 자체(원문)는 반환하지 않는다."""
+    if not body:
+        return "empty"
+    index = 0
+    for prefix, _label in _BOM_PREFIXES:
+        if body.startswith(prefix):
+            index = len(prefix)
+            break
+    while index < len(body) and body[index] in _WHITESPACE_BYTES:
+        index += 1
+    if index >= len(body):
+        return "empty"
+    char = body[index]
+    if char == 0x7B:
+        return "{"
+    if char == 0x5B:
+        return "["
+    if char == 0x3C:
+        return "<"
+    return "other"
+
+
+def _summarize_candidate_snapshots(candidates: list, parsed_cache: dict | None = None) -> dict:
+    """PAGE-300-2B-2D(gpt-5.6-sol 독립 검토 지적, Medium 반영): candidate 목록에서
+    body snapshot 3분류(success/error/pending)와 안전 진단(candidate_snapshot_
+    diagnostics)을 계산하는 단일 지점이다. navigation_error 조기 반환과 정상
+    반환 경로가 이 함수를 공유해야, "response/requestfinished가 goto() 예외
+    발생 전에 이미 도착했을 수 있는" edge case에서도 success+error+pending==
+    candidate_response_count 불변식이 모든 반환 경로에서 항상 성립한다(수정
+    전에는 navigation_error 조기 반환이 이미 관측된 candidate가 있어도 전부
+    0/빈 리스트로 고정해 불변식이 깨질 수 있었다). parsed_cache가 없으면(예:
+    navigation_error 조기 반환처럼 JSON 파싱 자체가 아직 시도되지 않은 시점)
+    json_decode_error_count는 0으로 둔다."""
+    parsed_cache = parsed_cache or {}
+    diagnostics = []
+    for e in candidates:
+        body = e.get("body_snapshot")
+        if e["body_snapshot_ready"]:
+            state = "success"
+        elif e["body_snapshot_error_type"] == "EmptyBody":
+            state = "empty"
+        elif e["body_snapshot_error_type"]:
+            state = "error"
+        else:
+            state = "pending"
+        diagnostics.append({
+            "sequence_id": e["sequence_id"],
+            "url_kind": _url_kind(e["url"]),
+            "method": e["method"],
+            "resource_type": e["resource_type"],
+            "status": e["status"],
+            "content_type": e.get("content_type", ""),
+            "content_encoding": e.get("content_encoding", ""),
+            "body_snapshot_state": state,
+            "body_snapshot_size": e["body_snapshot_size"],
+            "body_snapshot_error_type": e["body_snapshot_error_type"],
+            "json_top_level_type": e.get("json_top_level_type", ""),
+            "json_decode_error_type": e.get("json_decode_error_type", ""),
+            "first_non_whitespace_character": (
+                _classify_first_non_whitespace_character(body) if body is not None else "empty"
+            ),
+            "bom_type": _classify_bom(body) if body is not None else "none",
+            "compression_magic": _classify_compression_magic(body) if body is not None else "none",
+            "processed": e["processed"],
+            "generation": e["generation"],
+        })
+    success = sum(1 for e in candidates if e["body_snapshot_ready"])
+    error = sum(1 for e in candidates if (not e["body_snapshot_ready"]) and e["body_snapshot_error_type"])
+    pending = sum(1 for e in candidates if (not e["body_snapshot_ready"]) and not e["body_snapshot_error_type"])
+    empty = sum(1 for e in candidates if e["body_snapshot_error_type"] == "EmptyBody")
+    total_bytes = sum(e["body_snapshot_size"] for e in candidates if e["body_snapshot_ready"])
+    json_decode_error_count = sum(
+        1 for idx, e in enumerate(candidates)
+        if e["body_snapshot_ready"] and parsed_cache.get(idx, {}).get("error")
+    )
+    return {
+        "body_snapshot_success_count": success,
+        "body_snapshot_error_count": error,
+        "snapshot_pending_count": pending,
+        "body_snapshot_empty_count": empty,
+        "body_snapshot_total_bytes": total_bytes,
+        "json_decode_error_count": json_decode_error_count,
+        "candidate_snapshot_diagnostics": diagnostics,
+    }
+
 
 class _QueryObservationContext:
     """쿼리 1회 호출에 국한된 로컬 상태(전역/클래스 공용 상태를 두지 않기 위함).
@@ -115,6 +245,10 @@ class _QueryObservationContext:
         # 네이버 page를 추측하는 것과 무관하다(우리가 클릭을 시도한 시점 기준
         # 로컬 카운터일 뿐이라 "페이지 번호 추측 금지" 원칙과 충돌하지 않는다).
         self.current_generation = 1
+        # PAGE-300-2B-2D §5: request-response 연결 무결성 진단. 정상 경로에서는
+        # 항상 0이어야 하며, 0보다 크면 candidate identity 매칭이 깨졌다는 뜻이다.
+        self.unmatched_requestfinished_count = 0
+        self.ambiguous_request_mapping_count = 0
 
 
 def _make_response_handler(ctx: _QueryObservationContext):
@@ -150,7 +284,13 @@ def _make_response_handler(ctx: _QueryObservationContext):
                 ctx.seen_response_ids.add(response_id)
                 # 방어적 dedupe: 같은 request가 이미 candidate로 등록돼 있으면
                 # (이론상 발생하지 않아야 하지만) entry를 중복 생성하지 않는다.
+                # PAGE-300-2B-2D §5: 이 경우가 바로 "하나의 request가 둘 이상의
+                # response/candidate에 연결되려는" ambiguous 상황이다 - 두 번째
+                # entry를 만들지 않음으로써 "snapshot을 성공 처리하지 않음"
+                # 요구사항을 이미 만족하며, 여기서는 그 사실을 진단 카운터로
+                # 남긴다.
                 if request is not None and id(request) in ctx.request_id_to_candidate:
+                    ctx.ambiguous_request_mapping_count += 1
                     return
                 try:
                     status = response.status
@@ -168,11 +308,15 @@ def _make_response_handler(ctx: _QueryObservationContext):
                     "method": method,
                     "resource_type": resource_type,
                     "status": status,
+                    "content_type": "",
+                    "content_encoding": "",
                     "body_snapshot": None,
                     "body_snapshot_ready": False,
                     "body_snapshot_error_type": "",
                     "body_snapshot_error_message": "",
                     "body_snapshot_size": 0,
+                    "json_top_level_type": "",
+                    "json_decode_error_type": "",
                     "processed": False,
                     "generation": ctx.current_generation,
                 }
@@ -198,15 +342,41 @@ def _make_request_finished_handler(ctx: _QueryObservationContext):
         try:
             entry = ctx.request_id_to_candidate.get(id(request))
             if entry is None:
+                # PAGE-300-2B-2D §5: candidate로 등록된 적 없는 request의
+                # requestfinished는 대부분 정상이다(이미지/스크립트 등 애초에
+                # candidate가 아닌 리소스도 requestfinished를 발생시킨다).
+                # candidate URL/resource_type 패턴과 일치하는데도 매핑이 없는
+                # 경우에만 진짜 이상 신호(연결 실패)로 집계한다.
+                try:
+                    unmatched_url = request.url or ""
+                except Exception:
+                    unmatched_url = ""
+                try:
+                    unmatched_resource_type = request.resource_type
+                except Exception:
+                    unmatched_resource_type = ""
+                if is_candidate_response(unmatched_url, unmatched_resource_type):
+                    ctx.unmatched_requestfinished_count += 1
                 return
             if entry["body_snapshot_ready"] or entry["body_snapshot_error_type"]:
                 return
-            try:
-                response = request.response()
-            except Exception as exc:
-                entry["body_snapshot_error_type"] = type(exc).__name__
-                entry["body_snapshot_error_message"] = str(exc)[:200]
-                return
+            # PAGE-300-2B-2D(gpt-5.6-sol 독립 검토 지적, High): request.response()를
+            # 다시 호출하면, 이 request 객체가 (이론상 발생하지 않아야 하지만)
+            # candidate 등록 이후 다른 response를 참조하도록 바뀌었을 경우 이
+            # entry의 메타데이터(url/status 등은 candidate A)와 실제로 snapshot되는
+            # body(response B)가 서로 다른 candidate의 것으로 뒤섞일 수 있다.
+            # entry["response"]는 candidate 등록 시점(response handler)에 이미
+            # 확정된 참조이므로 이를 우선 사용해 정체성을 고정한다 - request.
+            # response()로의 재조회는 entry["response"]가 없는 경우(예: 향후
+            # 다른 등록 경로)에 한해서만 fallback으로 사용한다.
+            response = entry.get("response")
+            if response is None:
+                try:
+                    response = request.response()
+                except Exception as exc:
+                    entry["body_snapshot_error_type"] = type(exc).__name__
+                    entry["body_snapshot_error_message"] = str(exc)[:200]
+                    return
             if response is None:
                 entry["body_snapshot_error_type"] = "NoResponse"
                 entry["body_snapshot_error_message"] = "request.response()가 None을 반환함"
@@ -216,6 +386,14 @@ def _make_request_finished_handler(ctx: _QueryObservationContext):
             # 만으로는 할당 자체를 막지 못한다 - content-length 헤더를 먼저
             # 확인할 수 있으면 body()를 아예 호출하지 않고 조기에 거른다
             # (헤더가 없거나 파싱 불가하면 기존처럼 body() 이후 길이로만 판단).
+            try:
+                entry["content_type"] = response.headers.get("content-type") or ""
+            except Exception:
+                entry["content_type"] = ""
+            try:
+                entry["content_encoding"] = response.headers.get("content-encoding") or ""
+            except Exception:
+                entry["content_encoding"] = ""
             try:
                 content_length_header = response.headers.get("content-length")
             except Exception:
@@ -241,6 +419,16 @@ def _make_request_finished_handler(ctx: _QueryObservationContext):
                     entry["body_snapshot_error_type"] = type(exc2).__name__
                     entry["body_snapshot_error_message"] = str(exc2)[:200]
                     return
+            # PAGE-300-2B-2D §3: 빈 body(0바이트)는 성공이 아니다 - json.loads(b"")는
+            # 항상 실패하므로 JSON decode 실패로 미루지 않고 이 시점에 별도
+            # 오류 타입으로 확정한다(PAGE-300-2B-2C의 "success_count=2인데
+            # total_bytes가 page1 크기만"이던 모순의 유력 원인 - 빈 snapshot이
+            # 성공으로 잘못 집계됐을 가능성).
+            if len(body) == 0:
+                entry["body_snapshot_error_type"] = "EmptyBody"
+                entry["body_snapshot_error_message"] = "response body가 0바이트입니다"
+                entry["body_snapshot_size"] = 0
+                return
             if len(body) > _MAX_CANDIDATE_BODY_BYTES:
                 entry["body_snapshot_error_type"] = "BodyTooLarge"
                 entry["body_snapshot_error_message"] = (
@@ -302,11 +490,15 @@ def _make_request_failed_handler(ctx: _QueryObservationContext):
                     "method": method,
                     "resource_type": resource_type,
                     "status": None,
+                    "content_type": "",
+                    "content_encoding": "",
                     "body_snapshot": None,
                     "body_snapshot_ready": False,
                     "body_snapshot_error_type": "",
                     "body_snapshot_error_message": "",
                     "body_snapshot_size": 0,
+                    "json_top_level_type": "",
+                    "json_decode_error_type": "",
                     "processed": False,
                     "generation": ctx.current_generation,
                 }
@@ -690,6 +882,13 @@ def collect_network_query(
             navigation_error_message = f"{type(exc).__name__}: {exc}"
 
         if navigation_error:
+            # PAGE-300-2B-2D(gpt-5.6-sol 독립 검토 지적, Medium 반영): goto()가
+            # 던진 예외가 timeout이 아닌 navigation_error로 분류되기 전에도,
+            # 리스너는 이미 등록돼 있었으므로 response/requestfinished가 먼저
+            # 도착해 candidate가 생겼을 가능성이 있다(예: 병행 요청이 goto
+            # 완료 전에 이미 끝난 경우) - 이 경우에도 하드코딩된 0/빈 리스트
+            # 대신 실제 ctx 상태를 그대로 요약해 불변식을 유지한다.
+            navigation_error_snapshot_summary = _summarize_candidate_snapshots(ctx.candidates)
             return {
                 "rows": [],
                 "active_captcha_detected": False,
@@ -715,10 +914,15 @@ def collect_network_query(
                 "pagination_unverified_candidate_count": 0,
                 "pagination_drain_item_count": 0,
                 "per_page_diagnostics": [],
-                "body_snapshot_success_count": 0,
-                "body_snapshot_error_count": 0,
-                "body_snapshot_total_bytes": 0,
-                "json_decode_error_count": 0,
+                "body_snapshot_success_count": navigation_error_snapshot_summary["body_snapshot_success_count"],
+                "body_snapshot_error_count": navigation_error_snapshot_summary["body_snapshot_error_count"],
+                "body_snapshot_total_bytes": navigation_error_snapshot_summary["body_snapshot_total_bytes"],
+                "json_decode_error_count": navigation_error_snapshot_summary["json_decode_error_count"],
+                "body_snapshot_empty_count": navigation_error_snapshot_summary["body_snapshot_empty_count"],
+                "snapshot_pending_count": navigation_error_snapshot_summary["snapshot_pending_count"],
+                "unmatched_requestfinished_count": ctx.unmatched_requestfinished_count,
+                "ambiguous_request_mapping_count": ctx.ambiguous_request_mapping_count,
+                "candidate_snapshot_diagnostics": navigation_error_snapshot_summary["candidate_snapshot_diagnostics"],
             }
 
         # PAGE-300-2B-2B: parsed_cache는 candidate 하나당 JSON 파싱을 정확히
@@ -739,12 +943,25 @@ def collect_network_query(
             entry = ctx.candidates[index]
             if entry["body_snapshot_ready"]:
                 try:
-                    text = entry["body_snapshot"].decode("utf-8-sig")
-                    data = json.loads(text)
+                    # PAGE-300-2B-2D §6: decode("utf-8-sig") 고정 대신 bytes를
+                    # json.loads에 직접 전달한다 - CPython 3.6+의 json 모듈은
+                    # bytes/bytearray 입력에 한해 RFC 8259 BOM/UTF-8/UTF-16/
+                    # UTF-32를 자체 감지하므로(json.detect_encoding), UTF-8
+                    # 고정 가정보다 더 넓은 인코딩을 안전하게 처리한다. 압축
+                    # 해제나 charset 추측 재시도는 하지 않는다(§6, 임의 gzip
+                    # 해제 금지).
+                    data = json.loads(entry["body_snapshot"])
                     items = _extract_list_items(data)
                     parsed_cache[index] = {"items": items, "error": False}
-                except Exception:
+                    if isinstance(data, dict):
+                        entry["json_top_level_type"] = "object"
+                    elif isinstance(data, list):
+                        entry["json_top_level_type"] = "array"
+                    else:
+                        entry["json_top_level_type"] = "other"
+                except Exception as exc:
                     parsed_cache[index] = {"items": [], "error": True}
+                    entry["json_decode_error_type"] = type(exc).__name__
                 entry["processed"] = True
                 return parsed_cache[index]
             if entry["body_snapshot_error_type"]:
@@ -1106,6 +1323,12 @@ def collect_network_query(
 
         capped_rows = unique_rows[:per_query_limit] if per_query_limit else unique_rows
 
+        # PAGE-300-2B-2D §3/§4: navigation_error 조기 반환과 동일한 공유 헬퍼로
+        # success/error/pending 3분류 불변식과 candidate_snapshot_diagnostics를
+        # 계산한다(gpt-5.6-sol 독립 검토 Medium 지적 반영 - 두 반환 경로가
+        # 서로 다른 계산 로직을 갖지 않도록 통일).
+        snapshot_summary = _summarize_candidate_snapshots(ctx.candidates, parsed_cache)
+
         return {
             "rows": capped_rows,
             "active_captcha_detected": bool(final_captcha_signal["active_captcha_detected"]),
@@ -1131,13 +1354,15 @@ def collect_network_query(
             "pagination_unverified_candidate_count": pagination_unverified_candidate_count,
             "pagination_drain_item_count": pagination_drain_item_count,
             "per_page_diagnostics": per_page_diagnostics,
-            "body_snapshot_success_count": sum(1 for e in ctx.candidates if e["body_snapshot_ready"]),
-            "body_snapshot_error_count": sum(1 for e in ctx.candidates if not e["body_snapshot_ready"]),
-            "body_snapshot_total_bytes": sum(e["body_snapshot_size"] for e in ctx.candidates if e["body_snapshot_ready"]),
-            "json_decode_error_count": sum(
-                1 for idx, e in enumerate(ctx.candidates)
-                if e["body_snapshot_ready"] and parsed_cache.get(idx, {}).get("error")
-            ),
+            "body_snapshot_success_count": snapshot_summary["body_snapshot_success_count"],
+            "body_snapshot_error_count": snapshot_summary["body_snapshot_error_count"],
+            "body_snapshot_total_bytes": snapshot_summary["body_snapshot_total_bytes"],
+            "json_decode_error_count": snapshot_summary["json_decode_error_count"],
+            "body_snapshot_empty_count": snapshot_summary["body_snapshot_empty_count"],
+            "snapshot_pending_count": snapshot_summary["snapshot_pending_count"],
+            "unmatched_requestfinished_count": ctx.unmatched_requestfinished_count,
+            "ambiguous_request_mapping_count": ctx.ambiguous_request_mapping_count,
+            "candidate_snapshot_diagnostics": snapshot_summary["candidate_snapshot_diagnostics"],
         }
     finally:
         for event, event_handler in (

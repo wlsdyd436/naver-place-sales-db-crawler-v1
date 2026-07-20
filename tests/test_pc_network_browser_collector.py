@@ -571,6 +571,416 @@ def check_json_decode_error_diagnostic_field(reporter: ValidationReporter) -> No
         reporter.fail(f"json_decode_error_count 결과가 예상과 다름: {result}")
 
 
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-2D: PAGE-300-2B-2C의 모순(body_snapshot_success_count=2인데
+# body_snapshot_total_bytes가 실측 page1 크기(약 78KB)뿐이던 현상) 원인을
+# 좁히기 위한 snapshot 무결성/EmptyBody/request-response 연결/JSON bytes
+# decode 신규 검증.
+# ---------------------------------------------------------------------------
+
+
+def check_snapshot_total_bytes_equals_exact_sum_of_two_candidates(reporter: ValidationReporter) -> None:
+    """테스트 1/13: page1(약 78KB급)과 page2(약 414KB급) 두 candidate 모두
+    body snapshot이 성공하면 body_snapshot_total_bytes는 두 body 길이의
+    "정확한 합"이어야 한다(PAGE-300-2B-2C처럼 page1 크기만 남는 결함 회귀 고정)."""
+    body1 = json.dumps({"result": {"place": {"list": [{"id": f"p1_{i}", "name": f"업체{i}"} for i in range(400)]}}}).encode("utf-8")
+    body2 = json.dumps([{"id": f"p2_{i}", "name": f"업체{i}"} for i in range(2200)]).encode("utf-8")
+    response1 = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body1)
+    response2 = FakeResponse("https://pcmap-api.place.naver.com/graphql", 200, "fetch", body=body2)
+    page = FakePage(responses=[response1, response2])
+    result = collect_network_query(page, JOB, 10000, collected_at="2026-07-20")
+    expected_total = len(body1) + len(body2)
+    if (
+        result["body_snapshot_success_count"] == 2
+        and result["body_snapshot_error_count"] == 0
+        and result["body_snapshot_empty_count"] == 0
+        and result["json_decode_error_count"] == 0
+        and result["body_snapshot_total_bytes"] == expected_total
+        and expected_total > 50000
+    ):
+        reporter.pass_(f"snapshot total bytes: 두 candidate({len(body1)}B+{len(body2)}B) 합계 {expected_total}B와 정확히 일치")
+    else:
+        reporter.fail(f"snapshot total bytes 결과가 예상과 다름: expected={expected_total}, result={result}")
+
+
+def check_empty_body_not_counted_as_success(reporter: ValidationReporter) -> None:
+    """테스트 2: page1은 정상, page2는 빈 bytes(0바이트) - EmptyBody로 안전
+    분류되어 성공으로 집계되지 않아야 한다(PAGE-300-2B-2C 모순의 유력 원인)."""
+    ok_response = _place_response([("p1", "업체1")])
+    empty_response = FakeResponse("https://pcmap-api.place.naver.com/graphql", 200, "fetch", body=b"")
+    page = FakePage(responses=[ok_response, empty_response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = {d["sequence_id"]: d for d in result["candidate_snapshot_diagnostics"]}
+    if (
+        result["body_snapshot_success_count"] == 1
+        and result["body_snapshot_empty_count"] == 1
+        and result["body_snapshot_error_count"] == 1
+        and result["body_snapshot_total_bytes"] == len(json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8"))
+        and diag[1]["body_snapshot_state"] == "empty"
+        and diag[1]["body_snapshot_error_type"] == "EmptyBody"
+    ):
+        reporter.pass_("빈 body(0바이트) candidate: EmptyBody로 안전 분류, success_count=1/empty_count=1, total_bytes=page1 크기만")
+    else:
+        reporter.fail(f"빈 body 결과가 예상과 다름: {result}")
+
+
+def check_duplicate_requestfinished_total_bytes_counted_once(reporter: ValidationReporter) -> None:
+    """테스트 3: 동일 requestfinished가 두 번 발생해도 body_snapshot_total_bytes는
+    한 번만 합산돼야 한다(idempotent snapshot의 byte 집계 버전)."""
+    response = _place_response([("p1", "업체1")])
+
+    class DuplicateFinishPage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            for handler in list(self._handlers.get("response", [])):
+                handler(response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)
+
+    page = DuplicateFinishPage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    expected_bytes = len(json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8"))
+    if (
+        response.body_call_count == 1
+        and result["body_snapshot_success_count"] == 1
+        and result["body_snapshot_total_bytes"] == expected_bytes
+    ):
+        reporter.pass_("동일 requestfinished 2회: body_snapshot_total_bytes도 1회만 합산됨(idempotent)")
+    else:
+        reporter.fail(f"중복 requestfinished byte 집계 결과가 예상과 다름: {result}")
+
+
+def check_unmatched_requestfinished_for_never_registered_candidate(reporter: ValidationReporter) -> None:
+    """테스트 4: candidate 패턴과 일치하는 request가 response 이벤트 없이
+    (즉 request_id_to_candidate에 등록된 적 없이) requestfinished만 발생하면
+    unmatched_requestfinished_count가 증가해야 하고, 다른 candidate에 잘못
+    연결되어 snapshot이 저장되면 안 된다."""
+    ok_response = _place_response([("p1", "업체1")])
+    stray_request = FakeRequest("xhr")
+    stray_request.url = CANDIDATE_URL
+
+    class UnmatchedFinishPage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            for handler in list(self._handlers.get("response", [])):
+                handler(ok_response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(ok_response.request)
+            # response 이벤트 없이(candidate로 등록된 적 없이) requestfinished만 발생.
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(stray_request)
+
+    page = UnmatchedFinishPage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        result["unmatched_requestfinished_count"] == 1
+        and result["candidate_response_count"] == 1
+        and result["body_snapshot_success_count"] == 1
+        and len(result["rows"]) == 1
+    ):
+        reporter.pass_("잘못된 request identity: unmatched_requestfinished_count 증가, 다른 candidate에 snapshot 저장 안 됨")
+    else:
+        reporter.fail(f"unmatched requestfinished 결과가 예상과 다름: {result}")
+
+
+def check_ambiguous_request_mapping_not_snapshotted_as_new_success(reporter: ValidationReporter) -> None:
+    """테스트 5: 서로 다른 두 response 이벤트가 같은 request 객체를 공유하면
+    (하나의 request가 둘 이상의 candidate에 연결되려는 상황) 두 번째는
+    ambiguous_request_mapping_count로만 집계되고 별도 성공 candidate로
+    만들어지면 안 된다."""
+    shared_request = FakeRequest("xhr")
+    response_a = FakeResponse.__new__(FakeResponse)
+    response_a.url = CANDIDATE_URL
+    response_a.status = 200
+    response_a.request = shared_request
+    response_a._body = json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8")
+    response_a._body_error = None
+    response_a.body_call_count = 0
+    response_a.simulate_request_failed = False
+    response_a.headers = {}
+    shared_request._response = response_a
+
+    response_b = FakeResponse.__new__(FakeResponse)
+    response_b.url = CANDIDATE_URL
+    response_b.status = 200
+    response_b.request = shared_request
+    response_b._body = json.dumps({"result": {"place": {"list": [{"id": "p2", "name": "업체2"}]}}}).encode("utf-8")
+    response_b._body_error = None
+    response_b.body_call_count = 0
+    response_b.simulate_request_failed = False
+    response_b.headers = {}
+
+    def body_a():
+        response_a.body_call_count += 1
+        return response_a._body
+
+    def body_b():
+        response_b.body_call_count += 1
+        return response_b._body
+
+    response_a.body = body_a
+    response_b.body = body_b
+
+    # gpt-5.6-sol 독립 검토(High) 재현, 2차 검토 지적 반영(순서 강화): A의
+    # requestfinished를 B가 도착하기 "전에" 미리 확정시키면 idempotent guard가
+    # 회귀를 가려버려 수정 전 코드도 우연히 통과할 수 있다(2차 검토 지적) -
+    # 실제 결함을 확실히 재현하려면 response(A) -> response(B, ambiguous 판정) ->
+    # shared_request가 B를 가리키도록 재할당 -> "최초" requestfinished 순서여야
+    # 한다. 이 순서에서 entry(candidate A)는 여전히 A의 body만 snapshot해야
+    # 하며(entry["response"]를 신뢰), request.response()를 다시 조회해 B의
+    # body가 A의 entry에 뒤섞이면 안 된다.
+    class AmbiguousRequestResponseSwapPage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            for handler in list(self._handlers.get("response", [])):
+                handler(response_a)
+            for handler in list(self._handlers.get("response", [])):
+                handler(response_b)
+            # ambiguous 판정(entry 미생성) 이후에야 shared_request가 B를
+            # 가리키도록 재할당하고, 이 시점에 처음이자 유일하게 requestfinished를
+            # 발생시킨다 - entry["response"](=A)를 신뢰하지 않으면 이 시점에
+            # request.response()가 B를 반환해 A entry에 B body가 저장된다.
+            shared_request._response = response_b
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(shared_request)
+
+    page = AmbiguousRequestResponseSwapPage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        result["ambiguous_request_mapping_count"] == 1
+        and result["candidate_response_count"] == 1
+        and len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and response_b.body_call_count == 0
+    ):
+        reporter.pass_("동일 request가 둘 이상의 response에 연결(request.response()가 이후 B로 바뀌어도): entry는 candidate 등록 시점의 response(A)만 snapshot하고 B body는 호출조차 되지 않음")
+    else:
+        reporter.fail(f"ambiguous request mapping 결과가 예상과 다름: {result}, response_b.body_call_count={response_b.body_call_count}")
+
+
+def check_navigation_error_preserves_already_observed_snapshot_invariant(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 독립 검토(Medium) 재현: goto() 도중 candidate response와
+    requestfinished가 먼저 관측된 뒤(예: 병행 요청이 이미 끝남) navigation_error
+    예외가 발생하면, 조기 반환도 하드코딩된 0/빈 리스트 대신 실제 ctx 상태를
+    반영해 success+error+pending == candidate_response_count 불변식을 유지해야
+    한다."""
+    response = _place_response([("p1", "업체1")])
+
+    class NavigationErrorAfterResponsePage(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            for handler in list(self._handlers.get("response", [])):
+                handler(response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)
+            raise Exception("Target page, context or browser has been closed")
+
+    page = NavigationErrorAfterResponsePage()
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    total = result["body_snapshot_success_count"] + result["body_snapshot_error_count"] + result["snapshot_pending_count"]
+    if (
+        result["navigation_error"] is True
+        and result["candidate_response_count"] == 1
+        and result["body_snapshot_success_count"] == 1
+        and total == result["candidate_response_count"] == 1
+        and len(result["candidate_snapshot_diagnostics"]) == 1
+        and result["body_snapshot_total_bytes"] > 0
+        and result["rows"] == []
+    ):
+        reporter.pass_("navigation_error 조기 반환도 이미 관측된 candidate의 snapshot 상태를 정확히 반영(success+error+pending==candidate_response_count 유지, rows는 여전히 빈 리스트)")
+    else:
+        reporter.fail(f"navigation_error 조기 반환 불변식 결과가 예상과 다름: total={total}, result={result}")
+
+
+def check_utf8_json_object_bytes_decoded(reporter: ValidationReporter) -> None:
+    """테스트 6: UTF-8 JSON object(dict top-level) bytes가 정상 decode된다."""
+    response = _place_response([("p1", "업체1")])
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if len(result["rows"]) == 1 and diag["json_top_level_type"] == "object" and diag["json_decode_error_type"] == "":
+        reporter.pass_("UTF-8 JSON object bytes: 정상 decode, json_top_level_type=object")
+    else:
+        reporter.fail(f"UTF-8 object decode 결과가 예상과 다름: {diag}")
+
+
+def check_utf8_json_array_bytes_decoded(reporter: ValidationReporter) -> None:
+    """테스트 7: UTF-8 JSON array(top-level list) bytes가 정상 decode된다."""
+    body = json.dumps([{"id": "p1", "name": "업체1"}]).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and diag["json_top_level_type"] == "array"
+        and diag["json_decode_error_type"] == ""
+    ):
+        reporter.pass_("UTF-8 JSON array bytes: 정상 decode, json_top_level_type=array")
+    else:
+        reporter.fail(f"UTF-8 array decode 결과가 예상과 다름: {diag}, rows={result.get('rows')}")
+
+
+def check_utf8_bom_prefixed_json_decoded(reporter: ValidationReporter) -> None:
+    """테스트 8: UTF-8 BOM이 포함된 JSON bytes도 json.loads(bytes)로 정상 decode된다."""
+    body = b"\xef\xbb\xbf" + json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if len(result["rows"]) == 1 and diag["bom_type"] == "utf8" and diag["json_decode_error_type"] == "":
+        reporter.pass_("UTF-8 BOM 포함 JSON: 정상 decode, bom_type=utf8로 진단됨")
+    else:
+        reporter.fail(f"UTF-8 BOM decode 결과가 예상과 다름: {diag}, rows={result.get('rows')}")
+
+
+def check_utf16_json_bytes_decoded_by_json_loads(reporter: ValidationReporter) -> None:
+    """테스트 9: UTF-16(BOM 포함) 인코딩된 JSON bytes를 json.loads(bytes)가
+    실제로 처리할 수 있는지 검증한다(Python 표준 동작 확인 - fake 없이 실제
+    encode/decode 경로를 그대로 통과시킨다)."""
+    body = json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-16")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "p1"
+        and diag["json_decode_error_type"] == ""
+        and diag["bom_type"] in ("utf16_le", "utf16_be")
+    ):
+        reporter.pass_("UTF-16 JSON bytes: json.loads(bytes)가 BOM을 감지해 정상 decode함(실제 Python 표준 동작 확인)")
+    else:
+        reporter.fail(f"UTF-16 decode 결과가 예상과 다름: {diag}, rows={result.get('rows')}")
+
+
+def check_html_error_body_reports_first_char_and_no_leak(reporter: ValidationReporter) -> None:
+    """테스트 10: HTML 오류 body는 first_non_whitespace_character='<'로
+    진단되고 JSON decode 실패로 안전 처리되며 원문이 노출되지 않아야 한다."""
+    html_marker = "고유HTML마커QWE"
+    body = f"<html><body>{html_marker}</body></html>".encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    leaked = html_marker in json.dumps(result["candidate_snapshot_diagnostics"])
+    if (
+        diag["first_non_whitespace_character"] == "<"
+        and diag["json_decode_error_type"] != ""
+        and result["json_decode_error_count"] == 1
+        and not leaked
+    ):
+        reporter.pass_("HTML 오류 body: first_non_whitespace_character='<', json decode 실패, 원문 미노출")
+    else:
+        reporter.fail(f"HTML 오류 body 결과가 예상과 다름: {diag}, leaked={leaked}")
+
+
+def check_gzip_magic_body_no_decompression_attempted(reporter: ValidationReporter) -> None:
+    """테스트 11: gzip magic bytes(\\x1f\\x8b)로 시작하는 body는
+    compression_magic='gzip'으로만 진단되고, 임의 압축 해제를 시도하지
+    않으므로 json decode는 실패해야 한다."""
+    body = b"\x1f\x8b" + b"\x00" * 20
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        diag["compression_magic"] == "gzip"
+        and diag["json_decode_error_type"] != ""
+        and result["json_decode_error_count"] == 1
+        and result["rows"] == []
+    ):
+        reporter.pass_("gzip magic body: compression_magic=gzip으로만 진단, 임의 압축 해제 없이 json decode 실패로 안전 처리")
+    else:
+        reporter.fail(f"gzip magic body 결과가 예상과 다름: {diag}")
+
+
+def check_zero_length_body_skips_json_loads(reporter: ValidationReporter) -> None:
+    """테스트 12: 0바이트 body는 EmptyBody로 즉시 확정되며, json.loads가
+    호출되지 않으므로 json_decode_error_type이 채워지지 않아야 한다(decode
+    시도 자체가 없었다는 증거 - 이미 EmptyBody 원인으로 확정됐기 때문)."""
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"")
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        diag["body_snapshot_state"] == "empty"
+        and diag["body_snapshot_error_type"] == "EmptyBody"
+        and diag["json_decode_error_type"] == ""
+        and result["json_decode_error_count"] == 0
+        and result["body_snapshot_empty_count"] == 1
+    ):
+        reporter.pass_("zero-length body: EmptyBody로 즉시 확정, json.loads 호출 없음(json_decode_error_type 미기록)")
+    else:
+        reporter.fail(f"zero-length body 결과가 예상과 다름: {diag}, result={result}")
+
+
+def check_snapshot_invariant_success_error_pending_equals_candidate_count(reporter: ValidationReporter) -> None:
+    """테스트 13(불변식): body_snapshot_success_count + body_snapshot_error_count
+    + snapshot_pending_count는 candidate_response_count와 정확히 일치해야 한다."""
+    ok_response = _place_response([("p1", "업체1")])
+    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
+    empty_response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"")
+    page = FakePage(responses=[ok_response, broken, empty_response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    total = result["body_snapshot_success_count"] + result["body_snapshot_error_count"] + result["snapshot_pending_count"]
+    if total == result["candidate_response_count"] == 3:
+        reporter.pass_("snapshot 불변식: success+error+pending == candidate_response_count(3) 정확히 성립")
+    else:
+        reporter.fail(f"snapshot 불변식 결과가 예상과 다름: total={total}, result={result}")
+
+
+def check_candidate_diagnostics_no_business_data_leak(reporter: ValidationReporter) -> None:
+    """테스트 14: candidate_snapshot_diagnostics는 raw body, 업체명, 주소,
+    전화번호를 전혀 포함하지 않아야 한다(size/타입/enum 라벨만 허용)."""
+    marker_name = "고유업체진단마커"
+    marker_address = "고유주소진단마커"
+    marker_tel = "010-9999-8888"
+    response = FakeResponse(
+        CANDIDATE_URL, 200, "xhr",
+        body=json.dumps({
+            "result": {"place": {"list": [
+                {"id": "p1", "name": marker_name, "roadAddress": marker_address, "tel": marker_tel}
+            ]}}
+        }).encode("utf-8"),
+    )
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    serialized = json.dumps(result["candidate_snapshot_diagnostics"])
+    leaked = any(marker in serialized for marker in (marker_name, marker_address, marker_tel))
+    if not leaked:
+        reporter.pass_("candidate diagnostics: raw body/업체명/주소/전화번호 미노출(size/enum 라벨만 포함)")
+    else:
+        reporter.fail("candidate diagnostics 검증 실패: 업체 원문 데이터가 진단 필드에 노출됨")
+
+
+def check_graphql_top_level_list_synthetic_body_end_to_end(reporter: ValidationReporter) -> None:
+    """테스트 15: GraphQL top-level list(placeholder 중첩 구조) synthetic
+    body가 snapshot -> json.loads(bytes) -> 기존 parser(_extract_list_items/
+    _find_item_lists) 전체 경로를 통과해 rows로 정상 매핑돼야 한다."""
+    # placeholder 키(실제 미확인 GraphQL 스키마를 추정하지 않음) - top-level list
+    # 안에 중첩된 업체 배열을 휴리스틱 재귀로 찾아내는 계약만 검증한다
+    # (tests/test_pc_network_list_scraper.py의 TOP_LEVEL_ARRAY_FIXTURE와 동일한 패턴).
+    synthetic_graphql_array = [
+        {"wrapper_unconfirmed": {"nested_unconfirmed": [
+            {"id": f"g{i}", "name": f"업체g{i}"} for i in range(3)
+        ]}}
+    ]
+    body = json.dumps(synthetic_graphql_array).encode("utf-8")
+    response = FakeResponse("https://pcmap-api.place.naver.com/graphql", 200, "fetch", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    ids = sorted(row.get("place_id") for row in result["rows"])
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if ids == ["g0", "g1", "g2"] and diag["json_top_level_type"] == "array" and result["parse_error_count"] == 0:
+        reporter.pass_("GraphQL top-level list synthetic body: snapshot->json.loads(bytes)->기존 parser 경로로 rows 정상 추출")
+    else:
+        reporter.fail(f"GraphQL top-level list 결과가 예상과 다름: ids={ids}, diag={diag}")
+
+
 class FakeLifecyclePage:
     """NetworkBrowserCollector 생명주기 테스트용 fake page. 실제 응답 관찰은
     하지 않고, close() 호출 여부/횟수와 best-effort 예외 처리만 검증한다."""
@@ -988,6 +1398,24 @@ def main() -> int:
     check_no_raw_body_leak_in_result(reporter)
     check_unicode_json_bytes_decoded_correctly(reporter)
     check_json_decode_error_diagnostic_field(reporter)
+
+    check_snapshot_total_bytes_equals_exact_sum_of_two_candidates(reporter)
+    check_empty_body_not_counted_as_success(reporter)
+    check_duplicate_requestfinished_total_bytes_counted_once(reporter)
+    check_unmatched_requestfinished_for_never_registered_candidate(reporter)
+    check_ambiguous_request_mapping_not_snapshotted_as_new_success(reporter)
+    check_navigation_error_preserves_already_observed_snapshot_invariant(reporter)
+    check_utf8_json_object_bytes_decoded(reporter)
+    check_utf8_json_array_bytes_decoded(reporter)
+    check_utf8_bom_prefixed_json_decoded(reporter)
+    check_utf16_json_bytes_decoded_by_json_loads(reporter)
+    check_html_error_body_reports_first_char_and_no_leak(reporter)
+    check_gzip_magic_body_no_decompression_attempted(reporter)
+    check_zero_length_body_skips_json_loads(reporter)
+    check_snapshot_invariant_success_error_pending_equals_candidate_count(reporter)
+    check_candidate_diagnostics_no_business_data_leak(reporter)
+    check_graphql_top_level_list_synthetic_body_end_to_end(reporter)
+
     check_session_and_context_shared_across_jobs(reporter)
     check_new_page_created_per_query(reporter)
     check_each_page_closed_exactly_once(reporter)

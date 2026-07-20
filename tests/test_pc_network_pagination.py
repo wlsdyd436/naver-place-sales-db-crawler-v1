@@ -725,11 +725,19 @@ def check_no_additional_goto_for_pagination(reporter: ValidationReporter) -> Non
 
 
 def check_no_graphql_variables_in_source(reporter: ValidationReporter) -> None:
+    """이 검증의 실제 목적은 "GraphQL 응답의 operationName/variables.input.page 같은
+    쿼리 스키마 내부 구조를 페이지네이션 결정(다음 페이지 여부/진행)에 사용하지
+    않는다"는 것이다 - 바로 아래 hasNext/nextCursor 검증과 쌍을 이루는 원래 의도다.
+    PAGE-300-2B-2D에서 candidate_snapshot_diagnostics에 URL 형태를 사람이 읽기 좋게
+    구분하는 순수 진단 라벨(url_kind="graphql_candidate")을 추가했는데, 이는
+    페이지네이션 결정 로직과 무관한 문자열 분류일 뿐이므로 이전처럼 소스 전체에서
+    "graphql"이라는 부분 문자열 자체를 금지하면 오탐이 발생한다 - 실제 의존
+    지표(operationName/variables.input.page/variables["input"])만 정밀하게 검사한다."""
     source = inspect.getsource(network_browser_collector)
-    forbidden = ["graphql", "operationname", "variables.input.page", "variables[\"input\"]"]
+    forbidden = ["operationname", "variables.input.page", "variables[\"input\"]"]
     found = [token for token in forbidden if token in source.lower()]
     if not found:
-        reporter.pass_("network_browser_collector.py 소스에 GraphQL operationName/variables 의존 코드 없음")
+        reporter.pass_("network_browser_collector.py 소스에 GraphQL operationName/variables.input.page 의존 코드 없음(url_kind 진단 라벨은 페이지네이션 결정과 무관)")
     else:
         reporter.fail(f"금지된 GraphQL 관련 토큰이 소스에 존재함: {found}")
 
@@ -1213,6 +1221,73 @@ def check_page2_late_body_access_would_fail_but_snapshot_cached(reporter: Valida
         reporter.fail(f"page2 body 지연 재접근 결과가 예상과 다름: call_count={call_state['count']}, result={result}")
 
 
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-2D 테스트 16: PAGE-300-2B-2C 실제 live 재현(page1 약 78KB/page2
+# 약 414KB, 둘 다 requestfinished, page2 rows 추출 성공, final rows=40,
+# total bytes가 page1 크기만으로 나오지 않음을 확인).
+# ---------------------------------------------------------------------------
+
+
+def _padded_item(item_id: str, name: str, padding_bytes: int) -> dict:
+    """실제 PAGE-300-2B-2A 실측(page1 약 78KB/page2 약 414KB)과 유사한 body
+    크기를 item 개수는 20개로 유지한 채(진단 계약상 raw_item_count가 실제
+    관측치와 일치해야 함) padding 필드로만 재현한다 - 원본 GraphQL 응답
+    구조를 추정하지 않고, 순수하게 byte 크기만 부풀리는 목적의 필드다."""
+    return {"id": item_id, "name": name, "_padding": "x" * padding_bytes}
+
+
+def check_page300_2b2c_reproduction_total_bytes_not_page1_only(reporter: ValidationReporter) -> None:
+    """PAGE-300-2B-2C 실제 결과(body_snapshot_success_count=2인데
+    body_snapshot_total_bytes=78,973로 page1 실측 크기(약 78KB)뿐이던 모순)를
+    합성 데이터로 재현한다. page1(약 78KB급, allSearch 스타일 object)과
+    page2(약 414KB급, graphql 스타일 top-level array)를 각각 20개 아이템으로
+    구성하고, 두 candidate 모두 requestfinished로 body snapshot이 성공하면
+    body_snapshot_total_bytes가 두 body 길이의 실제 합(page1 크기만이 아님)과
+    일치해야 하고, page2 rows도 정상 추출되어 최종 40건이 나와야 한다."""
+    page1_items = [{"id": f"p1_{i}", "name": f"업체p1_{i}", "_padding": "x" * 3800} for i in range(20)]
+    page1_body = json.dumps({"result": {"place": {"list": page1_items}}}).encode("utf-8")
+    page1_response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=page1_body)
+
+    page2_items = [_padded_item(f"p2_{i}", f"업체p2_{i}", 20600) for i in range(20)]
+    page2_body = json.dumps(page2_items).encode("utf-8")
+    page2_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 200, "fetch", body=page2_body
+    )
+
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_response)]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, page1_response)],
+        click_plan={"2": page2_spec},
+    )
+    result = collect_network_query(page, JOB, 40, collected_at="2026-07-20")
+
+    expected_total_bytes = len(page1_body) + len(page2_body)
+    page1_only_bytes = len(page1_body)
+    ok = (
+        result["pagination_page_count"] == 2
+        and result["pagination_click_count"] == 1
+        and result["body_snapshot_success_count"] == 2
+        and result["body_snapshot_error_count"] == 0
+        and result["body_snapshot_empty_count"] == 0
+        and result["json_decode_error_count"] == 0
+        and result["body_snapshot_total_bytes"] == expected_total_bytes
+        and result["body_snapshot_total_bytes"] != page1_only_bytes
+        and len(page1_body) > 50000
+        and len(page2_body) > 250000
+        and len(result["rows"]) == 40
+        and result["per_page_diagnostics"][0]["raw_item_count"] == 20
+        and result["per_page_diagnostics"][1]["raw_item_count"] == 20
+    )
+    if ok:
+        reporter.pass_(
+            f"PAGE-300-2B-2C 재현: page1({len(page1_body)}B)+page2({len(page2_body)}B) 두 candidate 모두 snapshot 성공, "
+            f"total_bytes={result['body_snapshot_total_bytes']}(page1 크기만이 아님), page2 rows 추출 성공, final rows=40"
+        )
+    else:
+        reporter.fail(f"PAGE-300-2B-2C 재현 결과가 예상과 다름: expected_total={expected_total_bytes}, result={result}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -1252,6 +1327,7 @@ def main() -> int:
     check_dom_shows_transition_but_no_response_not_treated_as_success(reporter)
     check_dom_transition_explicit_mismatch_preserves_partial_rows(reporter)
     check_page2_late_body_access_would_fail_but_snapshot_cached(reporter)
+    check_page300_2b2c_reproduction_total_bytes_not_page1_only(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

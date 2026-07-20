@@ -5914,3 +5914,179 @@ gzip/brotli 등 압축 해제 여부, 빈 응답, truncated body 등 가능성) 
 no-live 정밀 진단이 먼저 필요하다 - 구체적인 디코드 실패 타입/메시지를
 production 반환 계약에 임시로(진단 전용, capture_artifacts 유사 패턴) 노출하는
 별도 진단 단계를 검토해야 한다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-2D snapshot 무결성 및 JSON bytes decode 보완
+
+## PAGE-300-2B-2C FAIL 결과(재확인)
+- body_snapshot_success_count=2, body_snapshot_error_count=0,
+  body_snapshot_total_bytes=78,973, json_decode_error_count=1
+- 이전 독립 실측(PAGE-300-2B-2A): page1 body 약 78KB, page2 body 약 414KB
+- 모순: 성공이 2건이면 합계가 약 490KB여야 하는데 실제로는 page1 크기만
+  남았다 - 인코딩/압축/parser/GraphQL 배열 문제로 성급히 단정하지 않고
+  snapshot 계약 자체(빈 body 처리, request-response 연결, JSON decode 방식)를
+  먼저 no-live로 정밀 진단했다.
+
+## 원인 후보와 채택된 수정
+1. **성공 기준이 빈 bytes도 허용**(채택 - 가장 유력한 원인): requestfinished가
+   `response.body()`로 0바이트를 받아도 기존 코드는 `body_snapshot_ready=True`로
+   표시했다 - JSON 파싱 단계(`json.loads(b"")`)에서만 실패로 드러나
+   `json_decode_error_count`에는 잡혔지만 `body_snapshot_total_bytes`에는 0을
+   더해 "성공인데 크기 기여가 없는" 상태를 만들 수 있었다.
+2. request-response 연결 실패 가능성: 구조상 이론적으로 가능성이 낮다고
+   판단했으나 진단 카운터(§3)를 신설해 실측 가능하게 만들었다.
+3. 동일 candidate 중복 성공 집계, JSON decode 방식(UTF-8 고정 가정) 문제:
+   기존 idempotent guard로 이미 방지되고 있었으나(회귀 테스트로 재확인),
+   decode 방식은 §6대로 `json.loads(bytes)` 직접 호출로 교체했다.
+
+## snapshot 성공 기준 변경 / EmptyBody 처리
+`body_snapshot_size == 0`이면 `body_snapshot_ready=False`,
+`body_snapshot_error_type="EmptyBody"`로 확정하고 반환하며(BodyTooLarge 검사
+이전에 수행), 성공으로 집계하지 않는다. 신규 진단 필드
+`body_snapshot_empty_count`가 이 하위 집합만 별도로 센다.
+
+## snapshot 3분류 불변식
+`body_snapshot_success_count + body_snapshot_error_count +
+snapshot_pending_count == candidate_response_count`가 항상 성립하도록
+`_summarize_candidate_snapshots()` 단일 헬퍼로 계산을 통일했다(정상 반환과
+navigation_error 조기 반환이 모두 이 헬퍼를 공유 - gpt-5.6-sol 1차 검토
+Medium 지적으로 navigation_error 조기 반환이 하드코딩된 0/빈 리스트를
+반환하던 문제를 발견해 반영했다).
+
+## request-response 연결 무결성
+- `unmatched_requestfinished_count`: candidate로 등록된 적 없는데 candidate
+  URL/resource_type 패턴과 일치하는 request의 requestfinished가 발생하면
+  증가(정상 비-candidate 리소스는 증가시키지 않음).
+- `ambiguous_request_mapping_count`: 같은 request가 이미 candidate로
+  등록됐는데 다른 response가 또 그 request를 참조하려 하면 기존 방어적
+  dedupe 분기에서 증가시키고 두 번째 entry는 만들지 않는다.
+- **gpt-5.6-sol 1차 검토 High 지적(수정 반영)**: `handle_request_finished`가
+  `request.response()`를 재조회하면, ambiguous 상황에서 request가 나중에
+  다른 response를 가리키도록 바뀌면 entry A의 메타데이터에 entry B의 body가
+  섞일 수 있었다. candidate 등록 시점에 확정한 `entry["response"]`를
+  우선 사용하도록 수정(`entry["response"]`가 없을 때만 `request.response()`
+  fallback).
+
+## JSON decode 방식 / BOM·배열 처리
+`entry["body_snapshot"].decode("utf-8-sig")` 후 `json.loads(str)` 대신
+`json.loads(bytes)`를 직접 호출한다(CPython 표준 json 모듈이 bytes 입력에
+한해 BOM/UTF-8/UTF-16/UTF-32를 자체 감지). 압축 해제나 charset 추측 재시도는
+전혀 하지 않는다. `_classify_bom`/`_classify_compression_magic`/
+`_classify_first_non_whitespace_character` 3개 순수 분류 헬퍼를 추가해
+candidate별 안전 진단(원본 없이 enum 라벨만)을 제공한다.
+
+## body 크기 상한의 정확한 의미
+기존 `_MAX_CANDIDATE_BODY_BYTES`(2MB)는 그대로 유지하되 의미를 명확히 했다:
+snapshot 장기 보존 상한이자 명백히 큰 Content-Length의 사전 차단일 뿐,
+모든 네트워크 body 할당을 완전히 막는 절대 hard cap은 아니다(content-length
+헤더가 없거나 부정확하면 여전히 body() 호출 후 실제 길이로만 판단).
+
+## 신규 진단 필드
+`body_snapshot_empty_count`, `snapshot_pending_count`,
+`unmatched_requestfinished_count`, `ambiguous_request_mapping_count`,
+`candidate_snapshot_diagnostics`(candidate별 sequence_id/url_kind/method/
+resource_type/status/content_type/content_encoding/body_snapshot_state/
+body_snapshot_size/body_snapshot_error_type/json_top_level_type/
+json_decode_error_type/first_non_whitespace_character/bom_type/
+compression_magic/processed/generation - 원본 body·업체 row는 절대 포함하지
+않음). 기존 필드(`body_snapshot_success_count`/`body_snapshot_error_count`/
+`body_snapshot_total_bytes`/`json_decode_error_count`)는 그대로 유지하되
+navigation_error 조기 반환을 포함한 모든 반환 경로에 동일하게 포함된다.
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`(핵심 변경 - EmptyBody 판정, 3분류
+  불변식 헬퍼, request-response 연결 진단, json.loads(bytes) 전환, candidate
+  안전 진단 헬퍼 3종)
+- `tests/test_pc_network_browser_collector.py`(신규 케이스 17건 추가 - snapshot
+  total bytes 정확한 합, EmptyBody 미집계, 중복 requestfinished byte 1회 집계,
+  unmatched/ambiguous request identity 2건, UTF-8 object/array/BOM/UTF-16 decode
+  4건, HTML/gzip/zero-length body 3건, 3분류 불변식, candidate diagnostics
+  원문 미노출, GraphQL top-level list end-to-end, navigation_error 불변식 유지)
+- `tests/test_pc_network_pagination.py`(PAGE-300-2B-2C 실제 결과 재현 케이스
+  1건 추가 - page1 약 78KB/page2 약 414KB 합성 body로 total_bytes 정확한 합과
+  final rows=40 확인, 기존 GraphQL 소스 정적 검사 테스트를 "graphql" 부분
+  문자열 하드코딩 자체가 아니라 실제 의존 지표(operationName/
+  variables.input.page/variables["input"])만 검사하도록 정밀화 - url_kind
+  진단 라벨이 페이지네이션 결정 로직과 무관함을 명시)
+- `src/pc/network_list_scraper.py`: 무수정(이번 단계 범위 아님 - 오류가
+  parser 전달 이전 단계에서 발생했기 때문)
+- `tests/test_pc_network_adaptive_settle.py`: 무수정(회귀만 재확인)
+
+## GPT-5.6-Sol(Codex MCP, read-only) 독립 검토 결과(2라운드)
+1차 검토: High 1건(ambiguous request에서 request.response() 재조회 시 다른
+candidate의 body가 섞일 수 있음 - 실제 재현 시나리오 제시), Medium 1건
+(navigation_error 조기 반환이 3분류 불변식을 위반할 수 있음 - 재현 시나리오
+제시). 둘 다 수정 반영(위 절 참고) + 재현 회귀 테스트 2건 추가.
+2차 재검토: 두 수정 모두 원래 결함을 실제로 해결했으며 새로운 회귀 없음을
+확인. 다만 ambiguous 재현 테스트의 이벤트 순서가 "A를 먼저 requestfinished로
+확정 후 B로 교체"라 idempotent guard 때문에 수정 전 코드도 우연히 통과할
+수 있었다는 테스트 강도 지적을 받아, "response(A) → response(B, ambiguous
+판정) → request가 B를 가리키도록 재할당 → 최초이자 유일한 requestfinished"
+순서로 재구성해 실제 결함을 확실히 가둔다(최종 재실행도 PASS).
+
+## 남은 위험(문서화된 알려진 한계)
+- unmatched_requestfinished_count/ambiguous_request_mapping_count는 정상
+  Playwright 계약상 거의 발생하지 않아야 하는 방어적 진단이다 - 실제 live에서
+  0이 아니게 나오면 그 자체로 이례적 신호이므로 즉시 조사 대상으로 다뤄야
+  한다(정상으로 넘기면 안 됨).
+- EmptyBody 판정은 "0바이트"만 잡는다 - PAGE-300-2B-2C의 78,973바이트가
+  실제로 EmptyBody 때문이었는지, 아니면 여전히 다른 원인(예: 압축된 매우 작은
+  응답, 트렁케이션)이었는지는 이번 no-live 수정만으로는 확정할 수 없다 -
+  다음 실제 live(PAGE-300-2B-2E)에서 candidate_snapshot_diagnostics를 직접
+  관찰해야 확정된다.
+- gpt-5.6-sol이 지적한 대로 `body_snapshot_success_count`는 body 확보
+  성공일 뿐 업체 목록 추출 성공을 의미하지 않는다 - 다음 live 판정은 반드시
+  `success+error+pending==candidate_response_count`,
+  `unmatched_requestfinished_count==0`, `ambiguous_request_mapping_count==0`,
+  `snapshot_pending_count==0`, `body_snapshot_empty_count==0`,
+  `json_decode_error_count==0`, page2 candidate의 `processed=True` 및 실제
+  신규 row 존재를 모두 함께 확인해야 한다(gpt-5.6-sol 권고 그대로 채택).
+
+## 신규 테스트 요약
+- pagination: 35 → 36 PASS(PAGE-300-2B-2C 재현 1건 추가).
+- browser_collector: 34 → 50 PASS(신규 17건: snapshot 무결성/EmptyBody/
+  request-response 연결/JSON decode/BOM/압축/불변식/진단 누출 방지/GraphQL
+  top-level list/navigation_error 불변식).
+- adaptive_settle: 18 PASS(무수정, 회귀만 재확인).
+- network_product_integration_no_live/pipeline/ui_network_start/
+  ui_network_wiring: 무수정, 회귀만 재확인(각 11/12/15/19 PASS).
+- network_list_scraper(7개 회귀 파일에는 미포함, 별도 확인): 42 PASS(무수정).
+
+## 전체 관련 회귀 파일별 PASS/FAIL(최종)
+| 파일 | PASS | FAIL |
+|---|---|---|
+| tests/test_pc_network_pagination.py | 36 | 0 |
+| tests/test_pc_network_browser_collector.py | 50 | 0 |
+| tests/test_pc_network_adaptive_settle.py | 18 | 0 |
+| tests/test_network_product_integration_no_live.py | 11 | 0 |
+| tests/test_pc_network_pipeline.py | 12 | 0 |
+| tests/test_ui_network_start.py | 15 | 0 |
+| tests/test_ui_network_wiring.py | 19 | 0 |
+| tests/test_pc_network_list_scraper.py(별도) | 42 | 0 |
+
+**7개 회귀 파일 합계: 161건, FAIL 0.**(작업 전 144건 대비 신규 17건).
+list_scraper 별도 42건 포함 전체 203건, FAIL 0.
+
+## 실제 live 미실행 확인
+확인됨 - BrowserSession/Playwright 실행, 네이버 접속, page 2 실제 클릭,
+40건/100건 재실행, Excel 생성 전부 하지 않았다. Fake 객체와 synthetic bytes만
+사용했다.
+
+## Git 상태
+`git status --short`/`git diff --name-status` 기준 변경 파일은
+`src/pc/network_browser_collector.py`, `tests/test_pc_network_browser_
+collector.py`, `tests/test_pc_network_pagination.py` + 이 `PROJECT_STATE.md`
+append뿐이다(작업 허용 범위와 정확히 일치). `src/pc/network_list_scraper.py`,
+`src/pc/network_pipeline.py`, `src/pc/browser_session.py`, `src/ui.py`,
+`src/exporter.py`, `app.py`, `tests/test_pc_network_adaptive_settle.py`,
+`tests/test_network_product_integration_no_live.py`,
+`tests/test_pc_network_list_scraper.py` 전부 무수정. git add/commit/push/
+reset/checkout/restore 전부 수행하지 않았다.
+
+## PAGE-300-2B-2E 진입 가능 여부
+gpt-5.6-sol 2차 재검토 PASS - no-live 수정과 회귀만으로는 "실제 page2 body가
+더 이상 EmptyBody가 아님"을 증명할 수 없으므로(§남은 위험), PAGE-300-2B-2E
+(동일 검색어, page 1→2, per_query_limit=40/target_count=40, 실제 live 정확히
+1회, retry 0, page 3 접근 금지)로 진입해 candidate_snapshot_diagnostics를
+직접 관찰하는 것을 권장한다. 이번 단계에서 채택한 최소 PASS 조건(위 "남은
+위험" 절 그대로)을 하나라도 어기면 조건부 PASS가 아니라 즉시 HOLD/FAIL로
+판정한다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
