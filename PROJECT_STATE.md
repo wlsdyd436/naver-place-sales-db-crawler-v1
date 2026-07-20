@@ -5604,3 +5604,23 @@ HOLD - PAGE-300-2B-3(page 1~5 최대 100건 live)로 임의 진입하지 않는�
 이번 parse error의 원인 분석(응답 구조 재확인, 재현성 확인)이 먼저
 필요하다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
 과거 기록은 수정하거나 삭제하지 않았다.
+# 2026-07-20 PAGE-300-2B-2A page 2 응답 파싱 실패 원인 진단
+
+- PAGE-300-2B-2 HOLD 원인: page 2 candidate response의 JSON 파싱 에러(1건)로 목표(40건) 달성 실패
+- 기준 커밋: 5b7f9ca
+- 실행 횟수: 1회 (Playwright 프로브 스크립트)
+- 검색어: "서울특별시 강동구 카페"
+- page 2 클릭 수: 1회
+- CAPTCHA·429 여부: 발생 안 함
+- page 1·2 response 비교:
+  - page 1: URL llSearch, Resource xhr, JSON Object({), Top key ["result"]
+  - page 2: URL graphql, Resource etch, JSON Array([), Top key ["<list>"]
+- 정확한 parse 예외: Playwright 내부 예외 playwright._impl._errors.Error: response.json: Response body is unavailable (지연 접근에 따른 바디 해제 문제)
+- matcher 판정: 정상. _CANDIDATE_URL_TOKENS에 llSearch와 graphql 모두 포함되어 올바르게 후보로 선택함.
+- parser 판정: 보류. JSON 바디를 읽지 못해 _extract_list_items 동작 여부를 검증할 수 없음. (단, _find_item_lists의 휴리스틱 로직이 GraphQL 배열 구조에 대응될 가능성 있음)
+- lifecycle 판정: 비정상. esponse.json()을 Settle 루프에서 지연 호출하여 바디 접근 시 예외 발생.
+- A/B/C/D/E 최종 분류: B. response body lifecycle 문제
+- production·tests 무수정: 확인
+- Git 상태: Clean (작업 전 기준)
+- 추천 다음 단계: Claude Sonnet 5를 사용하여 response 수신 직후 바디를 미리 복사해두거나, 파싱 시점을 앞당기도록 
+etwork_browser_collector.py 수정 (PAGE-300-2B-3)
