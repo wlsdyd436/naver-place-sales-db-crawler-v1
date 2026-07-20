@@ -6350,3 +6350,151 @@ FULL PASS - work order §18에 따라 다음 단계는 **PAGE-300-3(page 6~10 �
 order §18 명시 주의사항). 이번 보고에서 page 6 이상 접근이나 300건 live를
 임의로 시작하지 않고 여기서 중단한다. 과거 PAGE 기록은 수정하거나 삭제하지
 않았다.
+
+# 2026-07-20 PAGE-300-2B-4 현재 최대 5페이지로 실제 300건 검증
+
+## 전략 배경
+PAGE-300-2B-3에서 page 2·3이 각각 70건의 신규 unique를 반환한 사실이
+확인되어(20+70+70+70+70=300 산술적으로 가능), page 6 이후 "다음 페이지 번호
+묶음" 전환을 구현하기 전에 현재 page 1~5 제한 구현만으로 실제 300건 도달
+가능성을 먼저 검증했다. production 코드는 이번 단계에서 전혀 수정하지
+않았다.
+
+## 기준/실행 정보
+- 기준 커밋: `a364c2ed4ccd3e19119a74db72813bd9fa38d428`(검증: 제한
+  페이지네이션으로 단일 조합 100건 달성) - 작업 전/후 동일, 변경 없음
+- 검색어: "서울특별시 강동구 카페", query_count=1, per_query_limit=300,
+  target_count=300, settle_ms=5000
+- 실행 마커: `scratchpad/arch300_page300_probe/results/page300_2b4/
+  PAGE300_2B4_LIVE_STARTED.marker`(원자 생성, 삭제하지 않음)
+- live 실행 횟수: 정확히 1회(20260720_181208), retry_count=0, 재실행 없음
+- production `_MAX_PAGINATION_PAGES`: override 없이 production 기본값 5
+  그대로 사용(live_override_used=False, 실행 전/후 동일하게 5)
+
+## harness/사전 검증
+- harness: `scratchpad/arch300_page300_probe/page300_2b4_live_300.py`(신규,
+  page300_2b3_live_100.py 구조를 재사용하되 그 harness는 수정하지 않음)
+- 컴파일: `py_compile` PASS
+- `--check-config`: PASS(production max pages=5, override 없음, 신규 진단
+  필드 10개 확인, 네이버 접속 없음, 마커 미생성)
+- 사전 회귀(7개 파일): 전부 PASS, 합계 161건(직전 기록과 동일)
+- parser 회귀: 42 PASS(동일)
+
+## 실제 접근 페이지 / CAPTCHA·429
+- 실제 접근 페이지: **page 1, 2**(page 3 클릭 시도 중 타임아웃으로 중단 -
+  page 3 이상 실제 도달 없음, page 6 접근도 당연히 없음)
+- CAPTCHA(active_captcha_detected): **False**(마커 미감지)
+- HTTP 429(status_429_seen): **False**
+- HTTP **405**(candidate 응답 status): page 2로 확정된 candidate가 405
+  Method Not Allowed 응답을 받음(§상세 원인 참고 - 429/CAPTCHA 마커와는
+  다른 신호)
+
+## candidate/snapshot 결과
+- candidate_response_count=2, body_snapshot_success_count=2, error/empty/
+  pending=0/0/0
+- snapshot_classified_count(2) == candidate_response_count(2): 일치
+- body_snapshot_total_bytes=78,994 == success_diag_bytes(78,994): 일치
+  (snapshot 자체의 성공/바이트 계산 메커니즘은 여전히 정확 - PAGE-300-2B-2D
+  수정의 회귀 아님)
+- **json_decode_error_count=1, parse_error_count=1**(work order §16 FAIL
+  조건에 직접 해당)
+- unmatched_requestfinished_count=0, ambiguous_request_mapping_count=0(
+  request-response 연결 자체는 정상)
+
+## candidate별 안전 진단(상세 원인)
+- generation 1(all_search, GET, xhr, status=200): success, size=78,411,
+  object, "{", processed=true, json_decode_error_type=""(page 1 정상)
+- generation 2(graphql_candidate, POST, fetch, **status=405**,
+  content_type=`text/html`): body_snapshot_state=**success**(body snapshot
+  자체는 583바이트를 정상 확보함 - EmptyBody 아님), json_top_level_type=""
+  (JSON이 아니므로 미확정), **json_decode_error_type="JSONDecodeError"**,
+  first_non_whitespace_character="**<**"(HTML 오류 페이지), processed=true
+- 즉 이 candidate는 "정상 GraphQL JSON 응답"이 아니라 **네이버 서버가
+  405(Method Not Allowed)와 함께 HTML 오류 페이지를 반환한 응답**이었다 -
+  snapshot 무결성(PAGE-300-2B-2D)은 이 상황을 정확히 감지해 EmptyBody가
+  아닌 "성공적으로 확보한 HTML 오류 body"로 정직하게 분류했고, JSON decode
+  실패로 올바르게 이어졌다(거짓 성공 없음).
+
+## pagination 진단 / 클릭 실패 상세
+- pagination_click_count=1(page 2로의 클릭은 성공 - DOM class diff로
+  page_count도 2로 확정됨), pagination_page_count=2
+- pagination_stop_reason=**pagination_click_error**
+- pagination_error_message: `TimeoutError: Locator.click: Timeout 30000ms
+  exceeded. ... waiting for get_by_role("button", name="3", exact=True)
+  ... locator resolved to <a href="#" role="button" ...`(page 3 버튼
+  locator는 정상적으로 resolve됐으나 실제 click() 자체가 30초 타임아웃 -
+  버튼이 존재/활성 상태였음에도 클릭이 완료되지 않음, 즉 포인터 이벤트가
+  가로채였거나 페이지가 이전 405 오류 이후 비정상 상태였을 가능성)
+- per_page_diagnostics: page 1(raw=20, new_unique=20) / page 2(raw=0,
+  new_unique=0 - 405 오류로 인해 실제 데이터 없음)
+- pagination_unverified_candidate_count=0, pagination_drain_item_count=0
+
+## 페이지별 raw·최종 기여 / 누적 unique
+- page 1: raw=20, parser_new_unique=20, 최종 기여=20, 누적=20
+- page 2: raw=0, parser_new_unique=0, 최종 기여=0, 누적=20(변화 없음)
+- total_cross_page_duplicate_count=0, total_unique_id_count=20,
+  target_reached_page=None(300건 목표에 도달하지 못함)
+
+## final_count / stop reason
+- before_trim_count=20, final_count=**20**(300건과 크게 미달)
+- orchestrator stop_reason=`queue_exhausted`(단일 job이 정상 종료 처리됐으나
+  navigation_error가 아닌 정상 반환 경로로 빠져나온 것 - collect_query
+  자체는 pagination_click_error를 rows=20과 함께 정상적으로 반환했으므로
+  orchestrator는 이를 CAPTCHA/429/target_reached가 아닌 큐 소진으로 처리)
+- pagination_stop_reason=`pagination_click_error`(예상된 300건 목표
+  page_reached도, per_query_limit_reached도 아님)
+
+## exporter/Excel
+- exporter_call_count=1(정확히 1회), 부분 rows(20건) 정상 저장(기존 계약
+  유지 - 손실 없음)
+- Excel 헤더 11개, MERGED_COLUMNS와 완전 일치, data_row_count=20(final_count와
+  일치), 새로오픈여부 전부 빈칸, 업체명 빈값 0건, 내부 필드 미노출
+
+## 성능
+session_ready_seconds=0.61, orchestrator_seconds=42.18(page 3 클릭 30초
+타임아웃이 대부분을 차지), session_teardown_seconds=0.22,
+export_seconds=0.02, total_wall_seconds=43.04
+
+## 최종 판정: **FAIL**
+work order §16 FAIL 조건 중 `json_decode_error_present=true`와
+`parse_error_present=true`가 True(나머지 FAIL 조건은 전부 False - EmptyBody/
+snapshot error/unmatched/ambiguous/page6 접근/override 사용/exporter
+중복/부분 rows 손실/두 번째 live/production 수정/Git 작업 전부 없음).
+snapshot 무결성 메커니즘(PAGE-300-2B-2D) 자체는 이번에도 정확히 동작했다 -
+405 HTML 오류 응답을 "성공적으로 확보한 비-JSON body"로 정직하게 분류하고
+거짓 성공을 만들지 않았다. FAIL의 근본 원인은 **네이버 서버가 두 번째
+페이지 요청에 405를 반환**했고, 그 직후 **page 3 버튼 클릭이 30초간 완료되지
+않은** 것이다.
+
+## production·tests 무수정 확인
+`git status --short`/`git diff --name-status`/`git diff --stat`/
+`git diff --check` 전부 출력 없음(live 실행 직후 기준, PROJECT_STATE.md
+append 전) - `scratchpad/`는 `.gitignore`로 전체 무시되므로 신규 harness/
+결과 JSON/Excel/마커도 tracked 변경으로 나타나지 않는다. 이 PROJECT_STATE.md
+append만이 유일한 tracked 변경이다. `src/*`, `tests/*` 전부 무수정.
+
+## 결과 파일(Git 미포함)
+- `scratchpad/arch300_page300_probe/results/page300_2b4/
+  PAGE300_2B4_LIVE_STARTED.marker`
+- `scratchpad/arch300_page300_probe/results/page300_2b4/
+  page300_2b4_live_300_result_20260720_181208.json`
+- `scratchpad/arch300_page300_probe/results/page300_2b4/
+  page300_2b4_live_300_20260720_181208.xlsx`
+
+## 남은 위험 / 다음 단계
+FAIL - work order §16에 따라 **production 수정 전 재-live 금지**.
+- 405 응답과 뒤이은 click 30초 타임아웃이 우연한 일시적 네트워크 이슈였는지,
+  아니면 네이버가 짧은 시간 내 반복 페이지 요청(첫 40건 검증 이후 두 번째
+  live로 100건, 그리고 오늘 세 번째로 300건 시도)을 감지해 완만하게
+  제한하기 시작한 신호인지 이번 결과만으로는 확정할 수 없다 - CAPTCHA
+  마커는 감지되지 않았고(active_captcha_detected=False) 429도 아니었으므로
+  (status_429_seen=False), 기존 안전 중단 로직이 다루도록 설계된 신호와는
+  다른 종류의 서버 반응이다.
+- 원인 확정 전 production의 CAPTCHA/429 감지 로직에 405를 추가하는 등의
+  수정을 시도하지 않는다(work order 범위 밖).
+- 다음 단계는 **no-live 정밀 진단**(원인 확정)이어야 하며, 확정 전에는
+  page 6 전환 구현이나 추가 300건 live를 시작하지 않는다. 반대 검토 AI
+  (GPT-5.6-Sol)의 사용 조건("page 4·5의 DOM 전환, candidate response 또는
+  GraphQL 구조가 기존 page 2·3과 다르고 저장된 진단만으로 원인을 확정할 수
+  없을 때")에 해당할 가능성이 있으므로, 다음 단계에서 독립 검토 활용을
+  검토할 수 있다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
