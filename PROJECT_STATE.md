@@ -6846,3 +6846,74 @@ PAGE-300-2B-4A(스크롤~클릭 공백 포함 전체 안전 중단 계약)가 �
 최대 page 5, 실제 live 정확히 1회, retry 0)로 진입하는 것을 권장한다. page 6
 전환 구현은 아직 진행하지 않는다. 과거 PAGE 기록은 수정하거나 삭제하지
 않았다.
+
+# 2026-07-20 PAGE-300-2B-4B 현재 최대 5페이지 300건 one-shot 재검증
+
+## 기준 커밋/실행 조건
+기준 커밋 `5043e0d`(안정화: candidate HTTP 오류와 클릭 직전 안전 중단),
+`git status --short` clean 확인 후 진입. query="서울특별시 강동구 카페"
+1개, per_query_limit=target_count=300, settle_ms=5000, retry_count=0,
+allowed_pages=[1,2,3,4,5], production `_MAX_PAGINATION_PAGES=5`(override
+없음). 신규 harness `scratchpad/arch300_page300_probe/page300_2b4b_live_
+300.py`는 기존 page300_2b4_live_300.py 패턴을 재사용하되 candidate_http_
+error_count/candidate_non_json_count/candidate_http_status_counts/
+candidate_processing_error_count 신규 진단 필드 기록과 work order의
+FULL PASS/CONDITIONAL PASS/SAFE-STOP PASS·CAPABILITY HOLD/FAIL 4갈래
+판정 로직만 추가했다. production/tests는 이 harness에서 수정하지 않았다.
+
+## 마커
+`PAGE300_2B4B_LIVE_STARTED.marker`를 `open(path, "x")`로 원자 생성,
+`--check-config`는 마커를 만들지 않고 존재 여부만 확인(False). 기존 live
+세션 재사용 없이 신규 BrowserSession 1개로 실행했다.
+
+## 핵심 사전 회귀
+tests/test_pc_network_pagination.py 48 PASS,
+tests/test_pc_network_browser_collector.py 58 PASS,
+tests/test_network_product_integration_no_live.py 11 PASS,
+tests/test_pc_network_list_scraper.py 42 PASS. 합계 159건, FAIL 0.
+
+## live 1회 결과
+정확히 1회 실행(20260720_195127). page 1 candidate(HTTP 200, JSON object,
+78475B)에서 raw=20/unique=20 정상 수집. page 2로 DOM 전환은 확정됐으나
+page 2 candidate가 **HTTP 405 + text/html(583B)**로 응답 - candidate_
+http_error_count=1, candidate_http_status_counts={'405':1}, non_json=0,
+body_snapshot_error_count=0, json_decode_error_count=0(비교: 이전 PAGE-
+300-2B-4 live에서 관측된 것과 동일한 405 패턴이 이번에도 재현됨). 이 오류를
+감지한 즉시 **page 3 click은 시도되지 않고** 안전 중단됐다(pagination_
+click_count=1, pagination_page_count=2, pagination_stop_reason=
+candidate_http_error, parse_error_count=1). CAPTCHA/HTTP 429/timeout/
+navigation_error 전부 없음. unmatched·ambiguous 0. snapshot 불변식
+(success+error+pending==candidate_response_count, success bytes 합계
+일치) 성립. page1의 rows(20건)는 그대로 보존됐다(place_id 중복 0).
+
+## Excel/성능
+exporter 정확히 1회 호출, 통합_결과 20행·11열, place URL 중복 0, 업체명
+공란 0, 새로오픈여부 전부 공란, 내부 필드(place_id 등) 미노출. 전체 wall
+11.12초(세션 준비 0.62s + 수집 10.26s + 종료 0.21s + export 0.02s).
+
+## 판정
+**SAFE-STOP PASS / CAPABILITY HOLD**. candidate HTTP 오류 발생 후 안전
+중단 계약(추가 click 없음/retry 없음/우회 없음/부분 rows 보존/exporter
+1회/HTML 원문 미노출/무한 대기 없음/production max pages 유지) 전부
+충족을 확인했다 - 이는 안전 기능의 성공이며 단순 FAIL로 기록하지 않는다.
+다만 page 2 자체가 서버 측 HTTP 405로 즉시 종료됐기 때문에, 현재 page
+1~5 구현으로 실제 300건에 도달할 수 있는지는 이번 live로 확정되지
+못했다(CAPABILITY HOLD). 동일 live를 이 harness에서 즉시 반복하지
+않았다.
+
+## 남은 위험/다음 단계
+동일 검색어의 page 2 GraphQL 요청이 PAGE-300-2B-4와 PAGE-300-2B-4B 두
+차례 live에서 모두 HTTP 405를 반환했다 - 우연한 1회성 장애인지 이 검색
+조합/페이지에 지속되는 서버 측 특성인지는 이번 세션 범위 밖이며, 재시도나
+우회 없이 그대로 기록한다. 300건 능력 검증은 여전히 HOLD 상태로 남고,
+재검증 여부와 시점은 사용자 판단에 맡긴다. page 6 이상 "다음 페이지 번호
+그룹" 전환 설계는 착수하지 않았다.
+
+## 무수정/Git 확인
+production(`src/*`)·`tests/*`·`app.py`·`README.md`·기존 harness·기존
+marker/JSON/Excel 전부 무수정. 신규 파일은 `scratchpad/arch300_page300_
+probe/page300_2b4b_live_300.py`와 그 결과물(`scratchpad/.../results/
+page300_2b4b/`)뿐이며 scratchpad는 `.gitignore` 대상이라 tracked 변경은
+`PROJECT_STATE.md` 뿐이다. `git status --short`/`git diff --name-status`
+확인 결과 이 append 외 tracked 변경 없음. git add/commit/push/reset/
+restore/checkout 전부 수행하지 않았다.
