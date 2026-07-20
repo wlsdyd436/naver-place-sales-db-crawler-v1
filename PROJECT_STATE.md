@@ -6090,3 +6090,147 @@ gpt-5.6-sol 2차 재검토 PASS - no-live 수정과 회귀만으로는 "실제 p
 직접 관찰하는 것을 권장한다. 이번 단계에서 채택한 최소 PASS 조건(위 "남은
 위험" 절 그대로)을 하나라도 어기면 조건부 PASS가 아니라 즉시 HOLD/FAIL로
 판정한다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-2E snapshot 무결성 적용 후 실제 40건 재검증
+
+## 기준/실행 정보
+- 기준 커밋: `dd2ec0fa98a48e679a7f155737a41a93d4992976`(개선: Network snapshot
+  무결성과 JSON bytes 진단 보강) - 작업 전/후 동일, 변경 없음
+- 검색어: "서울특별시 강동구 카페", query_count=1, per_query_limit=40,
+  target_count=40, settle_ms=5000
+- 실행 마커: `scratchpad/arch300_page300_probe/results/page300_2b2e/
+  PAGE300_2B2E_LIVE_STARTED.marker`(harness 시작 직전 `open(..., "x")`로 원자
+  생성, 삭제하지 않음)
+- live 실행 횟수: 정확히 1회(20260720_171700), retry_count=0, 재실행 없음
+- 허용 페이지: [1, 2] - page 3 이상 접근 없음(`pagination_page_count=2`)
+- production `_MAX_PAGINATION_PAGES` 원래 값 5 → live override 2 → 실행 후
+  복구 값 5(`production_max_pages_after_restore=5`, 복구 성공)
+
+## harness/사전 검증
+- harness: `scratchpad/arch300_page300_probe/page300_2b2e_live_40.py`(신규,
+  page300_2b2c_live_40.py의 구조를 재사용하되 그 harness는 수정하지 않음.
+  collector/parser/snapshot 로직은 harness에서 재구현하지 않고 production
+  함수만 호출)
+- 컴파일: `py_compile` PASS
+- `--check-config`: PASS(네이버 접속 없음, 실행 마커 미생성 확인, PAGE-300-2B-2D
+  신규 진단 필드 10개 소스 존재 정적 확인)
+- 사전 회귀(7개 파일): 전부 PASS, 합계 161건(직전 PAGE-300-2B-2D 기록과 동일,
+  회귀 없음) - `test_pc_network_pagination.py` 36 / `test_pc_network_browser_
+  collector.py` 50 / `test_pc_network_adaptive_settle.py` 18 /
+  `test_network_product_integration_no_live.py` 11 / `test_pc_network_
+  pipeline.py` 12 / `test_ui_network_start.py` 15 / `test_ui_network_
+  wiring.py` 19
+- parser 회귀: `test_pc_network_list_scraper.py` 42 PASS(직전 기록과 동일)
+
+## CAPTCHA·429·오류
+전부 발생 안 함(False) - active_captcha_detected=False, status_429_seen=False,
+timeout=False, navigation_error=False
+
+## candidate/pagination 결과
+- candidate_response_count=2, pagination_click_count=1, pagination_page_count=2,
+  pagination_stop_reason=`per_query_limit_reached`(2B-2C와 달리 max_page_count_
+  reached가 아니라 목표 도달로 정상 종료 - page2가 신규 데이터를 실제로
+  반환했다는 뜻)
+- per_page_diagnostics:
+  - page 1: candidate=1, raw_item_count=20, new_unique_count=20, duplicate=0,
+    adaptive_wait_ms=1800
+  - page 2: candidate=1, raw_item_count=**70**, new_unique_count=70,
+    duplicate=0, adaptive_wait_ms=5000(hard cap 전체 대기)
+- pagination_unverified_candidate_count=0, pagination_drain_item_count=0
+- pagination_raw_item_count=90, pagination_unique_item_count=90(local, cap
+  전) → per_query_limit=40으로 capped_rows=40, stop_reason=`target_reached`
+  (orchestrator 레벨)
+
+## snapshot success/error/empty/pending 및 불변식(이번 검증의 핵심)
+- body_snapshot_success_count=2, body_snapshot_error_count=0,
+  **body_snapshot_empty_count=0**, snapshot_pending_count=0
+- unmatched_requestfinished_count=0, ambiguous_request_mapping_count=0
+- json_decode_error_count=0, parse_error_count=0
+- snapshot_classified_count(2) == candidate_response_count(2): **일치**
+- body_snapshot_total_bytes=490,963
+- success_diag_bytes(candidate_snapshot_diagnostics의 success entry
+  body_snapshot_size 합) = 490,963 → **body_snapshot_total_bytes와 정확히
+  일치**(PAGE-300-2B-2C의 "success=2인데 total_bytes가 page1 크기만"이던
+  모순이 완전히 해소됨)
+
+## page 1·2 candidate 안전 진단
+- page 1(all_search, GET, xhr, status=200, content_type=`application/
+  json;charset=UTF-8`, content_encoding=`gzip`): body_snapshot_state=success,
+  body_snapshot_size=**78,390**(PAGE-300-2B-2A 실측 약 78KB와 일치),
+  json_top_level_type=object, first_non_whitespace_character="{",
+  bom_type=none, compression_magic=none, processed=true
+- page 2(graphql_candidate, POST, fetch, status=200, content_type=
+  `application/json; charset=utf-8`, content_encoding=`br`):
+  body_snapshot_state=success, body_snapshot_size=**412,573**(PAGE-300-2B-2A
+  실측 약 414KB와 일치), json_top_level_type=array,
+  first_non_whitespace_character="[", bom_type=none, compression_magic=none,
+  processed=true
+- content_encoding이 gzip/br로 찍혀 있지만 body_snapshot_size/first_
+  non_whitespace_character/json_top_level_type이 이미 압축 해제된 JSON
+  본문 기준이다 - Playwright의 `response.body()`가 압축 해제된 bytes를
+  반환하므로(브라우저 레벨에서 이미 decompress됨) production이 별도로
+  압축을 해제할 필요가 없었다는 것이 실측으로 확인됐다(§6 "임의 압축 해제
+  금지" 원칙과 무관 - 애초에 압축된 채로 온 적이 없었다).
+- candidate가 정확히 2개(all_search 1개, graphql_candidate 1개, 그 외 0개) -
+  목록 response 구분 불명확 문제 없음
+
+## page별 ID 교차 검증
+- page1_unique_id_count=20, page2_unique_id_count=20, page_intersection_
+  count=0, total_unique_id_count=40(최종 export된 40행 기준 - page2의 실제
+  raw/unique는 70건이었으나 per_query_limit=40 cap으로 인해 최종 40행 중
+  page2 기여분은 20행만 반영됨, 참고 진단이며 production 계약 검증의 유일한
+  근거는 아님)
+
+## exporter/Excel
+- exporter_call_count=1(정확히 1회)
+- Excel 헤더 11개, MERGED_COLUMNS와 완전 일치, data_row_count=40(final_count와
+  일치), 새로오픈여부 전부 빈칸, 업체명 빈값 0건, 플레이스 URL 중복 0건,
+  내부 필드(place_id/source_city/source_district/source_subregion/
+  source_layer/source_query) 미노출
+
+## 성능
+session_ready_seconds=0.98, orchestrator_seconds=10.84,
+session_teardown_seconds=0.27, export_seconds=0.02, total_wall_seconds=12.12
+
+## 최종 판정: **FULL PASS**
+work order §13 FULL PASS 조건 전부 충족: fail_conditions 전부 False,
+hold_conditions 전부 False, full_pass_conditions 25개 전부 True(candidate_
+response_count>=2, snapshot 불변식 성립, error/empty/pending/unmatched/
+ambiguous/json_decode_error/parse_error 전부 0, page1 candidate
+success+object+processed, page2 candidate success+array+processed,
+pagination_click_count=1, pagination_page_count=2, stop_reason=
+per_query_limit_reached, final_count=40, exporter 1회, Excel 40행/11열,
+새로오픈 전부 빈칸, 내부 필드 미노출, production max pages 5 복구,
+unverified=0, page 교집합=0).
+
+PAGE-300-2B-2D에서 채택한 EmptyBody 판정/3분류 불변식/request-response
+연결 진단/json.loads(bytes) 전환이 실제 live에서 page 2 GraphQL candidate의
+body snapshot을 정상 확보(412,573바이트, 0바이트 아님)하고 JSON decode도
+정상 성공시켜, PAGE-300-2B-2C의 "success=2인데 total_bytes 불일치·decode
+실패" 모순이 실제로 해소됐음을 확인했다.
+
+## production·tests 무수정 확인
+`git status --short`/`git diff --name-status`/`git diff --stat`/
+`git diff --check` 전부 출력 없음(live 실행 직후 기준, PROJECT_STATE.md
+append 전) - `scratchpad/`는 `.gitignore`로 전체 무시되므로 신규 harness/
+결과 JSON/Excel/마커도 tracked 변경으로 나타나지 않는다. 이 PROJECT_STATE.md
+append만이 유일한 tracked 변경이다. `src/*`, `tests/*`, `app.py`, `src/ui.py`,
+`src/exporter.py`, `src/pc/network_pipeline.py`, `src/pc/browser_session.py`
+전부 무수정.
+
+## 결과 파일(Git 미포함)
+- `scratchpad/arch300_page300_probe/results/page300_2b2e/
+  PAGE300_2B2E_LIVE_STARTED.marker`
+- `scratchpad/arch300_page300_probe/results/page300_2b2e/
+  page300_2b2e_live_40_result_20260720_171700.json`
+- `scratchpad/arch300_page300_probe/results/page300_2b2e/
+  page300_2b2e_live_40_20260720_171700.xlsx`
+
+## 다음 단계
+FULL PASS - work order §17에 따라 PAGE-300-2B-3(실제 page 1~5 최대 100건
+live) 진입을 다음 단계로 권장한다. 단, 이번 실측에서 page 2가 raw 70건(20건이
+아님)을 반환한 사실이 새로 확인됐으므로, 100건 단계에서는 페이지당 정확히
+20건이라는 가정 없이 실제 unique 누적 추이를 있는 그대로 관찰해야 한다(다음
+단계의 참고 사항으로 기록, 이번 단계 판정을 바꾸지 않음). 100건 live를 이번
+보고에서 임의로 시작하지 않고 중단한다. 과거 PAGE 기록은 수정하거나
+삭제하지 않았다.
