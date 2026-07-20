@@ -5497,4 +5497,110 @@ HOLD 사유(page identity 검증 불가) 없이 PASS 판정 - 문서화된 구�
 오귀속 리스크가 실측으로 확인되는 신호), pagination_unverified_candidate_count/
 pagination_drain_item_count 값(0이 아니면 이번 세션에서 다루지 못한
 실제 경로가 발동한 것이므로 즉시 원인 분석 필요).
+
+# 2026-07-20 PAGE-300-2B-2 실제 page 1→2 40건 live 검증
+
+## 기준/실행 조건
+- 기준 커밋: `2c8fb071eb043cede6047f1c906ae8b14798713b`(PAGE-300-2B-1-FIX 내용
+  포함, 작업 시작 시점 `git status --short` clean 확인).
+- 고정 검색어: "서울특별시 강동구 카페"(query_count=1).
+- per_query_limit=40, target_count=40, settle_ms=5000(production 기본값,
+  harness가 변경하지 않음).
+- 실행 마커: `scratchpad/arch300_page300_probe/results/page300_2b2/PAGE300_2B2_LIVE_STARTED.marker`
+  (`open(path, "x")`로 원자적 생성, 실행 후 삭제하지 않음).
+- production `_MAX_PAGINATION_PAGES` 원래 값=5, live 실행 구간에서만
+  harness가 모듈 속성을 2로 override, try/finally로 복구 확인(복구 후
+  값=5). production 소스 파일(`src/pc/network_browser_collector.py`)은
+  수정하지 않았다 - harness가 import한 모듈 객체의 속성만 런타임에 바꿨다.
+- 사전 회귀: 지정된 7개 테스트 파일 전부 PASS, 합계 **129 PASS / 0 FAIL**
+  (기존 계약과 동일).
+- 실제 브라우저 세션 1개, retry=0, 접근 페이지 1~2만(page 3 접근 없음),
+  CAPTCHA·HTTP 429 없음, live 실행 정확히 1회.
+
+## 실행 결과(요약)
+- `pagination_click_count=1`, `pagination_page_count=2` - page 2 버튼
+  클릭이 성공했고 DOM class diff로 page 2 전환 identity가 확정됐다(§6
+  계약대로 클릭 성공만으로 page_count를 올리지 않았고, 이번 실행에서는
+  실제로 identity까지 확인됨).
+- `pagination_stop_reason="max_page_count_reached"`(override로 2페이지
+  상한에 도달, per_query_limit(40)에는 도달하지 못함).
+- page별 진단(`per_page_diagnostics`):
+  - page 1: candidate=1, raw_item_count=20, new_unique_count=20,
+    duplicate_count=0.
+  - page 2: candidate=1, raw_item_count=0, new_unique_count=0,
+    duplicate_count=0.
+- `pagination_raw_item_count=20`, `pagination_unique_item_count=20`,
+  `pagination_duplicate_count=0` - page별 합계와 정확히 일치(raw
+  20+0=20, unique 20+0=20, dup 0+0=0).
+- `pagination_unverified_candidate_count=0`,
+  `pagination_drain_item_count=0` - 응답 귀속 미확인/지연 drain 경로는
+  이번 실행에서 발동하지 않았다.
+- **`parse_error_count=1`**(전체 쿼리 기준) - page 1이 raw 20건을 정상
+  파싱했으므로, 이 1건의 parse error는 page 2 harvest 단계에서 발생한
+  것으로 추정된다(candidate_response_count 총합=2, page 1 harvest에서
+  이미 1개 소비, page 2 클릭 후 도착한 나머지 1개가 harvest되며
+  `_ensure_parsed`가 실패 처리됨 - production 코드가 raw_item_count=0으로
+  안전하게 흡수). 정확한 예외 메시지는 production이 개수만 반환하고
+  원문을 노출하지 않아 이번 harness로는 확인할 수 없었다.
+- place_id 기준 페이지 간 검증: page 1 고유 ID 20개, page 2 고유 ID
+  0개, 교집합 0, 전체 고유 20개 - 페이지 간 중복 오염 신호는 없음.
+- `before_trim_count=20`, `final_count=20`, `stop_reason="queue_exhausted"`.
+- CAPTCHA·429·navigation_error·timeout 전부 없음.
+- exporter 호출 1회, Excel 저장 성공(`exported=True`).
+- Excel 검증: 통합_결과 11개 열(순서 포함 `MERGED_COLUMNS`와 완전 일치),
+  데이터 행 20(=final_count), 새로오픈여부 20개 전부 빈칸, place_id 등
+  내부 필드 노출 없음, 플레이스 URL 중복 0, 원본_모바일/원본_PC 시트는
+  헤더만 존재(정상 - Network 경로는 두 시트에 데이터가 없다).
+- 성능: session_ready=1.93s, orchestrator=10.87s, teardown=0.24s,
+  export=0.02s, 전체=13.07s.
+- production `_MAX_PAGINATION_PAGES` 실행 후 복구값=5(override=2, 원래=5
+  그대로 복구 확인).
+
+## 판정: HOLD
+완전 PASS 요건(§10) 중 `parse error 0`이 충족되지 않아(parse_error_count=1)
+"완전 PASS"로 보고하지 않았다. 동시에 "조건부 PASS"(page 2가 실제
+마지막 페이지이거나 raw item이 20건 미만이라는 근거가 있고 오류가
+없는 경우)로도 분류하지 않았다 - page 2 응답이 도착은 했으나(candidate
+확인됨) 그 응답의 파싱이 실패했으므로, "네이버 자체에 page 2 데이터가
+없다"와 "파싱 실패로 실제 데이터를 놓쳤다"를 현재 증거만으로 구분할 수
+없기 때문이다(증거 없는 추측 금지 원칙). `pagination_unverified_candidate_count`/
+`pagination_drain_item_count`는 둘 다 0으로, work order가 우려한
+"지연 응답 오귀속" 경로는 발동하지 않은 것으로 확인됐다 - 이번 HOLD의
+원인은 응답 귀속 문제가 아니라 **page 2 응답의 JSON/아이템 파싱
+실패** 쪽으로 좁혀진다.
+
+## page 2 추가 수집 기능 성공 여부(분리 판단)
+- 클릭·DOM 전환 확인 자체: **성공**(pagination_click_count=1,
+  pagination_page_count=2, class diff 기반 identity 확정).
+- page 2 데이터 반영: **실패**(parse_error_count=1로 인해 raw_item_count=0,
+  최종 rows에 page 2 데이터가 전혀 포함되지 않음).
+- 고정 검색어 40건 목표 달성 여부: **미달**(final_count=20/40).
+
+## 남은 위험/다음 필요 분석
+- 이번 1회 실행만으로는 parse error의 정확한 원인(응답 구조 변경,
+  일시적 네트워크 이슈, list 응답 스키마 예외 케이스 등)을 특정할 수
+  없다 - production이 예외 메시지를 diagnostics로 노출하지 않기 때문.
+- 재실행은 work order상 금지되어 있어 이번 세션에서는 추가 시도를
+  하지 않았다.
+- 다음 단계 전에 이 parse error의 재현성(같은 검색어로 다시 발생하는지,
+  다른 검색어에서도 발생하는지)과 원인을 먼저 분석해야 한다 - 원인
+  분석 없이 PAGE-300-2B-3(page 1~5 최대 100건)으로 진입하지 않는다.
+
+## production·tests 무수정 확인
+`git status --short` clean, `git diff --name-status`/`--stat`/`--check`
+전부 출력 없음(변경 없음) - `src/*`, `tests/*` 무수정 확인됨. 수정은
+`scratchpad/arch300_page300_probe/page300_2b2_live_40.py`(신규 harness)와
+이 `PROJECT_STATE.md` append뿐이다. git add/commit/push/reset/checkout/
+restore 전부 수행하지 않았다.
+
+## 결과 파일
+- `scratchpad/arch300_page300_probe/results/page300_2b2/PAGE300_2B2_LIVE_STARTED.marker`
+- `scratchpad/arch300_page300_probe/results/page300_2b2/page300_2b2_live_40_result_20260720_111254.json`
+- `scratchpad/arch300_page300_probe/results/page300_2b2/page300_2b2_live_40_20260720_111254.xlsx`
+(전부 Git 미포함)
+
+## 다음 단계
+HOLD - PAGE-300-2B-3(page 1~5 최대 100건 live)로 임의 진입하지 않는다.
+이번 parse error의 원인 분석(응답 구조 재확인, 재현성 확인)이 먼저
+필요하다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
 과거 기록은 수정하거나 삭제하지 않았다.
