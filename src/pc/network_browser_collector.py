@@ -92,6 +92,31 @@ _BOM_PREFIXES = (
 )
 _WHITESPACE_BYTES = (0x20, 0x09, 0x0A, 0x0D, 0x00)
 
+# PAGE-300-2B-4A §5: candidate 처리 단계에서 확인된 candidate_error_type을
+# pagination_stop_reason으로 변환하는 우선순위 매핑(dict 순서 = 우선순위 -
+# HTTP 오류가 non-JSON 판정보다 먼저 확인된다). 이 두 값은 JSON decode를
+# "시도조차 하지 않은" 경우에만 설정되므로(§3/§4), 기존 candidate_json_decode_
+# error(실제 decode를 시도했다가 실패한 경우)와 명확히 구분된다.
+_CANDIDATE_ERROR_STOP_REASONS = {
+    "CandidateHttpError": "candidate_http_error",
+    "NonJsonCandidateBody": "candidate_non_json_response",
+}
+
+
+def _classify_candidate_http_status(status) -> str:
+    """PAGE-300-2B-4A(gpt-5.6-sol 독립 검토 지적, Medium 반영): status는
+    response 이벤트 시점에 이미 알 수 있으므로, body snapshot 성공/실패와
+    무관하게 candidate 등록 즉시 분류한다 - 이전에는 이 판정이
+    body_snapshot_ready 분기 안에만 있어 EmptyBody/BodyTooLarge/RequestFailed
+    등으로 snapshot 자체가 실패한 non-2xx candidate(예: HTTP 429 + 빈 body)가
+    candidate_http_error_count/candidate_http_status_counts에 전혀 반영되지
+    않았다(안전성에는 영향 없음 - candidate_snapshot_error로 이미 pagination이
+    중단되지만, 진단 완전성이 떨어졌다). status가 None이면(예: response를
+    전혀 받지 못한 requestfailed 전용 synthetic entry) 빈 문자열을 반환한다."""
+    if status is not None and not (200 <= status <= 299):
+        return "CandidateHttpError"
+    return ""
+
 
 def _url_kind(url: str) -> str:
     """candidate URL을 안전한 enum 라벨로만 요약한다(전체 query string은
@@ -181,6 +206,7 @@ def _summarize_candidate_snapshots(candidates: list, parsed_cache: dict | None =
             "body_snapshot_error_type": e["body_snapshot_error_type"],
             "json_top_level_type": e.get("json_top_level_type", ""),
             "json_decode_error_type": e.get("json_decode_error_type", ""),
+            "candidate_error_type": e.get("candidate_error_type", ""),
             "first_non_whitespace_character": (
                 _classify_first_non_whitespace_character(body) if body is not None else "empty"
             ),
@@ -194,9 +220,31 @@ def _summarize_candidate_snapshots(candidates: list, parsed_cache: dict | None =
     pending = sum(1 for e in candidates if (not e["body_snapshot_ready"]) and not e["body_snapshot_error_type"])
     empty = sum(1 for e in candidates if e["body_snapshot_error_type"] == "EmptyBody")
     total_bytes = sum(e["body_snapshot_size"] for e in candidates if e["body_snapshot_ready"])
+    # PAGE-300-2B-4A: json_decode_error_count는 "실제로 json.loads를 시도했다가
+    # 실패한" candidate만 세야 한다(§3 "JSON decode 자체를 시도하지 않았기
+    # 때문이다") - candidate_http_error/non_json 판정은 json.loads 호출 이전에
+    # 이미 반환되므로 entry["json_decode_error_type"]이 채워지지 않는다. 기존
+    # parsed_cache 기반 계산은 "harvest 단계에서 error로 확정된 모든 candidate"를
+    # 뭉뚱그렸으므로(§candidate_error_type 도입 전에는 둘이 같았음), 이제는
+    # json_decode_error_type 필드 자체로 정밀하게 판별한다.
     json_decode_error_count = sum(
-        1 for idx, e in enumerate(candidates)
-        if e["body_snapshot_ready"] and parsed_cache.get(idx, {}).get("error")
+        1 for e in candidates
+        if e["body_snapshot_ready"] and e.get("json_decode_error_type")
+    )
+    candidate_http_error_count = sum(1 for e in candidates if e.get("candidate_error_type") == "CandidateHttpError")
+    candidate_non_json_count = sum(1 for e in candidates if e.get("candidate_error_type") == "NonJsonCandidateBody")
+    candidate_http_status_counts: dict = {}
+    for e in candidates:
+        if e.get("candidate_error_type") == "CandidateHttpError":
+            key = str(e.get("status"))
+            candidate_http_status_counts[key] = candidate_http_status_counts.get(key, 0) + 1
+    # PAGE-300-2B-4A §7: "정상적으로 성공(snapshot 성공 + candidate/decode 오류
+    # 전혀 없음)"이 아닌 candidate를 전부 합산한 총계 - snapshot 자체가 실패/
+    # 미확정인 경우(error/empty/pending)와 snapshot은 성공했지만 candidate
+    # HTTP 오류/non-JSON/decode 실패인 경우를 모두 포함한다.
+    candidate_processing_error_count = sum(
+        1 for e in candidates
+        if (not e["body_snapshot_ready"]) or e.get("candidate_error_type") or e.get("json_decode_error_type")
     )
     return {
         "body_snapshot_success_count": success,
@@ -205,6 +253,10 @@ def _summarize_candidate_snapshots(candidates: list, parsed_cache: dict | None =
         "body_snapshot_empty_count": empty,
         "body_snapshot_total_bytes": total_bytes,
         "json_decode_error_count": json_decode_error_count,
+        "candidate_http_error_count": candidate_http_error_count,
+        "candidate_non_json_count": candidate_non_json_count,
+        "candidate_http_status_counts": candidate_http_status_counts,
+        "candidate_processing_error_count": candidate_processing_error_count,
         "candidate_snapshot_diagnostics": diagnostics,
     }
 
@@ -317,6 +369,7 @@ def _make_response_handler(ctx: _QueryObservationContext):
                     "body_snapshot_size": 0,
                     "json_top_level_type": "",
                     "json_decode_error_type": "",
+                    "candidate_error_type": _classify_candidate_http_status(status),
                     "processed": False,
                     "generation": ctx.current_generation,
                 }
@@ -499,6 +552,7 @@ def _make_request_failed_handler(ctx: _QueryObservationContext):
                     "body_snapshot_size": 0,
                     "json_top_level_type": "",
                     "json_decode_error_type": "",
+                    "candidate_error_type": "",
                     "processed": False,
                     "generation": ctx.current_generation,
                 }
@@ -646,6 +700,38 @@ def _wait_for_next_page_settle(page, ctx: "_QueryObservationContext", ensure_par
         "final_count": last_seen_count,
         "elapsed_ms": elapsed_ms,
     }
+
+
+def _classify_page_candidate_error(ctx: "_QueryObservationContext", start_index: int, end_index: int):
+    """PAGE-300-2B-4A §5(gpt-5.6-sol 독립 검토 지적, High 반영): 지정된 candidate
+    인덱스 범위(하나의 새로 확정된 페이지의 harvest 범위이거나, 다음 페이지
+    클릭 직전 drain으로 합류된 지연 도착분)에 candidate HTTP 오류·non-JSON
+    body·snapshot 오류·JSON decode 오류 중 하나라도 있으면 우선순위(HTTP 오류 >
+    non-JSON > snapshot 오류 > decode 오류)에 따라 대응하는 pagination_stop_
+    reason을 반환한다. 없으면 None. 원래는 새로 확정된 페이지의 harvest
+    직후에만 이 검사를 했는데, drain 경로(§4)로 늦게 합류되는 candidate는
+    검사되지 않아 PAGE-300-2B-4류의 오류 candidate 이후에도 다음 페이지
+    클릭이 계속될 수 있었다 - 이제 drain 호출부에서도 동일하게 이 함수를
+    호출해 즉시 안전 중단한다.
+
+    PAGE-300-2B-4A-FIX(gpt-5.6-sol 최종 검토 지적, Medium 반영): 이 범위에서
+    candidate 오류가 발견됐고 동시에 `ctx.status_429_seen`도 True라면(예:
+    drain/scroll 중 도착한 candidate 자체가 HTTP 429), 기존에 이 함수 밖
+    (루프 최상단/클릭 직후)에서 이미 적용되던 "429가 다른 모든 판정보다
+    우선"이라는 전역 우선순위와 라벨을 일치시키기 위해 "status_429_seen"을
+    반환한다 - 중단 여부(반환값이 None이 아님) 자체는 바뀌지 않고, 어떤
+    문자열로 보고할지만 기존 전역 우선순위에 맞춘다."""
+    if end_index <= start_index:
+        return None
+    indices = range(start_index, end_index)
+    for candidate_error_type, mapped_reason in _CANDIDATE_ERROR_STOP_REASONS.items():
+        if any(ctx.candidates[i].get("candidate_error_type") == candidate_error_type for i in indices):
+            return "status_429_seen" if ctx.status_429_seen else mapped_reason
+    if any(ctx.candidates[i]["body_snapshot_error_type"] for i in indices):
+        return "status_429_seen" if ctx.status_429_seen else "candidate_snapshot_error"
+    if any(ctx.candidates[i].get("json_decode_error_type") for i in indices):
+        return "status_429_seen" if ctx.status_429_seen else "candidate_json_decode_error"
+    return None
 
 
 def _safe_get_attribute(locator, name: str):
@@ -923,6 +1009,10 @@ def collect_network_query(
                 "unmatched_requestfinished_count": ctx.unmatched_requestfinished_count,
                 "ambiguous_request_mapping_count": ctx.ambiguous_request_mapping_count,
                 "candidate_snapshot_diagnostics": navigation_error_snapshot_summary["candidate_snapshot_diagnostics"],
+                "candidate_http_error_count": navigation_error_snapshot_summary["candidate_http_error_count"],
+                "candidate_non_json_count": navigation_error_snapshot_summary["candidate_non_json_count"],
+                "candidate_http_status_counts": navigation_error_snapshot_summary["candidate_http_status_counts"],
+                "candidate_processing_error_count": navigation_error_snapshot_summary["candidate_processing_error_count"],
             }
 
         # PAGE-300-2B-2B: parsed_cache는 candidate 하나당 JSON 파싱을 정확히
@@ -942,6 +1032,29 @@ def collect_network_query(
                 return parsed_cache[index]
             entry = ctx.candidates[index]
             if entry["body_snapshot_ready"]:
+                # PAGE-300-2B-4A §3(gpt-5.6-sol 독립 검토 지적, Medium 반영):
+                # HTTP status 분류는 candidate 등록 시점(response handler,
+                # _classify_candidate_http_status)에 body snapshot 성공/실패와
+                # 무관하게 이미 확정돼 있다 - 여기서는 그 결과만 확인해 json
+                # decode를 아예 시도하지 않는다(json_decode_error_type은 채우지
+                # 않음 - §3 "JSON decode 자체를 시도하지 않았기 때문이다").
+                if entry.get("candidate_error_type") == "CandidateHttpError":
+                    parsed_cache[index] = {"items": [], "error": True}
+                    entry["processed"] = True
+                    return parsed_cache[index]
+                # PAGE-300-2B-4A §4: HTTP 2xx이지만 body의 첫 유효 문자가 JSON
+                # object/array 시작 기호가 아니면(예: HTML 오류 페이지 "<") 목록
+                # candidate로 인정하지 않는다 - Content-Type 헤더만으로 차단하지
+                # 않고(§4 "Content-Type만으로 무조건 차단하지 않는다") body 내용
+                # 기준(first_non_whitespace_character)으로만 판단하므로, 정상
+                # object/array를 잘못된 Content-Type(text/plain 등)으로 보내는
+                # endpoint도 여전히 정상 decode된다.
+                first_char = _classify_first_non_whitespace_character(entry["body_snapshot"])
+                if first_char not in ("{", "["):
+                    entry["candidate_error_type"] = "NonJsonCandidateBody"
+                    parsed_cache[index] = {"items": [], "error": True}
+                    entry["processed"] = True
+                    return parsed_cache[index]
                 try:
                     # PAGE-300-2B-2D §6: decode("utf-8-sig") 고정 대신 bytes를
                     # json.loads에 직접 전달한다 - CPython 3.6+의 json 모듈은
@@ -1151,11 +1264,22 @@ def collect_network_query(
 
                 # §4: 클릭 기준점을 확정하기 전에 미처리 candidate를 전부
                 # "현재까지 확정된 페이지의 지연 도착분"으로 먼저 harvest한다.
+                _drain_start_index = harvested_up_to_index
                 try:
                     harvested_up_to_index = _apply_pending_drain(harvested_up_to_index)
                 except Exception as exc:
                     pagination_stop_reason = "pagination_click_error"
                     pagination_error_message = f"{type(exc).__name__}: {exc}"
+                    break
+
+                # PAGE-300-2B-4A §5(gpt-5.6-sol 독립 검토 High 반영): drain으로
+                # 합류된 candidate 중 HTTP 오류·non-JSON 등이 있으면 다음 페이지
+                # 버튼을 클릭하지 않고 즉시 안전 중단한다 - 이 검사가 없으면
+                # 오류 candidate가 "이전 페이지 지연 도착분"으로 조용히
+                # 흡수되어 다음 페이지 클릭이 그대로 진행될 수 있었다.
+                drain_error_reason = _classify_page_candidate_error(ctx, _drain_start_index, harvested_up_to_index)
+                if drain_error_reason is not None:
+                    pagination_stop_reason = drain_error_reason
                     break
 
                 # 드레인만으로 이미 목표에 도달했다면(늦게 도착한 이전 페이지
@@ -1178,11 +1302,20 @@ def collect_network_query(
                 # 누락될 수 있었다 - 클릭 직전에 한 번 더 흡수해 확실히
                 # "이전 페이지 데이터"로 처리한다.
                 if ctx.candidate_response_count > candidate_count_before_click:
+                    _second_drain_start_index = candidate_count_before_click
                     try:
                         harvested_up_to_index = _apply_pending_drain(candidate_count_before_click)
                     except Exception as exc:
                         pagination_stop_reason = "pagination_click_error"
                         pagination_error_message = f"{type(exc).__name__}: {exc}"
+                        break
+                    # PAGE-300-2B-4A §5(gpt-5.6-sol 독립 검토 High 반영): 클릭
+                    # 직전 두 번째 drain에서도 동일하게 오류 candidate를 확인한다.
+                    second_drain_error_reason = _classify_page_candidate_error(
+                        ctx, _second_drain_start_index, harvested_up_to_index
+                    )
+                    if second_drain_error_reason is not None:
+                        pagination_stop_reason = second_drain_error_reason
                         break
                     candidate_count_before_click = harvested_up_to_index
                     if per_query_limit and len(unique_rows) >= per_query_limit:
@@ -1192,6 +1325,46 @@ def collect_network_query(
 
                 try:
                     target_locator.scroll_into_view_if_needed()
+                except Exception as exc:
+                    pagination_stop_reason = "pagination_click_error"
+                    pagination_error_message = f"{type(exc).__name__}: {exc}"
+                    break
+
+                # PAGE-300-2B-4A-FIX §3(gpt-5.6-sol 최종 검토 지적, 잔여 타이밍
+                # 공백 반영): scroll_into_view_if_needed() 실행 중에도 새
+                # candidate가 도착할 수 있다 - 이전 두 drain 검사와 click() 사이의
+                # 마지막 공백이었다. click() 호출 직전에 한 번 더(새 candidate가
+                # 실제로 도착했을 때만) drain하고 공유 helper로 오류를 검사해,
+                # 이 구간에서 도착한 오류 candidate도 다음 페이지 클릭을 막는다.
+                # 새 candidate가 전혀 없으면 추가 대기 없이 곧바로 click으로
+                # 진행한다(§8 - 무조건적인 대기 추가 금지).
+                pre_click_drain_start_index = candidate_count_before_click
+                if ctx.candidate_response_count > candidate_count_before_click:
+                    try:
+                        harvested_up_to_index = _apply_pending_drain(candidate_count_before_click)
+                    except Exception as exc:
+                        pagination_stop_reason = "pagination_click_error"
+                        pagination_error_message = f"{type(exc).__name__}: {exc}"
+                        break
+                    candidate_count_before_click = harvested_up_to_index
+
+                    pre_click_error_reason = _classify_page_candidate_error(
+                        ctx, pre_click_drain_start_index, candidate_count_before_click
+                    )
+                    if pre_click_error_reason is not None:
+                        pagination_stop_reason = pre_click_error_reason
+                        break
+
+                    # scroll 중 도착한 정상 candidate만으로 이미 목표에 도달했다면
+                    # (§6 "목표 도달 시 click 생략") 다음 페이지로 오인하지 않고
+                    # 여기서 종료한다 - 다른 drain 지점과 동일한 계약이다.
+                    if per_query_limit and len(unique_rows) >= per_query_limit:
+                        pagination_stop_reason = "per_query_limit_reached"
+                        break
+
+                    class_before = _safe_get_attribute(target_locator, "class")
+
+                try:
                     target_locator.click()
                     # §7: 실제 click()이 예외 없이 반환된 직후 증가한다 - 이후
                     # 응답 timeout/identity 미확인으로 페이지 확정에 실패해도
@@ -1291,6 +1464,18 @@ def collect_network_query(
                     "adaptive_wait_ms": wait_result["elapsed_ms"],
                 })
 
+                # PAGE-300-2B-4A §5: 이번 페이지의 candidate가 HTTP 오류·non-JSON
+                # body·snapshot 오류·JSON decode 오류 중 하나라도 겪었다면 다음
+                # 페이지 버튼을 클릭하지 않고 즉시 안전 중단한다(PAGE-300-2B-4
+                # 재현 - HTTP 405 응답을 받고도 계속 다음 페이지를 클릭하려다
+                # 30초 클릭 타임아웃으로만 우연히 멈췄던 문제를 명시적으로
+                # 고친다). 페이지 확정(DOM 전환) 자체는 되돌리지 않는다 - 데이터
+                # 품질과 DOM 전환 여부는 서로 다른 판단이다.
+                page_error_reason = _classify_page_candidate_error(ctx, candidate_count_before_click, wait_result["final_count"])
+                if page_error_reason is not None:
+                    pagination_stop_reason = page_error_reason
+                    break
+
                 # §16 종료 우선순위(1.per_query_limit > 4.max_page > 9.no_new_unique)를
                 # 그대로 반영한다 - 예를 들어 마지막(5번째) 페이지에서 신규 unique가
                 # 2연속 0건이 되는 경우에도 max_page_count_reached가 no_new_unique_rows
@@ -1363,6 +1548,10 @@ def collect_network_query(
             "unmatched_requestfinished_count": ctx.unmatched_requestfinished_count,
             "ambiguous_request_mapping_count": ctx.ambiguous_request_mapping_count,
             "candidate_snapshot_diagnostics": snapshot_summary["candidate_snapshot_diagnostics"],
+            "candidate_http_error_count": snapshot_summary["candidate_http_error_count"],
+            "candidate_non_json_count": snapshot_summary["candidate_non_json_count"],
+            "candidate_http_status_counts": snapshot_summary["candidate_http_status_counts"],
+            "candidate_processing_error_count": snapshot_summary["candidate_processing_error_count"],
         }
     finally:
         for event, event_handler in (

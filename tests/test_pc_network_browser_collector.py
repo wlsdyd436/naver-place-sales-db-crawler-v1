@@ -554,16 +554,22 @@ def check_unicode_json_bytes_decoded_correctly(reporter: ValidationReporter) -> 
 
 
 def check_json_decode_error_diagnostic_field(reporter: ValidationReporter) -> None:
-    """body snapshot은 성공했지만 JSON decode 자체가 실패하는 경우
-    json_decode_error_count(신규 진단 필드)가 증가해야 한다(body_snapshot_error_count와
-    구분됨 - snapshot 실패와 JSON decode 실패는 서로 다른 원인이다)."""
-    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
+    """body snapshot은 성공했고 body 모양(첫 문자 '{')은 JSON object처럼
+    보이지만 실제 JSON decode 자체가 실패하는 경우 json_decode_error_count
+    (신규 진단 필드)가 증가해야 한다(body_snapshot_error_count와 구분됨 -
+    snapshot 실패와 JSON decode 실패는 서로 다른 원인이다). PAGE-300-2B-4A
+    §3/§4 도입 이후에는 첫 문자가 '{'/'['가 아닌 body는 json.loads 자체를
+    시도하지 않고 candidate_non_json_count로 먼저 분류되므로, 이 테스트는
+    "JSON처럼 보이지만 문법이 깨진" 케이스로 body를 구성해 원래 의도(진짜
+    decode 실패 경로)를 유지한다."""
+    broken = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"{not valid json")
     page = FakePage(responses=[broken])
     result = collect_network_query(page, JOB, 10, collected_at="2026-07-14")
     if (
         result["json_decode_error_count"] == 1
         and result["body_snapshot_success_count"] == 1
         and result["body_snapshot_error_count"] == 0
+        and result["candidate_non_json_count"] == 0
         and result["parse_error_count"] == 1
     ):
         reporter.pass_("json_decode_error_count 진단 필드: snapshot 성공 + JSON decode 실패를 body_snapshot_error_count와 구분해 집계함")
@@ -859,7 +865,10 @@ def check_utf16_json_bytes_decoded_by_json_loads(reporter: ValidationReporter) -
 
 def check_html_error_body_reports_first_char_and_no_leak(reporter: ValidationReporter) -> None:
     """테스트 10: HTML 오류 body는 first_non_whitespace_character='<'로
-    진단되고 JSON decode 실패로 안전 처리되며 원문이 노출되지 않아야 한다."""
+    진단되고, PAGE-300-2B-4A §4에 따라 json.loads를 아예 시도하지 않고
+    candidate_non_json_count로 안전 처리되며 원문이 노출되지 않아야 한다
+    (json_decode_error_type은 decode를 실제로 시도했을 때만 채워지므로 여기서는
+    빈 문자열이어야 한다)."""
     html_marker = "고유HTML마커QWE"
     body = f"<html><body>{html_marker}</body></html>".encode("utf-8")
     response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
@@ -869,11 +878,13 @@ def check_html_error_body_reports_first_char_and_no_leak(reporter: ValidationRep
     leaked = html_marker in json.dumps(result["candidate_snapshot_diagnostics"])
     if (
         diag["first_non_whitespace_character"] == "<"
-        and diag["json_decode_error_type"] != ""
-        and result["json_decode_error_count"] == 1
+        and diag["candidate_error_type"] == "NonJsonCandidateBody"
+        and diag["json_decode_error_type"] == ""
+        and result["candidate_non_json_count"] == 1
+        and result["json_decode_error_count"] == 0
         and not leaked
     ):
-        reporter.pass_("HTML 오류 body: first_non_whitespace_character='<', json decode 실패, 원문 미노출")
+        reporter.pass_("HTML 오류 body: first_non_whitespace_character='<', candidate_non_json_count로 안전 처리(json.loads 미시도), 원문 미노출")
     else:
         reporter.fail(f"HTML 오류 body 결과가 예상과 다름: {diag}, leaked={leaked}")
 
@@ -881,7 +892,9 @@ def check_html_error_body_reports_first_char_and_no_leak(reporter: ValidationRep
 def check_gzip_magic_body_no_decompression_attempted(reporter: ValidationReporter) -> None:
     """테스트 11: gzip magic bytes(\\x1f\\x8b)로 시작하는 body는
     compression_magic='gzip'으로만 진단되고, 임의 압축 해제를 시도하지
-    않으므로 json decode는 실패해야 한다."""
+    않는다. 첫 유효 문자가 '{'/'['가 아니므로(PAGE-300-2B-4A §4)
+    json.loads 자체를 시도하지 않고 candidate_non_json_count로 안전
+    처리해야 한다."""
     body = b"\x1f\x8b" + b"\x00" * 20
     response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body)
     page = FakePage(responses=[response])
@@ -889,13 +902,184 @@ def check_gzip_magic_body_no_decompression_attempted(reporter: ValidationReporte
     diag = result["candidate_snapshot_diagnostics"][0]
     if (
         diag["compression_magic"] == "gzip"
-        and diag["json_decode_error_type"] != ""
-        and result["json_decode_error_count"] == 1
+        and diag["candidate_error_type"] == "NonJsonCandidateBody"
+        and diag["json_decode_error_type"] == ""
+        and result["candidate_non_json_count"] == 1
+        and result["json_decode_error_count"] == 0
         and result["rows"] == []
     ):
-        reporter.pass_("gzip magic body: compression_magic=gzip으로만 진단, 임의 압축 해제 없이 json decode 실패로 안전 처리")
+        reporter.pass_("gzip magic body: compression_magic=gzip으로만 진단, 임의 압축 해제 없이 candidate_non_json_count로 안전 처리")
     else:
         reporter.fail(f"gzip magic body 결과가 예상과 다름: {diag}")
+
+
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-4A: PAGE-300-2B-4 실제 live에서 확인된 결함(candidate가 HTTP
+# 405 + text/html을 반환했는데도 json.loads를 시도하고, 이후 다음 페이지
+# 클릭까지 계속 시도하다가 우연히 클릭 타임아웃으로만 멈췄던 문제)을 명시적
+# fail-closed 계약으로 고친다.
+# ---------------------------------------------------------------------------
+
+
+def check_candidate_http_error_405_html_body(reporter: ValidationReporter) -> None:
+    """테스트 1: HTTP 405 + text/html + HTML body는 snapshot은 성공하지만
+    json.loads를 시도하지 않고 candidate_http_error_count로 안전 처리돼야
+    한다(candidate_non_json_count는 증가하지 않음 - HTTP 오류 판정이 먼저
+    확정되므로 non-JSON 판정에는 도달하지 않는다)."""
+    body = b"<html><body>Method Not Allowed</body></html>"
+    response = FakeResponse(CANDIDATE_URL, 405, "xhr", body=body, headers={"content-type": "text/html"})
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        result["body_snapshot_success_count"] == 1
+        and diag["candidate_error_type"] == "CandidateHttpError"
+        and diag["status"] == 405
+        and result["candidate_http_error_count"] == 1
+        and result["candidate_non_json_count"] == 0
+        and result["json_decode_error_count"] == 0
+        and result["parse_error_count"] == 1
+        and result["rows"] == []
+    ):
+        reporter.pass_("HTTP 405 + HTML body: snapshot 성공하지만 json.loads 미시도, candidate_http_error_count=1로 안전 처리")
+    else:
+        reporter.fail(f"HTTP 405 candidate 결과가 예상과 다름: {result}")
+
+
+def check_http_403_json_body_still_blocked(reporter: ValidationReporter) -> None:
+    """테스트 3: body가 유효한 JSON이어도 status가 2xx 범위 밖(403)이면
+    item extraction을 시도하지 않아야 한다."""
+    body = json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 403, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        diag["candidate_error_type"] == "CandidateHttpError"
+        and result["candidate_http_error_count"] == 1
+        and result["json_decode_error_count"] == 0
+        and result["rows"] == []
+    ):
+        reporter.pass_("HTTP 403 + 유효 JSON body: non-2xx이므로 item extraction 금지, candidate_http_error_count=1")
+    else:
+        reporter.fail(f"HTTP 403 JSON body 결과가 예상과 다름: {diag}, result={result}")
+
+
+def check_http_500_html_body_safe_stop_no_retry(reporter: ValidationReporter) -> None:
+    """테스트 4: HTTP 500 + HTML body도 안전 중단되며 재시도 없이 한 번만
+    처리돼야 한다(body() 호출 1회)."""
+    body = b"<html><body>Internal Server Error</body></html>"
+    response = FakeResponse(CANDIDATE_URL, 500, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        diag["candidate_error_type"] == "CandidateHttpError"
+        and diag["status"] == 500
+        and response.body_call_count == 1
+        and result["rows"] == []
+    ):
+        reporter.pass_("HTTP 500 + HTML body: 안전 중단, body() 재시도 없이 1회만 호출")
+    else:
+        reporter.fail(f"HTTP 500 body 결과가 예상과 다름: {diag}, body_call_count={response.body_call_count}")
+
+
+def check_http_429_candidate_dual_counter_policy(reporter: ValidationReporter) -> None:
+    """테스트 5: candidate 자체가 HTTP 429를 반환하면 기존 status_429_seen=True
+    계약은 그대로 유지되고(§3), candidate_http_error_count/
+    candidate_http_status_counts에도 함께 집계된다(중복 의미 - 하나는 보안
+    중단 신호, 다른 하나는 candidate 처리 결과 진단이며 서로 배타적이지
+    않다)."""
+    body = b"<html><body>Too Many Requests</body></html>"
+    response = FakeResponse(CANDIDATE_URL, 429, "xhr", body=body)
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        result["status_429_seen"] is True
+        and result["candidate_http_error_count"] == 1
+        and result["candidate_http_status_counts"].get("429") == 1
+        and result["rows"] == []
+    ):
+        reporter.pass_("HTTP 429 candidate: 기존 status_429_seen=True 계약 유지 + candidate_http_error_count/http_status_counts에도 중복 집계(정책 명시)")
+    else:
+        reporter.fail(f"HTTP 429 candidate 결과가 예상과 다름: {result}")
+
+
+def check_429_candidate_with_empty_body_still_counted_as_http_error(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 독립 검토(Medium) 재현/수정 확인: candidate가 HTTP 429이면서
+    body가 0바이트(EmptyBody)여도 candidate_http_error_count/
+    candidate_http_status_counts에 여전히 집계돼야 한다 - 수정 전에는 HTTP
+    상태 분류가 body_snapshot_ready 분기 안에만 있어(snapshot 성공 시에만
+    판정), snapshot 자체가 실패한 non-2xx candidate(EmptyBody/BodyTooLarge/
+    RequestFailed 등)가 신규 카운터에서 누락됐다. 기존 status_429_seen=True
+    계약과 EmptyBody 분류(body_snapshot_empty_count)는 그대로 유지된다."""
+    response = FakeResponse(CANDIDATE_URL, 429, "xhr", body=b"")
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    diag = result["candidate_snapshot_diagnostics"][0]
+    if (
+        result["status_429_seen"] is True
+        and diag["candidate_error_type"] == "CandidateHttpError"
+        and diag["body_snapshot_state"] == "empty"
+        and result["candidate_http_error_count"] == 1
+        and result["candidate_http_status_counts"].get("429") == 1
+        and result["body_snapshot_empty_count"] == 1
+    ):
+        reporter.pass_("HTTP 429 + EmptyBody: snapshot 실패에도 candidate_http_error_count/http_status_counts에 정상 집계(status_429_seen/EmptyBody 분류도 그대로 유지)")
+    else:
+        reporter.fail(f"429+EmptyBody 결과가 예상과 다름: {diag}, result={result}")
+
+
+def check_missing_content_type_object_body_still_decodes(reporter: ValidationReporter) -> None:
+    """테스트 9: Content-Type 헤더가 없어도 body 첫 문자가 '{'이면 정상
+    JSON decode를 허용해야 한다."""
+    body = json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body, headers={})
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        len(result["rows"]) == 1
+        and result["candidate_non_json_count"] == 0
+        and result["json_decode_error_count"] == 0
+    ):
+        reporter.pass_("Content-Type 누락 + body '{': 정상 JSON decode 허용")
+    else:
+        reporter.fail(f"Content-Type 누락 object body 결과가 예상과 다름: {result}")
+
+
+def check_missing_content_type_array_body_still_decodes(reporter: ValidationReporter) -> None:
+    """테스트 10: Content-Type 헤더가 없어도 body 첫 문자가 '['이면 정상
+    JSON decode를 허용해야 한다."""
+    body = json.dumps([{"id": "p1", "name": "업체1"}]).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body, headers={})
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        len(result["rows"]) == 1
+        and result["candidate_non_json_count"] == 0
+        and result["json_decode_error_count"] == 0
+    ):
+        reporter.pass_("Content-Type 누락 + body '[': 정상 JSON decode 허용")
+    else:
+        reporter.fail(f"Content-Type 누락 array body 결과가 예상과 다름: {result}")
+
+
+def check_text_plain_content_type_with_json_object_still_decodes(reporter: ValidationReporter) -> None:
+    """테스트 11: Content-Type이 text/plain으로 잘못 표기돼 있어도 body 첫
+    문자가 '{'이면 first character 기준으로 정상 decode를 허용한다(정책:
+    Content-Type만으로 차단하지 않음, §4)."""
+    body = json.dumps({"result": {"place": {"list": [{"id": "p1", "name": "업체1"}]}}}).encode("utf-8")
+    response = FakeResponse(CANDIDATE_URL, 200, "xhr", body=body, headers={"content-type": "text/plain"})
+    page = FakePage(responses=[response])
+    result = collect_network_query(page, JOB, 10, collected_at="2026-07-20")
+    if (
+        len(result["rows"]) == 1
+        and result["candidate_non_json_count"] == 0
+        and result["json_decode_error_count"] == 0
+    ):
+        reporter.pass_("Content-Type=text/plain이지만 body '{': first character 기준으로 정상 decode 허용(정책 확정)")
+    else:
+        reporter.fail(f"text/plain content-type 결과가 예상과 다름: {result}")
 
 
 def check_zero_length_body_skips_json_loads(reporter: ValidationReporter) -> None:
@@ -1415,6 +1599,15 @@ def main() -> int:
     check_snapshot_invariant_success_error_pending_equals_candidate_count(reporter)
     check_candidate_diagnostics_no_business_data_leak(reporter)
     check_graphql_top_level_list_synthetic_body_end_to_end(reporter)
+
+    check_candidate_http_error_405_html_body(reporter)
+    check_http_403_json_body_still_blocked(reporter)
+    check_http_500_html_body_safe_stop_no_retry(reporter)
+    check_http_429_candidate_dual_counter_policy(reporter)
+    check_429_candidate_with_empty_body_still_counted_as_http_error(reporter)
+    check_missing_content_type_object_body_still_decodes(reporter)
+    check_missing_content_type_array_body_still_decodes(reporter)
+    check_text_plain_content_type_with_json_object_still_decodes(reporter)
 
     check_session_and_context_shared_across_jobs(reporter)
     check_new_page_created_per_query(reporter)

@@ -168,6 +168,12 @@ class FakePaginationButtonLocator:
 
     def scroll_into_view_if_needed(self):
         self._spec["scroll_calls"] = self._spec.get("scroll_calls", 0) + 1
+        # PAGE-300-2B-4A-FIX: scroll_into_view_if_needed() 실행 "중"에 새
+        # candidate response가 도착하는 상황(click() 직전 마지막 타이밍 공백)을
+        # 재현하기 위한 훅 - responses_during_scroll에 등록된 (delay_ms, response)
+        # 쌍을 click()의 responses_after_click과 동일한 방식으로 즉시 전달한다.
+        for delay_ms, response in (self._spec.get("responses_during_scroll") or []):
+            self._page_ref._schedule_relative(delay_ms, response)
 
     def click(self):
         # 이 메서드는 의도적으로 force 등 어떤 인자도 받지 않는다 - production이
@@ -945,11 +951,14 @@ def check_gap_between_harvest_and_click_baseline_not_lost(reporter: ValidationRe
 
 
 def check_drain_parse_error_counted_even_when_all_drained_items_fail(reporter: ValidationReporter) -> None:
-    """gpt-5.6-sol 독립 검토 지적(PAGE-300-2B-2B) 회귀: 클릭 전 drain
-    단계(§4)에서 harvest된 candidate가 전부 파싱 실패(raw_items=[])해도
-    parse_error_count에 반영돼야 한다 - 수정 전에는 `_apply_pending_drain`이
-    `drain_result["raw_items"]`가 있을 때만 parse_error_count를 누적해,
-    drain된 candidate가 전부 실패하면 그 사실이 조용히 사라질 수 있었다."""
+    """gpt-5.6-sol 독립 검토 지적(PAGE-300-2B-2B) 회귀 + PAGE-300-2B-4A 계약
+    갱신: 클릭 전 drain 단계(§4)에서 harvest된 candidate가 전부 파싱
+    실패(raw_items=[])해도 parse_error_count에 반영돼야 한다(원래 지적 그대로
+    유지). PAGE-300-2B-4A부터는 한 걸음 더 나아가 drain된 candidate가 non-JSON/
+    HTTP 오류였다면 그 사실이 조용히 사라지는 대신 pagination 자체를 안전하게
+    중단한다(gpt-5.6-sol 2차 독립 검토 High 지적 반영 - 수정 전에는 drain 오류가
+    다음 페이지 클릭을 막지 못해 PAGE-300-2B-4류의 문제가 재발할 수 있었다).
+    따라서 이 시나리오에서는 page 2 클릭이 아예 시도되지 않아야 한다."""
     page1_items = _page_items("p1_", 20)
     broken_orphan = FakeResponse(CANDIDATE_URL, 200, "xhr", body=b"not valid json {{{")
     page2_spec = {"count": 1, "visible": True, "enabled": True,
@@ -961,12 +970,15 @@ def check_drain_parse_error_counted_even_when_all_drained_items_fail(reporter: V
     result = collect_network_query(page, JOB, 100, collected_at="2026-07-16")
     ok = (
         result["parse_error_count"] == 1
-        and result["local_unique_count"] == 40
-        and result["pagination_click_count"] == 1
-        and result["pagination_page_count"] == 2
+        and result["local_unique_count"] == 20
+        and result["pagination_click_count"] == 0
+        and result["pagination_page_count"] == 1
+        and result["pagination_stop_reason"] == "candidate_non_json_response"
+        and page2_spec.get("click_calls", 0) == 0
+        and len(result["rows"]) == 20
     )
     if ok:
-        reporter.pass_("drain 중 전부 파싱 실패한 candidate도 parse_error_count에 정상 반영됨(raw_items=[]이어도 누락되지 않음)")
+        reporter.pass_("drain 중 전부 파싱 실패한 candidate: parse_error_count 반영 + page 2 클릭은 시도조차 하지 않고 안전 중단(candidate_non_json_response, PAGE-300-2B-4A)")
     else:
         reporter.fail(f"drain parse_error_count 결과가 예상과 다름: {result}")
 
@@ -1288,6 +1300,428 @@ def check_page300_2b2c_reproduction_total_bytes_not_page1_only(reporter: Validat
         reporter.fail(f"PAGE-300-2B-2C 재현 결과가 예상과 다름: expected_total={expected_total_bytes}, result={result}")
 
 
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-4A: PAGE-300-2B-4 실제 live에서 candidate가 HTTP 405 + text/html을
+# 반환했는데도 계속 다음 페이지 버튼을 클릭하려다 30초 클릭 타임아웃으로만
+# 우연히 멈췄던 문제를 명시적 fail-closed 계약으로 고친다 - candidate HTTP
+# 오류/non-JSON body를 감지하면 다음 페이지 버튼을 클릭하지 않고 즉시 안전
+# 중단해야 한다.
+# ---------------------------------------------------------------------------
+
+
+def check_page2_http_error_stops_before_page3_click(reporter: ValidationReporter) -> None:
+    """테스트 2: page 1은 정상이지만 page 2 candidate가 HTTP 405 + HTML을
+    반환하면 page 1 rows는 보존되고, page 3 버튼은 존재하더라도 click()이
+    전혀 호출되지 않아야 한다(pagination_stop_reason=candidate_http_error,
+    pagination_error_message는 짧고 전체 HTML을 포함하지 않음)."""
+    page1_items = _page_items("p1_", 20)
+    page2_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch",
+        body=b"<html><body>Method Not Allowed</body></html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_response)]}
+    page3_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, _place_response(_page_items("p3_", 20)))]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        result["pagination_page_count"] == 2
+        and result["pagination_click_count"] == 1
+        and page3_spec.get("click_calls", 0) == 0
+        and result["pagination_stop_reason"] == "candidate_http_error"
+        and len(result["pagination_error_message"]) < 200
+        and "<html>" not in result["pagination_error_message"]
+        and len(result["rows"]) == 20
+        and result["candidate_http_error_count"] == 1
+    )
+    if ok:
+        reporter.pass_("page 2 HTTP 405: page 1 rows(20) 보존, page 3 click 0회, pagination_stop_reason=candidate_http_error, HTML 원문 미노출")
+    else:
+        reporter.fail(f"page2 HTTP 오류 중단 결과가 예상과 다름: {result}, page3_click_calls={page3_spec.get('click_calls', 0)}")
+
+
+def check_page2_non_json_response_stops_before_page3_click(reporter: ValidationReporter) -> None:
+    """테스트 6(페이지네이션 변형): page 2가 HTTP 200이지만 body가 HTML("<"
+    로 시작)이면 candidate_non_json_response로 안전 중단하고 page 3 클릭을
+    시도하지 않아야 한다(candidate_http_error와는 다른 stop reason)."""
+    page1_items = _page_items("p1_", 20)
+    page2_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 200, "fetch",
+        body=b"<html><body>Unexpected HTML</body></html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_response)]}
+    page3_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, _place_response(_page_items("p3_", 20)))]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        result["pagination_stop_reason"] == "candidate_non_json_response"
+        and page3_spec.get("click_calls", 0) == 0
+        and result["candidate_non_json_count"] == 1
+        and result["candidate_http_error_count"] == 0
+        and len(result["rows"]) == 20
+    )
+    if ok:
+        reporter.pass_("page 2 HTTP 200 + HTML body: candidate_non_json_response로 안전 중단(candidate_http_error와 구분), page 3 click 0회")
+    else:
+        reporter.fail(f"page2 non-JSON 중단 결과가 예상과 다름: {result}")
+
+
+def check_html_error_body_not_leaked_anywhere_in_result(reporter: ValidationReporter) -> None:
+    """테스트 12: page 2 HTML 오류 원문(고유 마커 포함)이 rows/candidate
+    diagnostics/pagination_error_message/전체 result dict 어디에도 노출되지
+    않아야 한다."""
+    html_marker = "고유PAGE2ERROR마커ZXCV"
+    page1_items = _page_items("p1_", 20)
+    page2_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch",
+        body=f"<html><body>{html_marker}</body></html>".encode("utf-8"),
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_response)]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    serialized = json.dumps(result, default=str)
+    if html_marker not in serialized:
+        reporter.pass_("page 2 HTML 오류 원문(고유 마커): rows/candidate diagnostics/pagination_error_message/전체 result dict 어디에도 미노출")
+    else:
+        reporter.fail("HTML 오류 원문 미노출 검증 실패: 결과 dict 어딘가에 원문 마커가 노출됨")
+
+
+def check_page300_2b4_exact_reproduction_no_page3_click(reporter: ValidationReporter) -> None:
+    """테스트 13: PAGE-300-2B-4 실제 live 결과를 정확히 재현한다 - page 1
+    HTTP 200 object(raw 20), page 2 HTTP 405 HTML(583바이트, 실측과 동일한
+    크기), page 3 버튼은 존재하지만 click()이 호출되면 테스트 실패다."""
+    page1_items = _page_items("p1_", 20)
+    _wrapper_prefix, _wrapper_suffix = b"<html><body>", b"</body></html>"
+    _target_size = 583
+    page2_body = _wrapper_prefix + b"x" * (_target_size - len(_wrapper_prefix) - len(_wrapper_suffix)) + _wrapper_suffix
+    assert len(page2_body) == _target_size  # 실측(PAGE-300-2B-4)과 동일한 583바이트
+    page2_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch", body=page2_body,
+    )
+
+    class Page3ClickMustNotHappen(FakePaginationButtonLocator):
+        def click(self):
+            raise AssertionError("page 3 버튼 click()이 호출되면 안 된다(PAGE-300-2B-4 재현 - candidate_http_error 이후 즉시 중단 기대)")
+
+    page3_spec = {"count": 1, "visible": True, "enabled": True}
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_response)]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    # page 3 버튼 locator를 클릭 시 즉시 실패하는 버전으로 교체해, 혹시라도
+    # 코드가 안전 중단 없이 다음 페이지를 클릭 시도하면 테스트가 확실히
+    # 실패하도록 한다(단순히 click_calls==0을 사후 확인하는 것보다 엄격함).
+    original_get_by_role = page._frame.get_by_role
+
+    def guarded_get_by_role(role, name=None, exact=None):
+        if name == "3":
+            spec = page3_spec
+            return Page3ClickMustNotHappen(spec, page)
+        return original_get_by_role(role, name=name, exact=exact)
+
+    page._frame.get_by_role = guarded_get_by_role
+
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        result["candidate_response_count"] == 2
+        and result["body_snapshot_success_count"] == 2
+        and result["candidate_http_error_count"] == 1
+        and result["json_decode_error_count"] == 0
+        and result["parse_error_count"] == 1
+        and result["pagination_stop_reason"] == "candidate_http_error"
+        and len(result["rows"]) == 20
+    )
+    if ok:
+        reporter.pass_("PAGE-300-2B-4 정확 재현: page1(200/object)+page2(405/583B HTML), candidate_http_error=1, page3 click 없이 안전 중단, rows=20 보존")
+    else:
+        reporter.fail(f"PAGE-300-2B-4 재현 결과가 예상과 다름: {result}")
+
+
+def check_late_arriving_http_error_via_drain_stops_before_next_click(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 독립 검토(High) 재현/수정 확인: page 2 클릭 직후 정상
+    candidate가 먼저 도착해 quiet settle이 조기 종료되지만(page2 확정 성공),
+    같은 page 2에 대한 HTTP 405 candidate가 quiet period 이후(1000ms 지연)에
+    뒤늦게 도착해 "다음 페이지(3) 클릭 직전 drain"에서 harvest되는 경우에도
+    안전 중단해야 한다 - 오류가 새로 확정된 페이지의 메인 harvest 범위가
+    아니라 drain 경로로 들어왔다는 이유만으로 놓치면 안 된다(수정 전에는
+    이 경로에서 page 3 클릭이 계속 진행될 수 있었다)."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    late_405_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch",
+        body=b"<html>Method Not Allowed</html>",
+    )
+    page2_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_after_click": [(0, page2_ok_response), (1000, late_405_response)],
+    }
+    page3_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, _place_response(_page_items("p3_", 20)))]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 0
+        and result["candidate_http_error_count"] == 1
+        and result["pagination_stop_reason"] == "candidate_http_error"
+        and len(result["rows"]) == 40
+    )
+    if ok:
+        reporter.pass_("page 2 확정 성공 이후 지연 도착한 HTTP 405이 다음 클릭 직전 drain에서 harvest돼도 page 3 click 없이 안전 중단(candidate_http_error), page1+page2 rows(40) 보존")
+    else:
+        reporter.fail(f"지연 도착 HTTP 오류(drain 경로) 결과가 예상과 다름: {result}, page3_click_calls={page3_spec.get('click_calls', 0)}")
+
+
+# ---------------------------------------------------------------------------
+# PAGE-300-2B-4A-FIX: gpt-5.6-sol 최종 검토가 지적한 잔여 타이밍 공백 -
+# scroll_into_view_if_needed() 실행 중 도착한 candidate는 click() 전에
+# 재검사되지 않았다. click() 직전 최종 pre-click checkpoint를 추가해 이 공백을
+# 닫는다.
+# ---------------------------------------------------------------------------
+
+
+def check_http_error_arriving_during_scroll_blocks_next_click(reporter: ValidationReporter) -> None:
+    """테스트 A: page 1·2 정상 이후 page 3 버튼의 scroll_into_view_if_needed()
+    실행 "중"에 HTTP 405 candidate가 도착해도, click() 호출 전 최종 checkpoint가
+    이를 감지해 page 3 click을 차단해야 한다(gpt-5.6-sol 최종 검토 재현)."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_405_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch",
+        body=b"<html>Method Not Allowed</html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_405_response)],
+        "responses_after_click": [(0, _place_response(_page_items("p3_", 20)))],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 0
+        and result["candidate_http_error_count"] == 1
+        and result["parse_error_count"] == 1
+        and result["json_decode_error_count"] == 0
+        and result["pagination_stop_reason"] == "candidate_http_error"
+        and len(result["rows"]) == 40
+    )
+    if ok:
+        reporter.pass_("A. scroll 중 HTTP 405 도착: click() 전 최종 checkpoint가 감지, page 3 click 0회, page1+page2 rows(40) 보존")
+    else:
+        reporter.fail(f"scroll 중 HTTP 405 결과가 예상과 다름: {result}, page3_click_calls={page3_spec.get('click_calls', 0)}")
+
+
+def check_non_json_arriving_during_scroll_blocks_next_click(reporter: ValidationReporter) -> None:
+    """테스트 B: scroll 중 HTTP 200 + HTML body가 도착해도 non-JSON으로
+    분류되어 click() 전에 차단돼야 한다."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_html_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 200, "fetch",
+        body=b"<html>Unexpected HTML</html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_html_response)],
+        "responses_after_click": [(0, _place_response(_page_items("p3_", 20)))],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 0
+        and result["candidate_non_json_count"] == 1
+        and result["candidate_http_error_count"] == 0
+        and result["pagination_stop_reason"] == "candidate_non_json_response"
+        and len(result["rows"]) == 40
+    )
+    if ok:
+        reporter.pass_("B. scroll 중 HTTP 200+HTML 도착: candidate_non_json_response로 click() 전 차단, page 3 click 0회")
+    else:
+        reporter.fail(f"scroll 중 non-JSON 결과가 예상과 다름: {result}")
+
+
+def check_normal_candidate_during_scroll_absorbed_then_click_proceeds(reporter: ValidationReporter) -> None:
+    """테스트 C: scroll 중 정상 HTTP 200 JSON candidate가 도착하면 오류 없이
+    현재 rows에 흡수되고, 목표(300건)에는 아직 못 미치므로 click()은 그대로
+    진행돼야 한다(click_calls=1)."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_ok_response = _place_response(_page_items("scrollp3_", 5))
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_ok_response)],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 1
+        and result["candidate_http_error_count"] == 0
+        and result["candidate_non_json_count"] == 0
+        and result["parse_error_count"] == 0
+        and len(result["rows"]) == 45
+        and result["pagination_stop_reason"] == "next_page_response_timeout"
+    )
+    if ok:
+        reporter.pass_("C. scroll 중 정상 candidate(5건) 도착: 오류 없이 rows에 흡수(45건, 중복 없음), 목표 미달이므로 click은 정확히 1회 진행됨")
+    else:
+        reporter.fail(f"scroll 중 정상 candidate 흡수 결과가 예상과 다름: {result}, click_calls={page3_spec.get('click_calls', 0)}")
+
+
+def check_normal_candidate_during_scroll_reaches_target_skips_click(reporter: ValidationReporter) -> None:
+    """테스트 D: scroll 중 도착한 정상 candidate만으로 이미 per_query_limit에
+    도달하면 click()을 시도하지 않고 per_query_limit_reached로 종료해야 한다."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_ok_response = _place_response(_page_items("scrollp3_", 10))
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_ok_response)],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 45, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 0
+        and result["pagination_stop_reason"] == "per_query_limit_reached"
+        and len(result["rows"]) == 45
+    )
+    if ok:
+        reporter.pass_("D. scroll 중 정상 candidate로 목표(45건) 도달: click() 시도하지 않고 per_query_limit_reached로 종료")
+    else:
+        reporter.fail(f"scroll 중 목표 도달 결과가 예상과 다름: {result}, click_calls={page3_spec.get('click_calls', 0)}")
+
+
+def check_no_candidate_during_scroll_preserves_existing_flow(reporter: ValidationReporter) -> None:
+    """테스트 E: scroll 중 새 candidate가 전혀 도착하지 않으면 기존 정상
+    흐름(click 정확히 1회, per_query_limit_reached)이 그대로 유지돼야 한다 -
+    최종 checkpoint 추가가 정상 경로에 불필요한 대기나 부작용을 만들지
+    않았는지 확인한다."""
+    page1_items = _page_items("p1_", 20)
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, _place_response(_page_items("p2_", 20)))]}
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec},
+    )
+    result = collect_network_query(page, JOB, 40, collected_at="2026-07-16")
+    ok = (
+        page2_spec.get("click_calls", 0) == 1
+        and result["pagination_click_count"] == 1
+        and result["pagination_stop_reason"] == "per_query_limit_reached"
+        and len(result["rows"]) == 40
+    )
+    if ok:
+        reporter.pass_("E. scroll 중 candidate 없음: 기존 정상 흐름(click 1회, per_query_limit_reached) 그대로 유지")
+    else:
+        reporter.fail(f"scroll 중 candidate 없음 결과가 예상과 다름: {result}")
+
+
+def check_duplicate_candidate_during_scroll_not_double_counted(reporter: ValidationReporter) -> None:
+    """테스트 F: scroll 중 동일 response 객체가 중복 전달돼도(극단적 경우)
+    candidate/parse/HTTP 오류가 중복 집계되지 않아야 한다(object identity
+    dedup은 기존 response handler 계약 그대로 적용됨)."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 405, "fetch",
+        body=b"<html>dup</html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_response), (0, scroll_response)],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        result["candidate_response_count"] == 3  # page1 + page2 + 중복 전달됐지만 1개로 dedup된 scroll candidate
+        and result["candidate_http_error_count"] == 1
+        and result["parse_error_count"] == 1
+        and scroll_response.body_call_count == 1
+        and page3_spec.get("click_calls", 0) == 0
+    )
+    if ok:
+        reporter.pass_("F. scroll 중 동일 response 객체 중복 전달: object identity dedup으로 candidate/parse/HTTP 오류 중복 집계 없음(body() 1회만 호출)")
+    else:
+        reporter.fail(f"scroll 중 중복 candidate 결과가 예상과 다름: {result}, body_call_count={scroll_response.body_call_count}")
+
+
+def check_http_429_during_scroll_reports_status_429_seen_priority(reporter: ValidationReporter) -> None:
+    """gpt-5.6-sol 최종 검토(Medium) 재현/수정 확인: scroll 중 도착한 candidate
+    자체가 HTTP 429이면, candidate_http_error_count에는 그대로 집계되지만
+    pagination_stop_reason은 기존 전역 우선순위(captcha>429>...)와 일치하도록
+    "candidate_http_error"가 아니라 "status_429_seen"으로 보고돼야 한다(중단
+    여부 자체는 동일 - 라벨만 기존 관례에 맞춘다)."""
+    page1_items = _page_items("p1_", 20)
+    page2_ok_response = _place_response(_page_items("p2_", 20))
+    scroll_429_response = FakeResponse(
+        "https://pcmap-api.place.naver.com/graphql", 429, "fetch",
+        body=b"<html>Too Many Requests</html>",
+    )
+    page2_spec = {"count": 1, "visible": True, "enabled": True,
+                  "responses_after_click": [(0, page2_ok_response)]}
+    page3_spec = {
+        "count": 1, "visible": True, "enabled": True,
+        "responses_during_scroll": [(0, scroll_429_response)],
+    }
+    page = FakePaginationPage(
+        initial_schedule=[(0, _place_response(page1_items))],
+        click_plan={"2": page2_spec, "3": page3_spec},
+    )
+    result = collect_network_query(page, JOB, 300, collected_at="2026-07-16")
+    ok = (
+        page3_spec.get("click_calls", 0) == 0
+        and result["status_429_seen"] is True
+        and result["pagination_stop_reason"] == "status_429_seen"
+        and result["candidate_http_error_count"] == 1
+        and len(result["rows"]) == 40
+    )
+    if ok:
+        reporter.pass_("scroll 중 HTTP 429 candidate 도착: candidate_http_error_count는 집계되지만 pagination_stop_reason은 기존 전역 우선순위대로 status_429_seen으로 보고됨")
+    else:
+        reporter.fail(f"scroll 중 429 우선순위 결과가 예상과 다름: {result}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -1328,6 +1762,20 @@ def main() -> int:
     check_dom_transition_explicit_mismatch_preserves_partial_rows(reporter)
     check_page2_late_body_access_would_fail_but_snapshot_cached(reporter)
     check_page300_2b2c_reproduction_total_bytes_not_page1_only(reporter)
+
+    check_page2_http_error_stops_before_page3_click(reporter)
+    check_page2_non_json_response_stops_before_page3_click(reporter)
+    check_html_error_body_not_leaked_anywhere_in_result(reporter)
+    check_page300_2b4_exact_reproduction_no_page3_click(reporter)
+    check_late_arriving_http_error_via_drain_stops_before_next_click(reporter)
+
+    check_http_error_arriving_during_scroll_blocks_next_click(reporter)
+    check_non_json_arriving_during_scroll_blocks_next_click(reporter)
+    check_normal_candidate_during_scroll_absorbed_then_click_proceeds(reporter)
+    check_normal_candidate_during_scroll_reaches_target_skips_click(reporter)
+    check_no_candidate_during_scroll_preserves_existing_flow(reporter)
+    check_duplicate_candidate_during_scroll_not_double_counted(reporter)
+    check_http_429_during_scroll_reports_status_429_seen_priority(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

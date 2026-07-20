@@ -6498,3 +6498,351 @@ FAIL - work order §16에 따라 **production 수정 전 재-live 금지**.
   GraphQL 구조가 기존 page 2·3과 다르고 저장된 진단만으로 원인을 확정할 수
   없을 때")에 해당할 가능성이 있으므로, 다음 단계에서 독립 검토 활용을
   검토할 수 있다. 과거 PAGE 기록은 수정하거나 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-4A candidate HTTP 오류 안전 중단 보강
+
+## PAGE-300-2B-4 FAIL 결과(재확인)
+- 검색어 300건 목표, page 1 정상(HTTP 200 object) → page 2 클릭 성공(DOM
+  class diff로 확정) → page 2 candidate가 **HTTP 405 + text/html(583바이트)**
+  반환 → snapshot은 성공(EmptyBody 아님)했지만 production이 json.loads()까지
+  시도해 실패(json_decode_error_count=1, parse_error_count=1) → 이후에도
+  계속 "page 3" 버튼을 클릭하려다 Locator.click()이 **30초 타임아웃**돼서야
+  우연히 멈춤(의도된 안전 중단이 아니었음).
+
+## 핵심 해석
+snapshot 시스템(PAGE-300-2B-2D)은 정상 작동했다 - 문제는 candidate가 정상
+JSON이 아니라 HTTP 405/HTML 오류 응답을 반환했는데도 production이 이를
+구분하지 않고 JSON decode를 시도한 뒤, 계속 다음 페이지를 클릭하려 시도한
+제어 흐름 결함이었다.
+
+## candidate HTTP 오류 분류 / non-JSON 분류
+- candidate entry에 신규 필드 `candidate_error_type`(기본 "") 추가.
+- HTTP 상태 분류(`_classify_candidate_http_status`)는 **candidate 등록
+  시점(response handler)**에 body snapshot 성공/실패와 무관하게 즉시
+  확정한다(status가 200~299 범위 밖이면 "CandidateHttpError") - 최초 구현은
+  이 판정을 `_ensure_parsed`의 body_snapshot_ready 분기 안에만 두어 snapshot
+  자체가 실패한 non-2xx candidate가 누락되는 결함이 있었고, gpt-5.6-sol
+  1차 검토(Medium)에서 지적받아 수정했다(§아래 GPT-5.6-Sol 검토 절 참고).
+- HTTP 2xx(또는 status 미확인)인 candidate는 body의 첫 유효 문자가 "{"
+  또는 "["가 아니면 "NonJsonCandidateBody"로 분류한다 - Content-Type
+  헤더만으로 차단하지 않고 body 내용(first_non_whitespace_character) 기준
+  으로만 판단하므로, Content-Type이 누락되거나 text/plain으로 잘못 표기돼도
+  실제 body가 "{"/"["로 시작하면 정상 decode를 허용한다.
+- 두 경우 모두 json.loads()를 아예 호출하지 않으므로 `json_decode_error_type`
+  은 채우지 않는다("JSON decode 자체를 시도하지 않았기 때문").
+
+## 다음 페이지 클릭 차단(fail-closed 계약)
+- 공유 헬퍼 `_classify_page_candidate_error(ctx, start_index, end_index)`를
+  신설해, 지정된 candidate 인덱스 범위에 candidate HTTP 오류 > non-JSON >
+  snapshot 오류 > JSON decode 오류 우선순위로 pagination_stop_reason
+  (candidate_http_error / candidate_non_json_response / candidate_snapshot_
+  error / candidate_json_decode_error)을 결정한다.
+- 이 헬퍼를 **3곳**에서 호출한다: (1) 새로 확정된 페이지의 메인 harvest
+  직후, (2) 다음 페이지 버튼을 찾은 뒤 클릭 기준점을 확정하기 전 첫 번째
+  drain 직후, (3) class_before를 읽은 뒤 추가 도착 candidate를 처리하는
+  두 번째 drain 직후 - 처음에는 (1)만 구현했으나 gpt-5.6-sol 1차 검토(High)
+  에서 "drain 경로로 늦게 도착하는 오류 candidate는 이 검사를 우회해 다음
+  페이지 클릭이 그대로 진행될 수 있다"는 지적을 받아 (2)/(3)도 추가했다.
+- 어느 경로에서든 오류가 감지되면 pagination_stop_reason을 설정하고 즉시
+  break한다 - DOM class diff로 이미 확정된 pagination_page_count는 되돌리지
+  않는다(페이지 전환 자체와 데이터 품질은 별개 판단).
+
+## snapshot 의미 유지 / 429 기존 계약
+- `body_snapshot_success_count=2, body_snapshot_error_count=0,
+  candidate_http_error_count=1`처럼 snapshot 성공과 candidate HTTP 오류가
+  동시에 성립할 수 있다(서로 다른 의미) - 불변식(success+error+pending==
+  candidate_response_count)은 그대로 유지된다.
+- 기존 `status_429_seen=True` 계약(429 응답이면 candidate 여부와 무관하게
+  무조건 설정)은 변경하지 않았다. 429 candidate는 candidate_http_error_
+  count/candidate_http_status_counts에도 추가로 집계되며, 이 중복은
+  의도된 정책이다(하나는 보안 중단 신호, 다른 하나는 candidate 처리 진단).
+
+## 신규 진단 필드
+`candidate_http_error_count`, `candidate_non_json_count`,
+`candidate_http_status_counts`(status별 카운트 dict),
+`candidate_processing_error_count`(snapshot 실패/미확정/HTTP오류/non-JSON/
+decode실패를 모두 합친 총계). 기존 `json_decode_error_count` 계산 방식도
+함께 수정했다 - 이전에는 "harvest에서 error로 확정된 모든 candidate"를
+셌지만(candidate_error_type 도입 전에는 동일한 의미였음), 이제는
+`entry["json_decode_error_type"]`이 실제로 채워진 경우만 센다(HTTP 오류/
+non-JSON 판정으로 decode 자체를 시도하지 않은 candidate는 제외). 모든
+반환 경로(navigation_error 조기 반환 포함)에 기본값(0/{}/0)과 함께
+포함된다(`_summarize_candidate_snapshots` 공유 헬퍼로 통일).
+
+## raw HTML 미노출
+`candidate_snapshot_diagnostics`/`pagination_error_message`/rows/전체 result
+dict 어디에도 원본 HTML body가 노출되지 않음을 고유 마커 기반 테스트로 확인.
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`(핵심 변경 - candidate_error_type 필드,
+  HTTP 상태/non-JSON 분류, `_classify_page_candidate_error` 공유 헬퍼,
+  drain 2곳 포함 3개 호출부, 신규 진단 필드 4종)
+- `tests/test_pc_network_browser_collector.py`(신규 케이스 8건 추가 - HTTP
+  405/403/500/429 각각, Content-Type 누락/text-plain 경로 3건, 429+EmptyBody
+  이중 집계 확인; 기존 3건을 새 분류 체계에 맞게 갱신 - HTML/gzip body
+  테스트가 이제 candidate_error_type=NonJsonCandidateBody를 기대하도록
+  수정, json_decode_error 테스트는 body를 "{not valid json"으로 바꿔 원래
+  의도(진짜 decode 실패) 유지)
+- `tests/test_pc_network_pagination.py`(신규 케이스 5건 추가 - page2 HTTP
+  405/non-JSON 각각 page3 클릭 차단, HTML 원문 미노출, PAGE-300-2B-4 정확
+  재현, drain 경로 지연 도착 오류 재현; 기존 drain parse_error 테스트 1건을
+  새 fail-closed 계약에 맞게 갱신 - 이제 drain된 오류 candidate는 다음
+  페이지 클릭 자체를 막는다)
+- `tests/test_pc_network_adaptive_settle.py`: 무수정(회귀만 재확인)
+- `src/pc/network_list_scraper.py`: 무수정(이번 단계 범위 아님)
+
+## GPT-5.6-Sol(Codex MCP, read-only) 독립 검토 결과(2라운드)
+1차 검토: **High 1건**(drain 경로 - `_apply_pending_drain()` 호출 후 candidate
+오류 상태를 재검사하지 않고 곧바로 click()으로 진행해, 클릭 직전 200ms
+drain에서 늦게 harvest된 오류 candidate가 다음 페이지 클릭을 막지 못함 -
+정확한 재현 시나리오와 함께 지적), **Medium 1건**(HTTP 상태 분류가
+body_snapshot_ready 분기 안에만 있어 HTTP 429 + EmptyBody 같은 조합에서
+candidate_http_error_count 누락 - 재현 시나리오 제시). 둘 다 수정 반영(위
+절 참고) + 재현 회귀 테스트 3건 추가.
+2차 재검토: 두 수정 모두 원래 결함을 실제로 해결했으며 정상적인 다중
+페이지/drain 흐름에서 오탐(정상 candidate를 오류로 잘못 판정)도 발생하지
+않음을 확인. 다만 **매우 좁은 이론적 타이밍 공백** 1건을 추가로 발견 - 두
+번째 drain 검사 직후부터 실제 `click()` 호출 사이에 있는
+`scroll_into_view_if_needed()` 실행 중 candidate가 도착하면 이 경로는
+재검사되지 않는다(합성 검증 결과 405는 결국 감지되지만 page 2 클릭이 이미
+1회 발생). Critical/High로 분류되지 않았으며, 기존 코드에 이미 문서화된
+"DOM 전환과 response 도착의 인과관계 미보장" 같은 유사한 좁은 한계와
+같은 성격이라 판단해 남은 위험으로만 기록한다.
+
+## 남은 위험(문서화된 알려진 한계)
+- `scroll_into_view_if_needed()`~`click()` 사이의 매우 좁은 타이밍 공백(위
+  GPT-5.6-Sol 2차 검토 참고) - 이 구간에서 오류 candidate가 도착하면 그
+  다음 클릭(1회)까지는 진행될 수 있으나, 그 이후 페이지의 harvest/drain
+  단계에서는 여전히 감지되어 안전 중단된다(무한 진행 아님).
+- 405가 발생한 근본 외부 원인(일시적 서버 오류/반복 요청에 대한 서버
+  반응/특정 page transition 요청 실패/endpoint 내부 정책)은 이번 단계에서도
+  단정하지 않았다 - production 코드에서 이 가능성들을 추측하거나 우회하는
+  로직은 추가하지 않았다.
+- page 1 자체가 candidate HTTP 오류/non-JSON이었을 경우 pagination 진입
+  자체를 막는 로직은 이번 단계 범위에 포함하지 않았다(work order 15개
+  테스트 사례에 해당 시나리오가 없어 스코프를 확장하지 않음) - 다음 단계에서
+  필요성이 확인되면 별도로 검토해야 한다.
+
+## 신규 테스트 요약
+- browser_collector: 50 → 58 PASS(신규 8건: HTTP 405/403/500/429, 429+
+  EmptyBody 이중 집계, Content-Type 누락/text-plain 정상 decode 3건; 기존
+  3건 갱신은 PASS 수 변화 없음).
+- pagination: 36 → 41 PASS(신규 5건: page2 HTTP 405/non-JSON 차단 각 1건,
+  HTML 미노출 1건, PAGE-300-2B-4 정확 재현 1건, drain 경로 지연 오류 재현
+  1건; 기존 1건 갱신은 PASS 수 변화 없음).
+- adaptive_settle: 18 PASS(무수정, 회귀만 재확인).
+- network_product_integration_no_live/pipeline/ui_network_start/
+  ui_network_wiring: 무수정, 회귀만 재확인(각 11/12/15/19 PASS).
+- network_list_scraper(7개 회귀 파일에는 미포함, 별도 확인): 42 PASS(무수정).
+
+## 전체 관련 회귀 파일별 PASS/FAIL(최종)
+| 파일 | PASS | FAIL |
+|---|---|---|
+| tests/test_pc_network_pagination.py | 41 | 0 |
+| tests/test_pc_network_browser_collector.py | 58 | 0 |
+| tests/test_pc_network_adaptive_settle.py | 18 | 0 |
+| tests/test_network_product_integration_no_live.py | 11 | 0 |
+| tests/test_pc_network_pipeline.py | 12 | 0 |
+| tests/test_ui_network_start.py | 15 | 0 |
+| tests/test_ui_network_wiring.py | 19 | 0 |
+| tests/test_pc_network_list_scraper.py(별도) | 42 | 0 |
+
+**7개 회귀 파일 합계: 174건, FAIL 0.**(작업 전 161건 대비 신규 13건).
+list_scraper 별도 42건 포함 전체 216건, FAIL 0.
+
+## 실제 live 미실행 확인
+확인됨 - BrowserSession/Playwright 실행, 네이버 접속, 40·100·300건 live,
+Excel 생성, 기존 marker 삭제 전부 하지 않았다. Fake 객체와 synthetic
+response만 사용했다.
+
+## Git 상태
+`git status --short`/`git diff --name-status` 기준 변경 파일은
+`src/pc/network_browser_collector.py`, `tests/test_pc_network_browser_
+collector.py`, `tests/test_pc_network_pagination.py` + 이 `PROJECT_STATE.md`
+append뿐이다(작업 허용 범위와 정확히 일치). `src/pc/network_list_scraper.py`,
+`src/pc/network_pipeline.py`, `src/pc/browser_session.py`, `src/ui.py`,
+`src/exporter.py`, `app.py`, `tests/test_pc_network_adaptive_settle.py`,
+`tests/test_network_product_integration_no_live.py`,
+`tests/test_pc_network_list_scraper.py` 전부 무수정. git add/commit/push/
+reset/checkout/restore 전부 수행하지 않았다.
+
+## PAGE-300-2B-4B 재검증 진입 가능 여부
+gpt-5.6-sol 2차 재검토 PASS(Critical/High 결함 없음, 좁은 이론적 타이밍
+공백만 남은 위험으로 기록) - 충분한 시간 간격을 둔 뒤 PAGE-300-2B-4B(동일
+검색어, per_query_limit=300/target_count=300, 최대 page 5, 실제 live 정확히
+1회, retry 0)로 진입해 405가 실제로 재현되는지, 재현된다면 이번 안전 중단
+계약이 정확히 동작하는지, 재현되지 않는다면 300건 가능성을 재검증하는 것을
+권장한다. page 6 전환 구현은 아직 진행하지 않는다. 과거 PAGE 기록은
+수정하거나 삭제하지 않았다.
+
+# 2026-07-20 PAGE-300-2B-4A-FIX scroll 이후 pre-click 최종 checkpoint 보강
+
+## 이전 독립 검토의 잔여 타이밍 공백
+PAGE-300-2B-4A GPT-5.6-Sol 최종 검토에서 지적된 잔여 공백: 두 번째 drain
+검사 이후 `target_locator.scroll_into_view_if_needed()` → `target_locator.
+click()` 사이에는 candidate 오류 재검사가 없었다 - scroll 실행 중 HTTP
+405/non-JSON candidate가 도착해도 click() 전에 감지되지 않아 다음 페이지
+클릭이 1회 실행될 수 있었다.
+
+## scroll 중 오류 candidate 도착 재현(합성)
+GPT-5.6-Sol이 읽기 전용 합성 실행으로 재현: page 2 확정 성공 →
+scroll_into_view_if_needed() 실행 중 HTTP 405 candidate 도착 → 기존 코드는
+재검사 없이 곧바로 click() → page3_click_calls=1(안전 중단 아님).
+
+## 최종 pre-click drain/checkpoint
+`target_locator.scroll_into_view_if_needed()`를 별도 try/except로 분리하고,
+그 직후·`click()` 호출 "전"에 다음을 수행한다(`ctx.candidate_response_count
+> candidate_count_before_click`일 때만 - 즉 scroll 중 실제로 새 candidate가
+도착했을 때만 실행하며, 아무것도 도착하지 않으면 추가 대기 없이 곧바로
+click으로 진행한다 - §8 "무조건적인 대기 추가 금지"):
+1. 기존 `_apply_pending_drain` helper로 pending candidate를 harvest·parse.
+2. 공유 helper `_classify_page_candidate_error(ctx, pre_click_drain_start_
+   index, candidate_count_before_click)`로 오류 candidate 검사.
+3. 오류가 있으면 `pagination_stop_reason`을 설정하고 click() 없이 즉시
+   break.
+4. 오류가 없고 흡수된 정상 candidate만으로 이미 `per_query_limit`에
+   도달했다면 `per_query_limit_reached`로 종료하고 click() 생략.
+5. 오류도 없고 목표도 미달일 때만 `class_before`를 다시 읽고 click() 진행.
+
+## candidate index 범위 안전성
+`pre_click_drain_start_index`(= scroll 시작 전 `candidate_count_before_
+click`)부터 drain 이후 갱신된 `candidate_count_before_click`까지만 검사한다 -
+이전 두 drain 구간과 겹치지 않으며(각 구간은 이전 drain이 끝난 지점부터
+시작), 동일 candidate가 두 번 검사되거나 두 번 harvest되지 않는다(기존
+`processed`/`generation` 계약과 object identity dedup 그대로 유지).
+
+## 오류 candidate 차단 / 정상 late candidate 처리 / 목표 도달 시 click 생략
+- scroll 중 HTTP 405/non-JSON candidate 도착 → click() 호출 전에
+  `candidate_http_error`/`candidate_non_json_response`로 안전 중단,
+  `pagination_error_message`는 짧고 비식별적(HTML 원문 미포함).
+- scroll 중 정상 HTTP 200 JSON candidate 도착 → rows에 중복 없이 반영,
+  raw/unique/duplicate 집계 갱신, 목표 미달이면 click은 정상 진행(1회).
+- scroll 중 정상 candidate만으로 목표 도달 → click 생략,
+  `per_query_limit_reached`로 종료.
+- 부분 rows는 모든 경로에서 보존된다(오류 발생 이전까지 확정된 rows 유지).
+
+## GPT-5.6-Sol(Codex MCP, read-only) 독립 검토 결과(3라운드)
+1차 검토(이전 PAGE-300-2B-4A 세션): High 1건(drain 경로) + Medium 1건(429+
+EmptyBody) - 모두 수정 완료(별도 기록).
+2차 검토(이번 세션, pre-click checkpoint 구현 직후): 원래 지적된 scroll→
+click 공백은 정상 해결 확인. 추가로 **Medium 2건 + Low 1건**을 새로 발견:
+- **Medium 1**: scroll 중 정상 candidate를 drain으로 먼저 흡수한 경우,
+  그 이후 `class_before`를 다시 읽는 동안(§ 나선형 하위 공백) 도착하는
+  HTTP 405가 재검사되지 않아 click이 1회 실행될 수 있음(합성 재현 확인).
+- **Medium 2**: scroll 중 candidate 자체가 HTTP 429이면
+  `candidate_http_error_count`는 정상 집계되지만 `pagination_stop_reason`이
+  기존 전역 우선순위(captcha>429>...)를 따르지 않고 "candidate_http_error"로
+  보고됨(중단 자체는 정상, 라벨만 불일치).
+- **Low**: scroll/drain으로 합류된 데이터가 `per_page_diagnostics`에
+  반영되지 않아 페이지별 raw 합계와 전체 raw 집계가 어긋남(기존 drain
+  경로에도 이미 있던 동작 - 이번 신규 회귀 아님).
+Medium 2를 수정 반영(아래 절 참고) + 회귀 테스트 1건 추가.
+3차 재검토(Medium 2 수정 확인): 429 우선순위 수정이 의도대로 동작하며
+(`status_429_seen=False`인 기존 경로의 라벨은 전혀 바뀌지 않음),
+captcha 우선순위와도 충돌하지 않음을 확인. 새로운 Critical/High/Medium
+결함 없음. Medium 1/Low는 사용자가 이번 단계 범위를 "scroll→click 공백만
+제거"로 명시적으로 한정했고(§9 "완전히 잠그는 것은 과도한 구조 변경 없이는
+어렵다"), Medium 1은 이번에 닫은 공백 안에서 한 겹 더 들어간 나선형 하위
+공백(class_before 재조회 자체도 이론상 무한히 재귀 가능)이라는 판단에
+동의 - Critical/High로 재분류할 근거 없음, Low도 전체 rows/집계 손상이
+아닌 페이지별 진단 문제라 범위 제외가 타당하다고 확인. 잔여 참고사항으로
+"helper는 CAPTCHA를 새로 탐지하지 않으므로 drain 순간 CAPTCHA가 동시에
+나타나면 다음 probe 시점까지는 보장 안 됨"과 "scroll 중 non-candidate 429만
+도착하면 candidate_response_count가 늘지 않아 pre-click checkpoint가
+실행되지 않을 수 있음(단, 이 경우도 기존 top-of-loop/post-click 429 검사가
+별도로 여전히 작동)"을 추가로 언급했다 - 둘 다 이번 수정이 만든 회귀가
+아닌 기존 타이밍 한계.
+
+## 429 우선순위 수정(Medium 2)
+`_classify_page_candidate_error`가 candidate 오류를 발견해 reason을
+반환하려는 시점에 `ctx.status_429_seen`이 True이면, 그 reason 대신
+"status_429_seen"을 반환하도록 수정했다(중단 여부는 그대로, 라벨만 기존
+전역 우선순위에 맞춤). 이 함수는 main harvest 직후/drain 2곳/이번에 추가한
+pre-click checkpoint까지 4곳 모두에서 공유되므로 이 한 곳의 수정으로
+전부 일관되게 적용된다.
+
+## 변경 파일
+- `src/pc/network_browser_collector.py`(핵심 변경 - scroll_into_view_if_
+  needed()와 click() 분리, pre-click drain/checkpoint 추가,
+  `_classify_page_candidate_error`의 429 우선순위 라벨링)
+- `tests/test_pc_network_pagination.py`(신규 케이스 7건 추가 - scroll 중
+  HTTP 405/non-JSON 각각 차단, 정상 candidate 흡수 후 click 진행, 정상
+  candidate로 목표 도달 시 click 생략, candidate 없음 시 기존 흐름 유지,
+  동일 response 중복 전달 dedup, scroll 중 429 우선순위 라벨링; 기존
+  `FakePaginationButtonLocator.scroll_into_view_if_needed()`에
+  `responses_during_scroll` 스펙 키 지원 추가)
+- `tests/test_pc_network_browser_collector.py`: 무수정(이번 라운드는
+  pagination 흐름 전용이므로 신규 케이스 없음, 회귀만 재확인)
+- `src/pc/network_list_scraper.py`, `src/pc/network_pipeline.py`,
+  `src/pc/browser_session.py`: 무수정
+
+## 남은 이론적 race(문서화, 이번 단계에서 닫지 않음)
+- Medium 1: scroll 중 정상 candidate 흡수 후 `class_before` 재조회 중
+  도착하는 오류 candidate(나선형 하위 공백 - 사용자 work order §9의
+  "완전히 잠그기 어려운 잔여 이론적 race"에 해당한다고 판단해 범위 제외).
+- Low: drain/scroll로 합류된 데이터가 `per_page_diagnostics`에 반영되지
+  않아 페이지별 합계와 전체 합계가 어긋남(전체 rows/집계 자체는 정확 -
+  기존 drain 경로에도 있던 동작, 이번 신규 회귀 아님).
+- click() 호출 자체의 내부 실행 중 도착하는 response를 이전 페이지 오류로
+  오인해 click을 취소하는 구조는 만들지 않았다(work order §9 명시 금지
+  사항 - click 호출이 이미 시작된 이후의 응답은 다음 페이지의 정당한
+  데이터로 처리되어야 한다).
+
+## 신규 테스트 요약
+- pagination: 47(2B-4A 세션 종료 시점) → 48 PASS(신규 7건: scroll 중 HTTP
+  405/non-JSON 차단 각 1건, 정상 candidate 흡수 후 click 진행 1건, 정상
+  candidate로 목표 도달 시 click 생략 1건, candidate 없음 시 기존 흐름
+  유지 1건, 동일 response 중복 전달 dedup 1건, scroll 중 429 우선순위
+  라벨링 1건).
+- browser_collector: 58 PASS(무수정, 회귀만 재확인).
+- adaptive_settle/product_integration_no_live/pipeline/ui_start/ui_wiring:
+  무수정, 회귀만 재확인(각 18/11/12/15/19 PASS).
+- network_list_scraper(별도): 42 PASS(무수정).
+
+## 전체 관련 회귀 파일별 PASS/FAIL(최종)
+| 파일 | PASS | FAIL |
+|---|---|---|
+| tests/test_pc_network_pagination.py | 48 | 0 |
+| tests/test_pc_network_browser_collector.py | 58 | 0 |
+| tests/test_pc_network_adaptive_settle.py | 18 | 0 |
+| tests/test_network_product_integration_no_live.py | 11 | 0 |
+| tests/test_pc_network_pipeline.py | 12 | 0 |
+| tests/test_ui_network_start.py | 15 | 0 |
+| tests/test_ui_network_wiring.py | 19 | 0 |
+| tests/test_pc_network_list_scraper.py(별도) | 42 | 0 |
+
+**7개 회귀 파일 합계: 181건, FAIL 0.**(작업 전 174건 대비 신규 7건).
+list_scraper 별도 42건 포함 전체 223건, FAIL 0.
+
+## 실제 live 미실행 확인
+확인됨 - BrowserSession/Playwright 실행, 네이버 접속, 40·100·300건 live,
+Excel 생성, 기존 marker 삭제 전부 하지 않았다. Fake 객체와 synthetic
+response만 사용했다.
+
+## Git 상태
+`git status --short`/`git diff --name-status` 기준 변경 파일은
+`src/pc/network_browser_collector.py`, `tests/test_pc_network_browser_
+collector.py`, `tests/test_pc_network_pagination.py` + 이 `PROJECT_STATE.md`
+append뿐이다(작업 허용 범위와 정확히 일치 - 이번 세션에서는 test_pc_network_
+browser_collector.py 자체는 수정하지 않았지만 이전 PAGE-300-2B-4A 세션의
+변경분이 여전히 uncommitted 상태로 남아 있다). `src/pc/network_list_
+scraper.py`, `src/pc/network_pipeline.py`, `src/pc/browser_session.py`,
+`src/ui.py`, `src/exporter.py`, `app.py`,
+`tests/test_pc_network_adaptive_settle.py`,
+`tests/test_network_product_integration_no_live.py`,
+`tests/test_pc_network_list_scraper.py` 전부 무수정. git add/commit/push/
+reset/checkout/restore 전부 수행하지 않았다.
+
+## PAGE-300-2B-4A 최종 PASS/HOLD
+**PASS** - GPT-5.6-Sol 3차 재검토에서 Critical/High/Medium(신규) 결함 없음을
+확인했다. 남은 항목(Medium 1/Low)은 사용자가 명시한 범위 경계 안에서 의도적으로
+문서화만 하고 남겨둔 것이며, 안전성(다음 페이지 클릭 차단·부분 rows 보존) 자체를
+훼손하지 않는다.
+
+## PAGE-300-2B-4B 진입 가능 여부
+PAGE-300-2B-4A(스크롤~클릭 공백 포함 전체 안전 중단 계약)가 최종 PASS로
+확인됐으므로, 이전 기록(PAGE-300-2B-4A)에서 권장한 대로 충분한 시간 간격을
+둔 뒤 PAGE-300-2B-4B(동일 검색어, per_query_limit=300/target_count=300,
+최대 page 5, 실제 live 정확히 1회, retry 0)로 진입하는 것을 권장한다. page 6
+전환 구현은 아직 진행하지 않는다. 과거 PAGE 기록은 수정하거나 삭제하지
+않았다.
