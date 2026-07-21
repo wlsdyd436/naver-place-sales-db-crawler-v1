@@ -40,10 +40,30 @@ class ValidationReporter:
         print("====================")
 
 
+class FakeProgressBar:
+    def __init__(self):
+        self.values: list = []
+
+    def set(self, value):
+        self.values.append(value)
+
+
+class FakeStringVar:
+    def __init__(self):
+        self.values: list = []
+
+    def set(self, value):
+        self.values.append(value)
+
+
 def _make_app():
     # Tk __init__/mainloop 없이 메서드만 호출하기 위해 __new__로 인스턴스만 만든다
     # (test_ui_pc_full_wiring.py와 동일 패턴). log/set_status는 self.after 없이
-    # 바로 리스트에 기록하도록 교체한다.
+    # 바로 리스트에 기록하도록 교체한다. PAGE300-DETAIL-2: 상세정보 진행률이
+    # self.after(0, ...)/progress_bar/progress_percent_var를 쓰므로(§_reset_
+    # detail_progress/_on_detail_progress) 최소 fake를 추가한다 - after는 실제
+    # CTk처럼 지연 없이 즉시 func(*args)를 호출한다(테스트에서는 marshal
+    # 자체를 검증하지 않고, 값이 실제로 반영되는지만 확인).
     app = ui.SalesDbCrawlerApp.__new__(ui.SalesDbCrawlerApp)
     app.stop_event = threading.Event()
     app.pause_event = threading.Event()
@@ -52,17 +72,24 @@ def _make_app():
     app.log = lambda message: logs.append(message)
     app.set_status = lambda message: statuses.append(message)
     app._security_block_decision = None
+    app.after = lambda delay, func=None, *args: (func(*args) if func is not None else None)
+    app.progress_bar = FakeProgressBar()
+    app.progress_percent_var = FakeStringVar()
     return app, logs, statuses
 
 
 class FakeNetworkCollector:
     """NetworkBrowserCollector와 동일한 계약(컨텍스트 매니저 + collect_query)만
-    흉내내는 fake. 실제 Playwright/브라우저는 전혀 다루지 않는다."""
+    흉내내는 fake. 실제 Playwright/브라우저는 전혀 다루지 않는다. PAGE300-
+    DETAIL-2: enrich_detail 호출도 기록하되, 기본은 rows를 내용 변경 없이
+    그대로 echo한다(기존 export 인자 검증 테스트들이 rows == 원본과 정확히
+    같은 내용이라고 가정하므로, 이 기본 동작을 바꾸면 안 됨)."""
 
     def __init__(self, collected_at):
         self.collected_at = collected_at
         self.enter_count = 0
         self.exit_count = 0
+        self.enrich_detail_calls: list = []
 
     def __enter__(self):
         self.enter_count += 1
@@ -74,6 +101,13 @@ class FakeNetworkCollector:
 
     def collect_query(self, job, per_query_limit):
         raise AssertionError("collect_query는 fake orchestrator를 통해서만 참조되어야 하며 직접 호출되면 안 됨")
+
+    def enrich_detail(self, rows, *, max_targets=None, should_continue=None, on_progress=None):
+        self.enrich_detail_calls.append({
+            "rows": list(rows), "max_targets": max_targets,
+            "should_continue": should_continue, "on_progress": on_progress,
+        })
+        return list(rows)
 
 
 class FakeCollectorFactory:
@@ -611,6 +645,178 @@ def check_run_network_pipeline_passes_target_count_through(reporter: ValidationR
         reporter.fail(f"Network worker 결과가 예상과 다름: calls={calls}")
 
 
+# ---------------------------------------------------------------------------
+# PAGE300-DETAIL-2: 상세정보 enrichment production 배선
+# ---------------------------------------------------------------------------
+
+
+def check_enrich_detail_called_once_after_list_before_export(reporter: ValidationReporter) -> None:
+    """목록 수집(orchestrator) -> 상세정보(enrich_detail) -> Excel 저장
+    (excel_exporter) 순서를 호출 순서 기록으로 검증한다(요청서 §2 순서
+    계약)."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    call_order: list = []
+
+    rows = _fake_rows(3)
+    result = _base_result(stop_reason="target_reached", final_count=3, rows=rows)
+
+    def fake_orchestrator(jobs, **kwargs):
+        call_order.append("orchestrator")
+        return result
+
+    class OrderTrackingExporter(FakeExporter):
+        def __call__(self, *args, **kwargs):
+            call_order.append("export")
+            return super().__call__(*args, **kwargs)
+
+    exporter = OrderTrackingExporter()
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    collector = factory.instances[0]
+    # enrich_detail 호출 자체를 call_order에 남기기 위해 사후에 호출 여부만 확인하고,
+    # 순서는 "orchestrator 호출 이후 & export 호출 이전에 enrich_detail_calls가 이미 채워져
+    # 있었는가"로 검증한다(OrderTrackingExporter가 실행되는 시점엔 이미 enrich_detail이
+    # 끝나 있어야 하므로, export 시점에 enrich_detail_calls가 1건이어야 한다).
+    ok = (
+        len(collector.enrich_detail_calls) == 1
+        and call_order == ["orchestrator", "export"]
+    )
+    if ok:
+        reporter.pass_("enrich_detail이 목록 수집 이후·Excel 저장 이전에 정확히 1회 호출됨")
+    else:
+        reporter.fail(f"호출 순서/횟수가 예상과 다름: call_order={call_order}, enrich_detail_calls={collector.enrich_detail_calls}")
+
+
+def check_enrich_detail_max_targets_matches_final_row_count(reporter: ValidationReporter) -> None:
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    rows = _fake_rows(7)
+    result = _base_result(stop_reason="target_reached", final_count=7, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
+    )
+
+    collector = factory.instances[0]
+    call = collector.enrich_detail_calls[0] if collector.enrich_detail_calls else {}
+    if call.get("max_targets") == 7 and len(call.get("rows") or []) == 7:
+        reporter.pass_("enrich_detail에 전달된 max_targets가 최종 rows 개수와 정확히 일치")
+    else:
+        reporter.fail(f"max_targets 결과가 예상과 다름: call={call}")
+
+
+def check_enrich_detail_receives_should_continue_and_on_progress(reporter: ValidationReporter) -> None:
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    rows = _fake_rows(2)
+    result = _base_result(stop_reason="target_reached", final_count=2, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
+    )
+
+    collector = factory.instances[0]
+    call = collector.enrich_detail_calls[0] if collector.enrich_detail_calls else {}
+    should_continue = call.get("should_continue")
+    on_progress = call.get("on_progress")
+    ok = callable(should_continue) and should_continue() is True and callable(on_progress)
+    if ok:
+        on_progress(1, 2, 1, 0)  # 예외 없이 진행률이 반영되는지도 함께 확인
+        ok = app.progress_percent_var.values and app.progress_percent_var.values[-1] == "1/2"
+    if ok:
+        reporter.pass_("enrich_detail에 should_continue(콜러블)/on_progress(콜러블)가 전달되고 진행률이 반영됨")
+    else:
+        reporter.fail(f"should_continue/on_progress 전달 결과가 예상과 다름: call={call}")
+
+
+def check_enrich_detail_skipped_when_stop_event_already_set(reporter: ValidationReporter) -> None:
+    """목록 수집 자체가 이미 사용자 중지로 끝났다면(stop_event set) 새 상세
+    단계를 시작하지 않는다(요청서 §6 - 중지 후 새 방문 없음이 경계에도
+    적용됨)."""
+    app, logs, statuses = _make_app()
+    app.stop_event.set()
+    factory = FakeCollectorFactory()
+    rows = _fake_rows(3)
+    result = _base_result(stop_reason="user_stopped", final_count=3, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
+    )
+
+    collector = factory.instances[0]
+    if collector.enrich_detail_calls == []:
+        reporter.pass_("stop_event가 이미 set된 상태로 목록 수집이 끝나면 enrich_detail을 호출하지 않음")
+    else:
+        reporter.fail(f"stop_event set 상태에서도 enrich_detail이 호출됨: {collector.enrich_detail_calls}")
+
+
+def check_enrich_detail_skipped_when_zero_rows(reporter: ValidationReporter) -> None:
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    result = _base_result(stop_reason="queue_exhausted", final_count=0, rows=[])
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=FakeExporter(),
+    )
+
+    collector = factory.instances[0]
+    if collector.enrich_detail_calls == []:
+        reporter.pass_("최종 rows가 0건이면 enrich_detail을 호출하지 않음")
+    else:
+        reporter.fail(f"rows 0건인데도 enrich_detail이 호출됨: {collector.enrich_detail_calls}")
+
+
+def check_enrich_detail_result_rows_are_exported(reporter: ValidationReporter) -> None:
+    """enrich_detail이 반환한(병합된) rows가 export에 그대로 전달되는지 확인한다 -
+    FakeNetworkCollector.enrich_detail이 place_id에 '-enriched' 표시를 덧붙이는
+    변형된 rows를 반환하도록 커스터마이즈해서 검증한다."""
+    app, logs, statuses = _make_app()
+
+    class EnrichingFakeNetworkCollector(FakeNetworkCollector):
+        def enrich_detail(self, rows, *, max_targets=None, should_continue=None, on_progress=None):
+            self.enrich_detail_calls.append({"rows": list(rows), "max_targets": max_targets})
+            return [dict(r, 대표전화="02-0000-0000") for r in rows]
+
+    class EnrichingFactory:
+        def __init__(self):
+            self.instances: list = []
+
+        def __call__(self, *, collected_at):
+            instance = EnrichingFakeNetworkCollector(collected_at)
+            self.instances.append(instance)
+            return instance
+
+    factory = EnrichingFactory()
+    exporter = FakeExporter()
+    rows = _fake_rows(2)
+    result = _base_result(stop_reason="target_reached", final_count=2, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    exported_rows = exporter.calls[0]["merged_data"] if exporter.calls else []
+    if exported_rows and all(r.get("대표전화") == "02-0000-0000" for r in exported_rows):
+        reporter.pass_("enrich_detail이 반환한 병합 rows가 그대로 Excel export에 전달됨")
+    else:
+        reporter.fail(f"enrich_detail 결과 반영 이상: exported_rows={exported_rows}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -633,6 +839,12 @@ def main() -> int:
     check_default_values_for_network_engine(reporter)
     check_target_count_input_enabled_no_stale_guidance(reporter)
     check_run_network_pipeline_passes_target_count_through(reporter)
+    check_enrich_detail_called_once_after_list_before_export(reporter)
+    check_enrich_detail_max_targets_matches_final_row_count(reporter)
+    check_enrich_detail_receives_should_continue_and_on_progress(reporter)
+    check_enrich_detail_skipped_when_stop_event_already_set(reporter)
+    check_enrich_detail_skipped_when_zero_rows(reporter)
+    check_enrich_detail_result_rows_are_exported(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

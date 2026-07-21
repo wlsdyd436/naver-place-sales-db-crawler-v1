@@ -1977,12 +1977,17 @@ def _find_entry_frame_like(page):
     return page
 
 
-def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY) -> dict:
+def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_continue=None) -> dict:
     """row(place_id 포함)의 상세 페이지를 직접 URL로 방문해 대표전화/주소/
     홈페이지/인스타/블로그/실제 플레이스 URL을 확보한다. 예외를 던지지 않고
     항상 dict를 반환한다(row 삭제 방지 원칙 - 호출자는 실패해도 기존 값을
     유지하면 된다). place_id가 없어 URL을 만들 수 없으면 즉시
-    detail_attempted=False로 반환한다."""
+    detail_attempted=False로 반환한다.
+
+    PAGE300-DETAIL-2: should_continue(선택, 인자 없이 bool 반환)가 주어지고
+    False를 반환하면 첫 시도를 포함해 매 재시도 직전에 확인하여 즉시
+    detail_stop_reason="user_stopped"로 중단한다(요청서 §6 "각 상세 업체
+    방문 전, retry 전"). None(기본값)이면 기존 동작과 완전히 동일하다."""
     name = str(row.get("업체명") or "")
     place_id = row.get("place_id") or ""
     place_url = build_place_url_from_id(place_id)
@@ -2014,6 +2019,10 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY) -> dict:
     last_stop_reason = "unknown_failure"
 
     while attempts_left > 0:
+        if should_continue is not None and not should_continue():
+            result["detail_stop_reason"] = "user_stopped"
+            result["detail_error_type"] = "UserStopped"
+            return result
         attempts_left -= 1
         http_statuses: list = []
 
@@ -2399,42 +2408,64 @@ class DomMembershipCollector:
             except Exception:
                 pass
 
-    def enrich_detail(self, rows: list, *, max_targets: int = None) -> list:
-        """PAGE300-DETAIL-1: 이미 확보된 rows(place_id 포함, DOM 순서)의 앞쪽
+    def enrich_detail(
+        self, rows: list, *, max_targets: int = None, should_continue=None, on_progress=None
+    ) -> list:
+        """PAGE300-DETAIL-1/2: 이미 확보된 rows(place_id 포함, DOM 순서)의 앞쪽
         max_targets개(None이면 전체)만 상세 페이지를 순차 방문해 대표전화/주소/
         홈페이지/인스타/블로그/플레이스 URL을 병합한 새 리스트를 반환한다.
         동시성 없이 순차 실행하며, CAPTCHA/HTTP 403·405·429 감지 시 그 즉시
         중단하고 그때까지의 결과(이미 병합된 rows + 아직 시도하지 않은 원본
         rows)를 그대로 보존한다. 연속 실패가 _CONSECUTIVE_FAILURE_LIMIT를
-        넘어도 동일하게 중단한다. collect_query/기본 UI 흐름에서 자동
-        호출되지 않는다 - 300개 전체 자동 실행 여부는 이번 라운드의 Live
-        표본 결과를 본 뒤 별도로 결정한다(요청서 §9)."""
+        넘어도 동일하게 중단한다.
+
+        should_continue(선택, 인자 없이 bool 반환)는 매 row 처리 전에
+        확인한다(요청서 §6 "다음 업체로 이동하기 전") - False가 되면(사용자
+        중지) 그 즉시 새 방문 없이 남은 row를 원본 그대로 보존하고 반환한다.
+        `_fetch_place_detail`에도 그대로 전달해 retry 도중의 중지도 즉시
+        반영한다.
+
+        on_progress(선택, (completed, total, success_count, failure_count)
+        호출)는 각 row 처리(성공/실패 불문) 직후 호출된다 - 콜백 자체가
+        예외를 던져도 수집 자체는 계속 진행한다(진행률 표시 실패가 수집을
+        막지 않도록)."""
         targets = list(rows[:max_targets]) if max_targets is not None else list(rows)
         remainder = list(rows[max_targets:]) if max_targets is not None else []
+        total = len(targets)
 
         page = self._session.context.new_page()
         merged_rows: list = []
         consecutive_failures = 0
+        success_count = 0
+        failure_count = 0
         stop_reason = None
         try:
             for row in targets:
+                if stop_reason is None and should_continue is not None and not should_continue():
+                    stop_reason = "user_stopped"
                 if stop_reason is not None:
                     merged_rows.append(row)
                     continue
-                detail_result = _fetch_place_detail(page, row)
+                detail_result = _fetch_place_detail(page, row, should_continue=should_continue)
                 merged_rows.append(merge_detail_into_row(row, detail_result))
 
                 if detail_result["detail_success"]:
                     consecutive_failures = 0
-                    continue
+                    success_count += 1
+                else:
+                    failure_count += 1
+                    if detail_result["detail_stop_reason"] in ("captcha_detected", "detail_http_error", "user_stopped"):
+                        stop_reason = detail_result["detail_stop_reason"]
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                            stop_reason = "consecutive_failure_limit"
 
-                if detail_result["detail_stop_reason"] in ("captcha_detected", "detail_http_error"):
-                    stop_reason = detail_result["detail_stop_reason"]
-                    continue
-
-                consecutive_failures += 1
-                if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
-                    stop_reason = "consecutive_failure_limit"
+                if on_progress is not None:
+                    try:
+                        on_progress(len(merged_rows), total, success_count, failure_count)
+                    except Exception:
+                        pass
         finally:
             try:
                 page.close()

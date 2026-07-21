@@ -412,6 +412,79 @@ def check_enrich_detail_success_merges_into_row(reporter: ValidationReporter) ->
         reporter.fail(f"성공 병합 이상: {merged}")
 
 
+# ---------------------------------------------------------------------------
+# 3. should_continue(사용자 중지) / on_progress(진행률) - PAGE300-DETAIL-2
+# ---------------------------------------------------------------------------
+
+
+def check_fetch_place_detail_stops_immediately_when_should_continue_false(reporter: ValidationReporter) -> None:
+    row = _row("카페 중지", "1000001")
+    page = FakePage(entry_frame_by_url={PLACE_URL_1: FakeEntryFrame(title="카페 중지", phone="02-1111-1111")})
+    result = _fetch_place_detail(row=row, page=page, should_continue=lambda: False)
+    if not result["detail_success"] and result["detail_stop_reason"] == "user_stopped" and len(page.goto_calls) == 0:
+        reporter.pass_("_fetch_place_detail: should_continue=False면 첫 시도조차 하지 않고 즉시 user_stopped")
+    else:
+        reporter.fail(f"should_continue 즉시중단 처리 이상: {result} goto_calls={page.goto_calls}")
+
+
+def check_enrich_detail_should_continue_stops_new_visits_and_preserves_remainder(reporter: ValidationReporter) -> None:
+    """on_progress로 "2개 row가 끝났다"는 사실을 확인한 뒤에만 should_continue를
+    False로 바꾼다 - _fetch_place_detail 내부에서도 should_continue를 한 번 더
+    확인하므로(요청서 §6 "retry 전"), row 하나당 호출 횟수가 1회로 고정된다고
+    가정하지 않고 실제 완료 개수 기준으로 중지 시점을 판정한다."""
+    rows = [_row(f"업체{i}", f"400000{i}") for i in range(5)]
+    urls = [f"https://pcmap.place.naver.com/place/400000{i}/home" for i in range(5)]
+    page = FakePage(entry_frame_by_url={u: FakeEntryFrame(title=f"업체{i}", phone="02-0000-0000") for i, u in enumerate(urls)})
+    collector = _make_collector([page])
+
+    state = {"stop": False}
+
+    def should_continue():
+        return not state["stop"]
+
+    def on_progress(completed, total, success_count, failure_count):
+        if completed >= 2:
+            state["stop"] = True
+
+    merged = collector.enrich_detail(rows, should_continue=should_continue, on_progress=on_progress)
+    visited = sum(1 for r in merged if r.get("대표전화"))
+    if len(merged) == 5 and visited == 2 and merged[2]["대표전화"] == "" and merged[3]["대표전화"] == "" and merged[4]["대표전화"] == "":
+        reporter.pass_("enrich_detail: should_continue이 False가 되면 새 방문을 즉시 멈추고 나머지 row는 원본 그대로 보존")
+    else:
+        reporter.fail(f"사용자 중지 처리 이상: merged={merged}")
+
+
+def check_enrich_detail_on_progress_reports_completed_total_success_failure(reporter: ValidationReporter) -> None:
+    rows = [_row("성공업체", "5000001"), _row("실패업체", "5000002")]
+    urls = ["https://pcmap.place.naver.com/place/5000001/home", "https://pcmap.place.naver.com/place/5000002/home"]
+    page = FakePage(entry_frame_by_url={
+        urls[0]: FakeEntryFrame(title="성공업체", phone="02-2222-2222"),
+        urls[1]: FakeEntryFrame(title="완전히다른이름"),
+    })
+    collector = _make_collector([page])
+    progress_calls = []
+    collector.enrich_detail(rows, on_progress=lambda *args: progress_calls.append(args))
+    if progress_calls == [(1, 2, 1, 0), (2, 2, 1, 1)]:
+        reporter.pass_("enrich_detail: on_progress가 (completed,total,success,failure)를 매 row마다 정확히 보고")
+    else:
+        reporter.fail(f"on_progress 호출 이상: {progress_calls}")
+
+
+def check_enrich_detail_on_progress_exception_does_not_break_collection(reporter: ValidationReporter) -> None:
+    rows = [_row("업체A", "6000001")]
+    page = FakePage(entry_frame_by_url={"https://pcmap.place.naver.com/place/6000001/home": FakeEntryFrame(title="업체A", phone="02-3333-3333")})
+    collector = _make_collector([page])
+
+    def bad_progress(*args):
+        raise RuntimeError("progress UI 갱신 실패 시뮬레이션")
+
+    merged = collector.enrich_detail(rows, on_progress=bad_progress)
+    if merged[0]["대표전화"] == "02-3333-3333":
+        reporter.pass_("enrich_detail: on_progress 콜백이 예외를 던져도 상세 수집 자체는 계속 진행됨")
+    else:
+        reporter.fail(f"on_progress 예외 처리 이상: {merged}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
     checks = [
@@ -425,6 +498,10 @@ def main() -> int:
         check_enrich_detail_captcha_stops_and_preserves_remainder,
         check_enrich_detail_consecutive_failure_limit_stops,
         check_enrich_detail_success_merges_into_row,
+        check_fetch_place_detail_stops_immediately_when_should_continue_false,
+        check_enrich_detail_should_continue_stops_new_visits_and_preserves_remainder,
+        check_enrich_detail_on_progress_reports_completed_total_success_failure,
+        check_enrich_detail_on_progress_exception_does_not_break_collection,
     ]
     for check in checks:
         check(reporter)

@@ -7581,3 +7581,116 @@ DOM300_PASS / PLACE_ID_300_PASS / PLACE_URL_300_PASS / DETAIL_PIPELINE_PASS
 않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
 `scratchpad/page300_detail_enrichment_live/`는 `.gitignore`의 `scratchpad/`
 패턴에 포함되어 tracked 변경에 나타나지 않는다.
+
+---
+
+# 2026-07-21 PAGE300-DETAIL-2: 상세정보 enrichment production 배선(진행률/취소/부분저장)
+
+## 배경/기준
+시작 HEAD `e38c2847b5e20f8ba34ac5f0b6482d4d01a53ed4`("기능: place_id 기반
+상세정보 보강 엔진 추가" - 직전 라운드가 사용자에 의해 이 커밋으로 합쳐짐),
+시작 working tree clean. 직전 라운드는 `DomMembershipCollector.enrich_
+detail()`을 검증만 하고 UI 기본 흐름에 자동 연결하지 않았는데, 이번 요청은
+그 연결을 명시적으로 지시했다(요청서 §4 "새 UI 토글 없이 기본 흐름에 자동으로
+이어져야 한다").
+
+## 감사 결과
+- `_run_network_pipeline`(`src/ui.py`)의 `with collector_factory(...) as
+  collector:` 블록이 `orchestrator(...)` 호출 직후 곧바로 닫히므로, 상세
+  단계는 **이 블록이 닫히기 전에** 호출해야 같은 브라우저 세션을 재사용해
+  query job마다 반복하지 않고 정확히 1회만 실행할 수 있다.
+- `run_collection_plan`이 이미 place_id 기준 전체 dedup + target_count
+  트림을 끝낸 rows를 반환하므로, 그 rows 1회에만 상세를 적용하면 다중
+  query 계약(§9, 동일 place_id 중복 방문 금지 포함)이 자동으로 만족된다.
+- `self.log`/`self.set_status`는 이미 `self.after(0, ...)`로 메인 스레드에
+  marshal되어 있어 워커 스레드에서 직접 호출해도 안전함을 확인 - 상세
+  진행률도 기존 `_set_queue_progress`와 동일한 패턴(`self.after(0, ...)`로
+  `progress_bar`/`progress_percent_var` 갱신)을 재사용했다(신규 위젯 없음).
+- `self.stop_event`가 이미 유일한 취소 신호이며 목록 단계에도 이미 쓰이고
+  있어, 상세 단계에도 동일한 람다를 그대로 재사용했다.
+- **회귀 발견 및 수정**: `collector_factory=NetworkBrowserCollector`(legacy
+  롤백 경로)를 명시적으로 주입하는 기존 테스트(`test_network_product_
+  integration_no_live.py`, `test_ui_network_export.py`)가 `NetworkBrowser
+  Collector`에는 `enrich_detail`이 없어 배선 직후 실패했다(`self.after`
+  미정의로 인한 RecursionError로 먼저 드러남 - `SalesDbCrawlerApp.__new__`
+  로 만든 헤드리스 인스턴스는 진짜 Tk 위젯이 아니라 임의 속성 접근 시 무한
+  재귀가 난다). `hasattr(collector, "enrich_detail")`로 감싸 legacy
+  collector에는 상세 블록 전체(진행률 초기화 포함)를 건너뛰도록 수정해
+  해결했다 - 두 기존 테스트 파일은 fixture조차 건드리지 않고 그대로
+  통과한다(가장 minimal한 해결책).
+
+## 변경 사항 요약
+- `src/pc/network_browser_collector.py`: `_fetch_place_detail`/`DomMembership
+  Collector.enrich_detail`에 `should_continue`(사용자 중지, 매 row 전 +
+  retry 전 확인)와 `on_progress(completed, total, success_count,
+  failure_count)`(매 row 처리 후 호출, 콜백 예외는 무시) 파라미터 추가(둘 다
+  기본값 None - 하위 호환).
+- `src/ui.py`: `_run_network_pipeline`의 `with collector_factory(...)` 블록
+  안, `orchestrator` 호출 직후에 `hasattr(collector, "enrich_detail")` +
+  rows 존재 + stop_event 미설정일 때만 `collector.enrich_detail(rows,
+  max_targets=len(rows), should_continue=..., on_progress=self._on_detail_
+  progress)` 호출 + `result["rows"]`를 그 결과로 교체. 신규 `_reset_detail_
+  progress(total)`/`_on_detail_progress(completed, total, success, failure)`
+  메서드 추가(기존 progress_bar/progress_percent_var/set_status 재사용).
+  Excel 저장 직전 상태 문구 1줄 추가. `_network_stop_message`/`_export_
+  network_result`는 무수정.
+
+## 테스트 결과
+`test_pc_detail_enrichment.py` 14/14(기존 10 + should_continue/on_progress
+신규 4). `test_ui_network_wiring.py` 25/25(기존 19 + enrich_detail 배선
+검증 신규 6 - 호출 순서/횟수, max_targets 일치, should_continue·on_progress
+전달, stop_event 선행 시 미호출, rows=0 시 미호출, 병합 결과가 export에
+반영됨). `test_ui_dom_membership_wiring.py` 3/3 유지. 전체 회귀(`tests/*.py`
+31개) 30 PASS/1 FAIL(baseline `test_excel_validation.py`만, 신규 실패 없음
+- 위 회귀 2건은 감사 중 발견 즉시 `hasattr` 가드로 해결).
+
+## Live 검증(production 경로, RUN_ID `PAGE300_DETAIL2_20260721_232651`)
+검색어 "서울특별시 강동구 천호동 카페", Edge, PID 8336. 목록: final_count=300,
+unique_place_id=300, place_url_filled=300. **상세 표본 30개: attempted=30,
+success~=30, failed~=0**(0건 실패), 소요 27.09초(평균 0.9초/건), 업체명/
+place_id 오매칭 0건. progress_log 정확히 30건 기록(콜백이 row마다 정확히
+1회 호출됨을 실측 확인). 컬럼별 채움(표본 30개): 대표전화 27, 주소 30,
+플레이스 URL 30, 홈페이지 9, 인스타 13, 블로그 1. CAPTCHA/HTTP 403·405·429
+없음. Excel 300행×11컬럼. process_cleanup=exited.
+
+**300건 전체 상세 예상 소요시간(30건 선형 외삽): 약 270.9초(~4.5분)** - 목록
+수집 시간(약 3분)에 더해지는 추가 시간이며, 실제 300건 연속 방문 시의
+네이버 차단 위험은 이번 30건 범위를 넘어서는 실측이 아니다.
+
+## 분리 판정
+DETAIL_PRODUCTION_WIRING_PASS / DETAIL_PROGRESS_PASS / DETAIL_CANCEL_PASS*
+/ DETAIL_PARTIAL_SAVE_PASS* / DETAIL_SAMPLE30_PASS / EXCEL_11COL_PASS
+(*cancel/partial-save는 이번 30건 Live에서 실제로 중지를 발생시키지 않았으므로
+`test_pc_detail_enrichment.py`의 fake 테스트 결과로 대체 판정함 - 아래
+남은 위험 참고)
+
+## 전체 판정
+**FULL_DETAIL300_READY**(이는 300건 전체 상세 수집이 완료됐다는 뜻이 아니라,
+실사용에서 전체 상세 수집을 실행할 준비가 완료됐다는 뜻이다).
+
+## 남은 위험/다음 단계
+1. **사용자 중지(cancel)와 부분 저장은 이번 Live에서 실제 브라우저로
+   재현되지 않았다** - fake 테스트(`test_pc_detail_enrichment.py`의
+   `check_enrich_detail_should_continue_stops_new_visits_and_preserves_
+   remainder` 등)로만 검증됐다. 실제 UI에서 "중지" 버튼을 상세 수집 도중
+   눌렀을 때의 실제 동작은 이번 라운드에서 실측되지 않았다.
+2. **300건 전체 상세 자동 실행은 여전히 실측되지 않았다.** 이번 변경으로
+   실제 사용자가 "수집 시작"을 누르면 300건 전체에 대해 자동으로 상세
+   방문이 시작된다 - 30건 표본은 0% 실패였지만, 300건 연속 실행 시 네이버
+   측 rate limit/CAPTCHA가 트리거될 가능성은 여전히 실측되지 않은 채로
+   production 기본 동작이 되었다. 이는 사용자가 명시적으로 요청한 범위(요청서
+   §4 "자동으로 이어져야 합니다")를 그대로 반영한 결과다.
+2-1. 목록 수집(약 2~3분) + 상세 300건(외삽 약 4.5분)을 더하면 전체 실행
+   시간이 기존 대비 약 2배 이상 늘어난다 - 사용자에게 이 시간 증가가
+   예상 범위인지 확인이 필요할 수 있다.
+3. `collector_factory=NetworkBrowserCollector`(legacy)로 명시 롤백하면
+   상세정보 단계 자체가 완전히 사라진다(hasattr 가드) - 이는 의도된
+   동작이지만, 향후 이 가드 자체를 깜빡하고 다른 collector 구현체에
+   `enrich_detail`을 잘못된 형태로 추가하면 조용히 오작동할 수 있다는
+   점을 남겨둔다.
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean` 전부 수행하지
+않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
+`scratchpad/page300_detail_production_live/`는 `.gitignore`의 `scratchpad/`
+패턴에 포함되어 tracked 변경에 나타나지 않는다.
