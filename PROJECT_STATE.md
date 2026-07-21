@@ -7087,3 +7087,358 @@ live300/`(live harness+marker+결과 JSON)는 `.gitignore`의 `scratchpad/`
 패턴에 이미 포함되어 tracked 변경에 나타나지 않는다. `output/native_cdp_
 live300_20260721_162906.xlsx`도 `.gitignore`의 `output/*.xlsx` 패턴에
 포함된다.
+
+---
+
+# 2026-07-21 PAGE300-DOM-1: DOM-first membership 300건 통합(collect_dom_membership_query)
+
+## 배경/기준 커밋
+시작 시점 HEAD `ef0312b5233f62f1bddeec7c47ac088ba3d441e6`("기능: 네이티브
+브라우저 CDP 백엔드 통합"), 시작 working tree clean(git status --short
+출력 없음). 사용자 지시서(PAGE300 4B2 계열, 20섹션)에 따라 단일 검색어에서
+DOM에 실제 렌더링된 업체 목록을 최종 membership 기준으로 삼고 Network/
+Apollo는 필드 보강 전용으로만 결합하는 신규 수집 경로를 요청받았다.
+
+## 감사한 artifacts
+`cdp_validation_tests/comprehensive_cdp_tester.py`(Edge 2회·Chrome 2회
+실측, 70/70/70/70/20=300건, CAPTCHA/HTTP 오류 없음 - 이번 구현의 스크롤
+방법론 기준), `cdp_validation_tests/report_edge_run1.json` 등 4개 report/
+raw json, `scratchpad/page300_4b2_apollo_consistency/`의 run_metadata.json/
+apollo_entity_summary.json/apollo_place_entities.json/dom_rows_full.json/
+stable_identifier_report.json/three_way_mapping.json/final_report.md/
+implementation_decision.md/probe_consistency.py 전수 확인.
+
+## 중간 감사: 53건 vs 70건 스크롤 방법론 판정
+구현 착수 직후 "최근 실행에서 page 1 DOM이 53개에서 안정화됐다"는 사용자
+보고로 작업을 일시 중단하고 두 스크립트를 구조 비교했다:
+- `comprehensive_cdp_tester.py`(70건): `container.scrollBy(0,1000)` 상대
+  증분 + `scrollHeight` 3틱 연속 불변으로 안정화 판정 + 단일
+  `frame.evaluate()` 안에서 완결 + 최대 40회 + 600ms tick.
+- `probe_consistency.py`(53건, RUN_ID PAGE300_4B2_20260721_171414): `container.
+  scrollTo(0, curr_height)` 절대 좌표 점프 + `item_count`(범용 `li`, row
+  selector 미한정) 3틱 연속 불변으로 안정화 판정 + Python 루프에서 매 tick
+  evaluate 2~3회 왕복 + 최대 20회 + 1000ms tick.
+
+scrollTo 절대 점프는 이미 도달한 위치로 반복 점프할 경우 실질적인 scroll
+이벤트를 재발생시키지 못해 lazy-load 재트리거가 끊길 수 있고, item_count
+기반 판정은 네트워크 지연 중에도 "변화 없음"으로 오판하기 쉬우며, 반복
+예산도 절반이라는 3가지 구조적 차이를 근거로 53건을 조기 종료 아티팩트로
+판정했다(실제 검색 결과 감소가 아님). 사용자가 이 판정을 승인하고
+`comprehensive_cdp_tester.py` 방식을 production 기준으로 확정했다(추가
+Gemini 재실측 없이 진행).
+
+## 실제 수정/추가 파일
+- `src/pc/network_list_scraper.py`: 기존 함수는 전혀 수정하지 않고, DOM
+  membership 순수 함수만 append(정규화/place_id 추출/entity 인덱스/
+  매칭 우선순위 엔진/필드 병합/page signature/dedup/진단 카운터/trim).
+  Import 추가: `hashlib`, `re`.
+- `src/pc/network_browser_collector.py`: 기존 `collect_network_query` 등은
+  전혀 수정하지 않고, `collect_dom_membership_query` 신규 함수와 전용 JS
+  상수(`_DOM_SCROLL_JS`/`_DOM_ROW_EXTRACTION_JS`/`_APOLLO_ENTITY_EXTRACTION_
+  JS`/`_CURRENT_PAGE_AND_TOP10_JS`) + 최소 헬퍼(`_parse_candidate_entry_
+  items`/`_harvest_all_candidates`/`_has_blocking_http_status`/`_wait_for_
+  dom_page_transition`)만 append. 기존 `_QueryObservationContext`/응답
+  핸들러 3종/`_find_search_frame`/`_find_page_button`/`_safe_get_attribute`/
+  `_probe_captcha_state`/goto 로직을 그대로 재사용(중복 재구현은 candidate
+  JSON 파싱 최소 로직 하나뿐 - closure라 직접 재사용 불가했던 부분).
+- `tests/test_pc_dom_membership.py`(신규): 순수 로직 24개 검증(정규화/
+  place_id 추출/매칭 6단계 우선순위/ambiguous 강등/3가지 병합 조합/
+  enrichment 실패 시 DOM 유지/dedup 우선순위/업체명 단독 dedup 금지/
+  동일 이름 다른 지점 유지/signature/전환 판정/진단 카운터/trim/Excel
+  11컬럼/Apollo 스키마 변경 안전 저하).
+- `tests/test_pc_dom_membership_collector.py`(신규): FakePage/FakeDomFrame
+  기반 16개 검증(scrollBy/selector 리터럴 확인, skeleton 제외+순서 보존,
+  page별 가변 수량, target 300 trim, CAPTCHA/HTTP 403·405·429 안전 중단,
+  container 소실, signature 미변경/전환 timeout 중단, DOM+Network/DOM+
+  Apollo ID 매핑 배선, Apollo unavailable 저하, Network-only 제외, Excel
+  11컬럼). 실제 브라우저 미실행.
+- `scratchpad/page300_dom_membership_live/run_live_verification.py`(신규,
+  production 코드 아님): Live 검증 1회용 러너. `output.xlsx`/`live_report.
+  json`도 이 폴더에 생성됨(`.gitignore`의 `scratchpad/` 패턴에 포함).
+- 수정하지 않음: `browser_session.py`, `config.py`, `export_adapter.py`,
+  `exporter.py`, `src/ui.py`, `src/crawler.py`, `src/pc_crawler.py`,
+  `network_pipeline.py`. UI/`run_collection_plan`에 신규 함수를 연결하지
+  않았다 - 독립 함수로만 추가(§보고 규칙: 프로덕션 경로 미연결 명시).
+
+## DOM membership / enrichment 설계 요약
+- membership: `li.UEzoS.rTjJo` DOM row 배열 순서를 그대로 최종 순서로
+  사용(Apollo/Network 순서 미사용). 업체명 없는 row(skeleton)만 제외.
+- 매핑 우선순위: place_id -> normalized place_url -> (이름,업종,주소) ->
+  (이름,업종)만 일치(항상 AMBIGUOUS로 강등, 임의 채택 금지). 각 단계 후보
+  2건 이상이면 그 단계에서 즉시 AMBIGUOUS 확정(하위 단계로 내려가지 않음).
+- 필드 우선순위: Network 검증값 > Apollo 구조화값 > DOM 직접값 > DOM
+  raw_text 정규식 파싱값(리뷰수만) > 빈값. 플레이스 URL은 DOM anchor href를
+  최우선으로 쓰고, `_map_item_to_row`의 구성 fallback("/place/{id}/home",
+  실측 세그먼트 "/restaurant/{id}/home"과 불일치 확인됨)은 신뢰하지 않는다.
+- dedup: place_id > normalized place_url > (이름,업종,주소) > (이름,업종,
+  raw_text) > (이름, page, dom_index 고유키, 최후 fallback) - 업체명 단독
+  dedup은 어떤 경우에도 발생하지 않는다.
+- page 전환 확인: 기대 페이지 번호 일치 AND top-10 signature 변화 둘 다
+  필요(페이지 번호만으로 완료 처리하지 않음).
+
+## 테스트 결과
+- 신규 `test_pc_dom_membership.py`: 24/24 PASS.
+- 신규 `test_pc_dom_membership_collector.py`: 16/16 PASS(실제 브라우저 미실행).
+- 전체 회귀(`tests/*.py` 28개 개별 실행): 27 PASS / 1 FAIL(`test_excel_
+  validation.py`, baseline과 동일한 기존 실패 - output 폴더에 그 이름
+  패턴의 파일이 없어서 발생, 코드 변경과 무관). baseline 대비 신규 실패
+  없음.
+
+## Live 검증 1회 결과(`scratchpad/page300_dom_membership_live/run_live_
+verification.py`, RUN_ID `PAGE300_DOM1_20260721_180313`)
+검색어 "서울특별시 강동구 천호동 카페", backend=native_cdp, browser
+preference=edge. 실제 사용 브라우저 `C:\Program Files (x86)\Microsoft\
+Edge\Application\msedge.exe`, PID 16140, CDP port 49643(동적,
+127.0.0.1 전용), profile `%LOCALAPPDATA%\NaverPlaceSalesDbCrawler\
+browser_profiles\edge`.
+
+page별 DOM row 수(스크롤 iters): page1=70(23), page2=70(21), page3=70(19),
+page4=70(13), page5=20(7) - **comprehensive_cdp_tester.py의 검증된
+70/70/70/70/20과 정확히 일치**하며, page별 top10_hash/first_name도
+`report_edge_run1.json`과 완전히 동일했다(예: page1 first_name "비트카페
+라운지 천호점", top10_hash `2e649af4dcbaba57a34b1014da527716`). page별
+final_unique_count 누적: 70/140/210/280/300. stop_reason=
+"target_reached", page_count=5, final_unique_count=300. CAPTCHA
+(active_captcha_detected)=False, status_429_seen=False, navigation_error=
+False, HTTP 403·405 candidate 없음. Excel(`output.xlsx`) 검증: rows=300,
+columns=11, 헤더가 `exporter.MERGED_COLUMNS`와 순서까지 정확히 일치.
+process_cleanup="exited"(owned process 정상 종료 확인, session `__exit__`
+정상 반환).
+
+**판정: PAGE300_FULL_PASS**(요청서 §17/§9에 명시된 성공 조건 - DOM 수집량/
+final unique=300/Excel 300행·11컬럼/CAPTCHA·HTTP 오류 없음/cleanup 완료를
+모두 충족).
+
+## 남은 위험/다음 단계(중요 - 반드시 확인)
+1. **Network/Apollo 고신뢰 매칭이 이번 Live에서 0건이었다.** 5개 page
+   전부 `exact_id_match_count=0`/`exact_url_match_count=0`/`composite_
+   match_count=0`이며, 300건 전부 `AMBIGUOUS`(이름+업종은 일치하지만
+   place_id/URL/주소로 확정할 수 없어 임의 채택하지 않음)로 분류됐다.
+   Excel 필드 채움률을 직접 확인한 결과: 업체명 300/300, 업종 300/300,
+   수집일 300/300, 리뷰수(DOM raw_text 정규식 fallback) 285/300, **플레이스
+   URL 17/300, 주소 0/300, 대표전화·홈페이지·인스타·블로그 0/300**이었다.
+   원인으로 추정되는 것: DOM row의 anchor href 기반 place_id/place_url
+   추출(이번 작업에서 처음 구현 - 검증된 `comprehensive_cdp_tester.py`의
+   `extract_page_data`는 애초에 href/주소 텍스트를 추출한 적이 없었다)이
+   실제 Naver 카드 구조에서 거의 동작하지 않은 것으로 보인다. "정확히
+   1회만 Live 수행, 반복 금지, 임의 보완 금지" 지시에 따라 이 문제를
+   고치기 위한 재실행은 하지 않았다 - **rows 자체(업체명/업종/수집일 300건)는
+   요청서 §11의 "enrichment 실패해도 row 삭제 금지" 규칙대로 정상 보존됐지만,
+   상세 필드(특히 주소/URL/연락처) 활용도는 이번 Live 기준으로 낮다.** 다음
+   단계에서 실제 DOM에 anchor `<a href>`가 존재하는지, 존재한다면 셀렉터가
+   `li.UEzoS.rTjJo a[href]`로 실제로 잡히는지를 별도 진단(코드 변경 없이
+   readonly 관찰)으로 먼저 확인한 뒤에만 후속 수정을 검토해야 한다.
+2. 이 신규 함수는 UI/`run_collection_plan`에 연결되지 않은 독립 함수다 -
+   실제 사용자가 쓰려면 별도 배선 작업과 승인이 필요하다.
+3. 이번 Live는 Edge·단일 검색어·단일 조합 1회만 검증했다 - Chrome
+   preference나 다른 검색어/지역 조합의 재현성은 확인되지 않았다.
+4. `_wait_for_dom_page_transition`의 hard_cap_ms(15000)/poll_ms(300)는
+   이번 1회 Live에서 매 페이지 전환이 즉시 확인되어 문제가 없었으나,
+   더 느린 네트워크/렌더링 환경에서의 여유는 별도로 검증되지 않았다.
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean` 전부 수행하지
+않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
+`scratchpad/page300_dom_membership_live/`는 `.gitignore`의 `scratchpad/`
+패턴에 포함되어 tracked 변경에 나타나지 않는다.
+
+---
+
+# 2026-07-21 PAGE300-DOM-2: React Fiber place_id 통합 + production 배선
+
+## 배경/기준
+시작 HEAD `ef0312b5233f62f1bddeec7c47ac088ba3d441e6`(직전 PAGE300-DOM-1 커밋과
+동일 - 그 사이 git 변경 없음). 직전 라운드(PAGE300-DOM-1)의 Live 검증에서
+Network/Apollo 고신뢰 매칭이 0건이었던 원인을 규명하고, `collect_dom_
+membership_query`를 실제 production pipeline에 배선하라는 요청을 받았다.
+
+## 감사한 artifacts
+`scratchpad/page300_4d_dom_place_id_audit/`의 audit.py(실제 실행된 JS 원본),
+final_report.md, implementation_recommendation.md, framework_property_paths.json,
+identifier_coverage.json, dom_identifier_mapping.json, apollo_entities.json,
+dom_row_attributes.json, dom_anchor_inventory.json, dom_property_inventory.json,
+network_entities.json 전수 확인. 핵심 발견:
+- DOM 카드의 anchor href는 전부 `href="#"`(placeholder)임을 실측으로 재확인
+  (`dom_anchor_inventory.json`) - 직전 라운드의 낮은 URL/주소 채움률의 원인이
+  이것이었음이 최종 확인됨.
+- `audit.py`의 실제 알고리즘은 리터럴 경로 하드코딩이 아니라 bounded recursive
+  search(maxDepth=7, `ref/return/sibling/parent/child/memoizedProps/
+  memoizedState/stateNode/updateQueue` 스킵, `id|place|business|url|href|link|
+  restaurant|entry|cid` 키워드 필터)였고, 42/42 row가 동일 경로
+  (`pendingProps.children.1.props.item.id`/`apolloCacheId`)로 수렴했다.
+- Apollo entity의 실제 key prefix는 `PlaceListBusinessesItem:`만 관측됨
+  (`RestaurantBase:`는 0건 - final_report.md 서술과 실제 데이터가 다름, guard는
+  둘 다 확인하되 강하게 의존하지 않음).
+- `network_allsearch_rows.json`/`network_all_candidate_rows.json`/이번 audit의
+  network_entities.json 전부에 `tel`/`virtualTel`/`homePage` 필드가 없음을
+  재확인 - 대표전화/홈페이지/인스타/블로그는 place_id 매칭 품질과 무관하게
+  list 응답 자체에 데이터가 없어 채워지지 않을 구조적 한계로 판단.
+- 유일한 기존 "상세정보" 흐름인 `src/pc/detail_scraper.py`는 카드 클릭 →
+  entryIframe 진입 방식(legacy)이며, README §1의 "카드를 클릭해 상세 화면으로
+  진입하지 않습니다" 원칙과 정면 충돌 + 300건 순차 클릭이라는 새로운 위험을
+  추가하므로 이번 범위에서 재사용하지 않기로 판단(대규모 신규 구현 금지 지시와도
+  일치).
+
+## 배선 방식 결정(AskUserQuestion)
+production 배선 방식(NetworkBrowserCollector 기본 동작 대체 여부)을 사용자에게
+직접 확인했다. 감사 결과 `NetworkBrowserCollector.collect_query`를 직접
+`collect_dom_membership_query`로 교체하면 그 클래스에 의존하는 기존 fake
+테스트 15개 이상(FakePage가 frame.evaluate를 지원하지 않음)이 깨짐을 미리
+확인해 선택지에 포함시켰다. 사용자는 "병렬 클래스 추가 + production 기본
+경로를 새 클래스로 배선 + 기존 NetworkBrowserCollector는 legacy 보존 + UI
+토글 추가 안 함 + 기존 fake 테스트 강제 재작성 안 함 + 신규 production wiring
+테스트 별도 추가 + Live는 production factory/run_collection_plan 경로로 수행"을
+명시적으로 선택했다.
+
+## 실제 수정/추가 파일
+- `src/pc/network_list_scraper.py`(기존 함수 일부 수정): `_is_valid_place_id_
+  format`/`apollo_key_exists_for_id`/`resolve_dom_identifier`(guard 엔진) 신규
+  추가. `normalize_dom_row`에 `apollo_raw_keys` 파라미터 추가하고, 기존
+  "anchor href에서 place_id 직접 추출" 로직을 `resolve_dom_identifier` 호출로
+  대체(anchor href는 이제 place_id 판단에서 최후 fallback(HREF_ID)으로만
+  쓰이고, "플레이스 URL" 필드 구성 로직은 그대로 유지). `resolve_match`/
+  `merge_dom_row_fields`/dedup류 함수는 전혀 수정하지 않음(place_id 신뢰도가
+  높아지면 기존 우선순위 로직이 그대로 EXACT_ID를 만들어냄을 확인).
+- `src/pc/network_browser_collector.py`: `_DOM_ROW_EXTRACTION_JS`를 React
+  Fiber 기반 place_id 후보 수집 로직으로 교체(`__reactFiber$`/`__reactProps$`
+  동적 suffix key 탐색 → fast path(`item.id`/`apolloCacheId`) → bounded search
+  fallback(maxDepth 6, 방문 객체 500 상한, Set 기반 순환 차단 - audit.py의
+  검증된 방식을 최소 각색, WeakSet 대신 Set을 쓴 것은 단일 evaluate 호출 안에서
+  스코프가 끝나 메모리 누수 위험이 없기 때문). `collect_dom_membership_query`
+  루프에서 Apollo 추출을 DOM row 정규화보다 먼저 수행하도록 재배치(guard의
+  Apollo key 확인용). per_page_diagnostics에 `identifier_method_counts`/
+  `identifier_resolved_count`/`network_exact_id_count`/`apollo_exact_id_count`
+  추가. 신규 `DomMembershipCollector` 클래스 추가(`NetworkBrowserCollector`와
+  동일 계약, 내부적으로 `collect_dom_membership_query` 호출, `_default_session_
+  factory` 재사용). `collect_network_query`/`NetworkBrowserCollector`는 이
+  변경으로 전혀 수정되지 않음.
+- `src/ui.py`: import에 `DomMembershipCollector` 추가(`NetworkBrowserCollector`
+  import는 더 이상 이 파일에서 쓰이지 않아 제거 - 클래스 자체는 network_
+  browser_collector.py에 그대로 보존됨). `_run_network_pipeline`의 기본값
+  `collector_factory=NetworkBrowserCollector` → `collector_factory=
+  DomMembershipCollector`로 변경(**production 기본 경로 변경** - UI 토글
+  없이 기본 버튼 동작 자체가 DOM-first로 바뀜). 그 외 UI 코드/시그니처 무변경.
+- `tests/test_pc_dom_membership.py`(기존 파일 갱신): 직접 `place_id` 필드를
+  주입하던 기존 fixture 일부를 `identifier_candidates` 구조로 갱신(신호 소스가
+  바뀌었으므로 자연스러운 갱신 - 매칭/병합 로직 자체의 기대값은 변경 없음).
+  `resolve_dom_identifier` guard 검증 12개 신규 추가(fast path item.id/
+  apolloCacheId, id·apolloCacheId 일치/충돌, bounded search 단일값/충돌값,
+  형식 검증 거부, href fallback, UNRESOLVED에도 row 유지, apollo_confirmed
+  전달, 300개 uniqueness). 총 36개(기존 24 + 신규 12).
+- `tests/test_pc_dom_membership_collector.py`(기존 파일 갱신): `_dom_row`
+  헬퍼가 `place_id`를 `identifier_candidates.fast_item_id`로 주입하도록 변경.
+  DOM+Network/DOM+Apollo ID 매핑 테스트를 유효 자릿수 ID로 갱신. JS 리터럴
+  구조 확인(Fiber key 탐색/bounded search guard) 2개, Fiber 없음 시 row 유지
+  1개, collector 통과 300 uniqueness 1개 신규 추가. 총 20개(기존 16 + 신규 4).
+- `tests/test_ui_dom_membership_wiring.py`(신규): `_run_network_pipeline`의
+  기본 `collector_factory`가 `DomMembershipCollector`임을 `inspect.signature`로
+  확인(실제 브라우저 실행 없음 - 기본값을 호출하지 않고 정적으로만 확인).
+  `NetworkBrowserCollector`가 손상 없이 보존되어 있는지도 함께 확인. 3개.
+- `scratchpad/page300_dom_place_id_live/run_live_verification.py`(신규,
+  production 코드 아님): 이번 라운드 Live 검증 러너 - `collect_dom_membership_
+  query`를 직접 호출하지 않고 `DomMembershipCollector` + `run_collection_plan`
+  (production과 동일 경로)을 그대로 사용.
+- 수정하지 않음: `browser_session.py`, `config.py`, `export_adapter.py`,
+  `exporter.py`, `src/crawler.py`, `src/pc_crawler.py`, `detail_scraper.py`,
+  `pipeline.py`, `network_pipeline.py`, 기존 `test_pc_network_browser_
+  collector.py`/`test_ui_network_wiring.py`(감사 결과 영향 없음 확인 - 전자는
+  `collect_network_query`를 직접 호출, 후자는 전부 `collector_factory=
+  factory`(fake)를 명시 주입해 기본값 교체와 무관함을 실행 전에 확인함).
+
+## Guard 로직 요약
+우선순위: fast path(`item.id`/`apolloCacheId` 상호 검증, 불일치 시 CONFLICT로
+확정하고 임의 채택 안 함) > bounded search(distinct 유효값이 정확히 1개일 때만
+채택, 2개 이상이면 CONFLICT) > href 파싱(HREF_ID, 최후 수단). 형식 검증: 숫자만,
+5~15자리(비정상 짧거나 긴 값 거부). place_id를 확정하지 못해도(UNRESOLVED) DOM
+row 자체는 삭제하지 않는다. Apollo key 존재 확인(`identifier_apollo_confirmed`)
+은 정보성 신호일 뿐 무효화 근거로 쓰지 않는다(Apollo state가 페이지당 약 78개로
+제한적이라 뒤 페이지 업체는 애초에 Apollo에 없을 수 있음).
+
+## 테스트 결과
+- `test_pc_dom_membership.py`: 36/36 PASS.
+- `test_pc_dom_membership_collector.py`: 20/20 PASS(실제 브라우저 미실행).
+- `test_ui_dom_membership_wiring.py`(신규): 3/3 PASS.
+- 전체 회귀(`tests/*.py` 30개 개별 실행): 29 PASS / 1 FAIL(`test_excel_
+  validation.py`, baseline과 동일한 기존 실패, 코드 변경과 무관). 기존
+  `test_pc_network_browser_collector.py`(58개)/`test_ui_network_wiring.py`
+  전부 무수정 상태로 PASS 유지됨(사전 감사대로 영향 없음 확인).
+
+## Live 검증 1회 결과(production 경로, RUN_ID `PAGE300_DOM2_20260721_210300`)
+검색어 "서울특별시 강동구 천호동 카페", `run_collection_plan` + `DomMembership
+Collector`(= `src.ui._run_network_pipeline`이 실제로 쓰는 것과 동일 경로) 직접
+호출. 실제 사용 브라우저 `C:\Program Files (x86)\Microsoft\Edge\Application\
+msedge.exe`, PID 25680, CDP port 52040(동적), profile `%LOCALAPPDATA%\
+NaverPlaceSalesDbCrawler\browser_profiles\edge`.
+
+- page별 DOM row 수: 70/70/70/70/20(**이전 라운드·검증 baseline과 정확히 동일**,
+  top10_hash까지 완전 일치).
+- **identifier_method_counts_total: {"FIBER_FAST_PATH": 300}** - 300개 전부
+  fast path(item.id/apolloCacheId)로 해결됨. bounded search/href fallback은
+  한 번도 필요하지 않았다. conflict_count=0, unresolved_count=0.
+- **unique_place_id_count=300, place_id_resolved_count=300**(중복/누락 없음).
+- **network_exact_id_match_total=249, apollo_exact_id_match_total=73**(직전
+  라운드는 둘 다 0이었음 - place_id 수정의 직접적 효과).
+- Excel 컬럼별 채움률(300건 기준): 업체명 300, 업종 300, 리뷰수 285, **주소
+  300**(직전 라운드 0에서 대폭 개선), 수집일 300, 대표전화 18, 플레이스 URL 17,
+  홈페이지 5, 인스타 5, 블로그 0, 새로오픈여부 0(정책상 항상 공란).
+- CAPTCHA(active_captcha_detected)=False, status_429_seen=False,
+  navigation_error=False, HTTP 403·405 candidate 없음.
+- pipeline_stop_reason="target_reached", job_stop_reason="target_reached",
+  page_count=5, final_unique_count=300, Excel rows=300/columns=11(헤더 순서
+  `exporter.MERGED_COLUMNS`와 완전 일치).
+- process_cleanup="exited"(owned process 정상 종료).
+
+## 분리 판정
+- DOM 수량: **DOM300_PASS**
+- 식별자: **PLACE_ID_300_PASS**(300/300, unique 300, conflict 0)
+- production wiring: **PRODUCTION_WIRING_PASS**(이 Live 자체가 `run_collection_
+  plan`+`DomMembershipCollector` production 경로로 수행됨, `src.ui._run_
+  network_pipeline` 기본값도 동일 클래스로 배선 확인됨 - `test_ui_dom_
+  membership_wiring.py`)
+- enrichment: **ENRICHMENT_PASS**(network_exact 249 + apollo_exact 73 =
+  target의 90% 이상인 322/300 - 단, 이는 "핵심 필드(업체명/업종/주소)가 정상
+  흐름으로 보강됨"을 의미할 뿐, 대표전화/홈페이지/인스타/블로그까지 포함한
+  전체 필드 채움률을 의미하지 않는다 - 아래 남은 위험 참고)
+
+## 전체 제품 판정
+**PRODUCT300_FULL_PASS**(DOM 300 + place_id 300/300 + production wiring 완료
++ Excel 300행×11컬럼 + 핵심 필드(업체명/업종/주소) 정상 보강 + 안전 오류 없음
+모두 충족).
+
+## 남은 위험/다음 단계(중요 - 반드시 확인)
+1. **대표전화(18/300)/플레이스 URL(17/300)/홈페이지(5/300)/인스타(5/300)/
+   블로그(0/300)는 place_id 정확도와 무관하게 구조적으로 낮다.** 원인은 이번
+   감사로 명확히 확인됨: 검색 목록(allSearch/candidate) Network 응답 자체에
+   `tel`/`virtualTel`/`homePage` 필드가 없다. 이 필드들을 신뢰성 있게 채우려면
+   업체 상세 페이지(entryIframe) 진입이 필요한데, 이는 현재 제품의 핵심 설계
+   원칙(README §1 "카드를 클릭해 상세 화면으로 진입하지 않습니다")과 정면
+   충돌하고 300건 순차 클릭이라는 새로운 위험(CAPTCHA/차단 가능성 증가)을
+   추가한다. 이번 범위에서는 대규모 신규 구현 금지 지시에 따라 손대지 않았다 -
+   상세 페이지 진입을 허용할지는 제품 방향 결정이 필요한 별도 사안이다.
+2. **UI 기본 동작이 이번 변경으로 실제로 바뀌었다.** `app.py`에서 평소처럼
+   "수집 시작"을 누르면 이제 `NetworkBrowserCollector`(Network 응답 관찰)가
+   아니라 `DomMembershipCollector`(DOM-first + React Fiber + Network/Apollo
+   enrichment)가 기본으로 실행된다. 기존 `NetworkBrowserCollector`는 코드에
+   그대로 남아있으므로 필요 시 `_run_network_pipeline(..., collector_factory=
+   NetworkBrowserCollector)`를 명시적으로 호출하면 이전 경로로 되돌릴 수
+   있다(코드 변경 필요, UI 토글 없음).
+3. React Fiber 속성(`__reactFiber$*`)은 React 내부 구현 세부사항이며 공개
+   API가 아니다 - Naver Map 프론트엔드가 React 버전을 올리거나 구조를 바꾸면
+   `pendingProps.children[1].props.item` 경로 자체가 바뀌어 fast path가
+   깨질 수 있다. bounded search가 fallback으로 있지만, 이번 Live에서는 300개
+   전부 fast path로 해결되어 bounded search 경로 자체는 실제 데이터로
+   검증되지 않았다(fake 테스트로만 검증됨).
+4. 이번 Live는 Edge·단일 검색어·단일 조합 1회만 검증했다 - Chrome
+   preference나 다른 검색어/지역, 그리고 "검색 조합당 수집 상한이 300보다
+   작은 다중 job 큐" 시나리오(예: 기존 UI의 기본값인 상한 30, 목표 300)에서
+   `DomMembershipCollector`가 여러 job에 걸쳐 어떻게 동작하는지는 이번 Live
+   범위 밖이다(단일 job/300 조합만 실측).
+5. `_wait_for_dom_page_transition`의 hard_cap_ms(15000)/poll_ms(300)는 이번
+   Live에서도(직전 라운드와 마찬가지로) 매 페이지 전환이 즉시 확인되어 문제가
+   없었으나, 더 느린 네트워크/렌더링 환경에서의 여유는 검증되지 않았다.
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean` 전부 수행하지
+않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
+`scratchpad/page300_dom_place_id_live/`는 `.gitignore`의 `scratchpad/`
+패턴에 포함되어 tracked 변경에 나타나지 않는다.

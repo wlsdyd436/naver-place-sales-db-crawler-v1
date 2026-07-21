@@ -21,7 +21,7 @@ from src.parser import parse_places
 from src.pc_crawler import crawl_places_pc
 from src.pc.config import DiagnosticConfig
 from src.pc.detail_scraper import build_full_collector
-from src.pc.network_browser_collector import NetworkBrowserCollector
+from src.pc.network_browser_collector import DomMembershipCollector
 from src.pc.network_pipeline import run_collection_plan
 from src.pc.pipeline import collect_pc_full
 from src.pc.region_data import load_region_layers
@@ -1684,14 +1684,23 @@ class SalesDbCrawlerApp(ctk.CTk):
         target_count: int,
         output_path: str,
         *,
-        collector_factory=NetworkBrowserCollector,
+        collector_factory=DomMembershipCollector,
         orchestrator=run_collection_plan,
         excel_exporter=export_places_to_excel,
     ) -> dict:
         """ARCH-300C WIRE-2C-1: Network/List 제품 흐름 worker + Excel 저장 연결.
 
+        2026-07-21(PAGE300-DOM-2): 기본 collector_factory를 `NetworkBrowserCollector`
+        (collect_network_query, Network 응답 관찰 기반)에서 `DomMembershipCollector`
+        (collect_dom_membership_query, DOM-first membership + React Fiber
+        place_id + Network/Apollo enrichment 기반)로 교체했다(사용자 확인 후
+        production 기본 경로 변경). `NetworkBrowserCollector`/`collect_network_
+        query`는 이 변경으로 전혀 수정되지 않았고 legacy/회귀 테스트/비상 복구
+        경로로 그대로 남아있다 - 필요 시 `collector_factory=NetworkBrowserCollector`를
+        명시적으로 주입해 이전 경로로 되돌릴 수 있다.
+
         collector_factory/orchestrator/excel_exporter는 의존성 주입 지점이다 -
-        기본값은 실제 NetworkBrowserCollector/run_collection_plan/
+        기본값은 실제 DomMembershipCollector/run_collection_plan/
         export_places_to_excel을 가리키지만, 기본값 참조만으로는 Playwright
         시작도 파일 저장도 발생하지 않는다(실제로 호출될 때만 부작용이
         생긴다). 이번 단계 테스트는 항상 fake를 주입해 실제 브라우저/파일

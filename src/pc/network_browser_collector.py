@@ -35,9 +35,21 @@ from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
 from src.pc.network_list_scraper import (
     _extract_list_items,
     _map_item_to_row,
+    build_entity_index,
     classify_captcha_signal,
+    compute_page_signature,
+    dedup_membership_rows,
     dedup_rows,
     is_candidate_response,
+    is_skeleton_dom_row,
+    merge_dom_row_fields,
+    normalize_dom_row,
+    overall_row_confidence,
+    page_transition_confirmed,
+    resolve_match,
+    summarize_membership_diagnostics,
+    to_common_entity,
+    trim_membership_rows_to_target,
 )
 
 _SEARCH_URL_TEMPLATE = "https://map.naver.com/v5/search/{query}"
@@ -1663,6 +1675,559 @@ class NetworkBrowserCollector:
                 per_query_limit,
                 collected_at=self.collected_at,
                 settle_ms=self.settle_ms,
+            )
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._session_cm is not None:
+            self._session_cm.__exit__(exc_type, exc, tb)
+        self._session_cm = None
+        self._session = None
+        return False
+
+
+# ============================================================================
+# PAGE300-DOM-1: DOM-first membership 수집(collect_dom_membership_query)
+# ============================================================================
+#
+# 단일 검색어에서 최대 5페이지, DOM에 실제 렌더링된 업체 목록을 최종 membership
+# 기준으로 삼고 Network/Apollo는 필드 보강에만 쓰는 신규 경로다. 기존
+# collect_network_query는 수정하지 않는다 - 이 함수는 그 위에 있는
+# _QueryObservationContext/_make_response_handler/_make_request_finished_handler/
+# _make_request_failed_handler/_find_search_frame/_find_page_button/
+# _safe_get_attribute/_probe_captcha_state를 그대로 재사용하는 별도 함수다.
+# UI/network_pipeline.run_collection_plan에는 연결하지 않는다(독립 함수로만
+# 추가 - Live 검증은 scratchpad 러너가 직접 호출한다).
+#
+# 스크롤 방법론(요청서 승인 근거): cdp_validation_tests/comprehensive_cdp_tester.py의
+# scroll_to_bottom()이 Edge/Chrome 4회 실측(70/70/70/70/20=300건, CAPTCHA/HTTP
+# 오류 없음)으로 검증됐다 - scrollBy(상대 증분) + scrollHeight 안정화 + 단일
+# frame.evaluate() 내 완결 + 40회 상한 + 600ms tick을 그대로 유지하고, row
+# count/업체명 count 안정성도 함께 확인하도록 확장했다(scrollHeight만으로는
+# 놓칠 수 있는 사례에 대한 추가 안전판). scrollTo(절대 좌표) + item_count만
+# 보는 방식(scratchpad/page300_4b2_apollo_consistency/probe_consistency.py)은
+# 같은 검색에서 53건에 그쳤고, 구조 비교 결과 조기 종료 아티팩트로 판정되어
+# 이번 구현에는 사용하지 않는다.
+
+_DOM_SCROLL_JS = """async () => {
+    const container = document.querySelector("#_pcmap_list_scroll_container");
+    if (!container) return {status: 'no_container', iters: 0};
+    let lastHeight = container.scrollHeight;
+    let lastRowCount = container.querySelectorAll('li.UEzoS.rTjJo').length;
+    let lastNameCount = container.querySelectorAll('li.UEzoS.rTjJo .TYaxT').length;
+    let stable = 0;
+    let iters = 0;
+    while (iters < 40) {
+        container.scrollBy(0, 1000);
+        await new Promise(r => setTimeout(r, 600));
+        const h = container.scrollHeight;
+        const rc = container.querySelectorAll('li.UEzoS.rTjJo').length;
+        const nc = container.querySelectorAll('li.UEzoS.rTjJo .TYaxT').length;
+        if (h === lastHeight && rc === lastRowCount && nc === lastNameCount) {
+            stable++;
+            if (stable >= 3) break;
+        } else {
+            stable = 0;
+            lastHeight = h;
+            lastRowCount = rc;
+            lastNameCount = nc;
+        }
+        iters++;
+    }
+    return {status: 'done', iters: iters, scrollHeight: lastHeight, rowCount: lastRowCount, nameCount: lastNameCount};
+}"""
+
+_DOM_ROW_EXTRACTION_JS = """() => {
+    // PAGE300-DOM-2: DOM anchor href가 전부 "#"(placeholder)임이 실측 확인됨에 따라,
+    // React가 DOM node에 심어두는 __reactFiber$*/__reactProps$* 속성에서 place_id
+    // 후보를 함께 수집한다(scratchpad/page300_4d_dom_place_id_audit/audit.py에서
+    // 42/42 row 재현 검증된 방식). 여기서는 원시 후보만 모으고, 검증/우선순위 판정
+    // (형식 검증/충돌 감지)은 Python의 resolve_dom_identifier가 담당한다.
+    const SKIP_KEYS = new Set(['ref', 'return', 'sibling', 'parent', 'child',
+        'memoizedProps', 'memoizedState', 'stateNode', 'updateQueue']);
+    const ID_KEY_PATTERN = /id|place|business|url|href|link|restaurant|entry|cid/i;
+    const MAX_DEPTH = 6;
+    const MAX_VISITED = 500;
+
+    function boundedSearch(obj, depth, visited) {
+        const results = [];
+        if (depth <= 0 || !obj || typeof obj !== 'object') return results;
+        if (visited.count >= MAX_VISITED || visited.seen.has(obj)) return results;
+        visited.seen.add(obj);
+        visited.count++;
+
+        let keys;
+        try { keys = Object.keys(obj); } catch (e) { return results; }
+
+        for (const k of keys) {
+            if (SKIP_KEYS.has(k)) continue;
+            let v;
+            try { v = obj[k]; } catch (e) { continue; }
+            if (v === null || v === undefined) continue;
+            if (typeof v !== 'object' && typeof v !== 'function') {
+                if (ID_KEY_PATTERN.test(k)) results.push({path: k, value: String(v)});
+            } else if (typeof v === 'object') {
+                if (visited.count >= MAX_VISITED) break;
+                const nested = boundedSearch(v, depth - 1, visited);
+                for (const r of nested) results.push(r);
+            }
+        }
+        return results;
+    }
+
+    function extractIdentifierCandidates(el) {
+        let fiberKey = null;
+        for (const key of Object.keys(el)) {
+            if (key.startsWith('__reactFiber$') || key.startsWith('__reactProps$')) {
+                fiberKey = key;
+                break;
+            }
+        }
+        if (!fiberKey) return {fast_item_id: '', fast_apollo_cache_id: '', bounded_candidates: []};
+
+        const fiber = el[fiberKey];
+        const children = fiber && fiber.pendingProps ? fiber.pendingProps.children : undefined;
+        const item = Array.isArray(children) && children[1] && children[1].props ? children[1].props.item : undefined;
+
+        const fastItemId = (item && item.id !== undefined && item.id !== null) ? String(item.id) : '';
+        const fastApolloId = (item && item.apolloCacheId !== undefined && item.apolloCacheId !== null) ? String(item.apolloCacheId) : '';
+
+        let bounded = [];
+        if (!fastItemId && !fastApolloId && fiber) {
+            bounded = boundedSearch(fiber, MAX_DEPTH, {seen: new Set(), count: 0});
+        }
+        return {fast_item_id: fastItemId, fast_apollo_cache_id: fastApolloId, bounded_candidates: bounded};
+    }
+
+    const rows = Array.from(document.querySelectorAll('li.UEzoS.rTjJo'));
+    return rows.map((row, i) => {
+        const nameEl = row.querySelector('.TYaxT');
+        const catEl = row.querySelector('.KCMnt');
+        const anchors = Array.from(row.querySelectorAll('a[href]')).map(a => a.getAttribute('href'));
+        const data_attributes = {};
+        for (const attr of row.attributes) {
+            if (attr.name.startsWith('data-')) data_attributes[attr.name] = attr.value;
+        }
+        return {
+            dom_index: i,
+            name: nameEl ? nameEl.innerText.trim() : "",
+            category: catEl ? catEl.innerText.trim() : "",
+            raw_text: row.innerText ? row.innerText.trim() : "",
+            anchor_hrefs: anchors,
+            data_attributes: data_attributes,
+            identifier_candidates: extractIdentifierCandidates(row),
+        };
+    });
+}"""
+
+_APOLLO_ENTITY_EXTRACTION_JS = """() => {
+    const state = window.__APOLLO_STATE__;
+    if (!state || typeof state !== 'object') return {available: false, entities: []};
+    const out = [];
+    for (const key of Object.keys(state)) {
+        const obj = state[key];
+        if (!obj || typeof obj !== 'object') continue;
+        if (typeof obj.name !== 'string' || !obj.name || obj.category === undefined) continue;
+        const idFromKey = key.indexOf(':') >= 0 ? key.split(':')[1] : '';
+        out.push({
+            apollo_key: key,
+            place_id: String(obj.id || idFromKey || ''),
+            name: obj.name || '',
+            category: obj.category || '',
+            address: obj.address || obj.roadAddress || '',
+            review_count: (obj.reviewCount !== undefined && obj.reviewCount !== null) ? String(obj.reviewCount) : '',
+        });
+    }
+    return {available: true, entities: out};
+}"""
+
+_CURRENT_PAGE_AND_TOP10_JS = """() => {
+    const rows = Array.from(document.querySelectorAll('li.UEzoS.rTjJo'));
+    const top10 = rows.slice(0, 10).map(r => {
+        const el = r.querySelector('.TYaxT');
+        return el ? el.innerText.trim() : '';
+    });
+    let page = null;
+    const pageMatches = document.querySelectorAll('.mBN2s.qxokY, a[aria-current="true"], a[aria-current="page"]');
+    for (const p of pageMatches) {
+        const num = parseInt((p.innerText || '').trim().replace(/[^0-9]/g, ''), 10);
+        if (num) { page = num; break; }
+    }
+    return {page: page, top10: top10};
+}"""
+
+
+def _parse_candidate_entry_items(entry: dict) -> dict:
+    """collect_network_query 내부의 _ensure_parsed(closure라 직접 재사용 불가)와
+    동일한 안전 판정(HTTP 오류/non-JSON body 제외)만 최소로 재구현한다.
+    BOM/compression 분류 등 진단 전용 필드는 이 경로에서 필요하지 않으므로
+    만들지 않는다 - candidate_error_type/body_snapshot_ready 등 상태 자체는
+    이미 재사용 중인 response/requestfinished/requestfailed 핸들러가
+    채워두므로 중복 구현하지 않는다."""
+    if entry.get("candidate_error_type") == "CandidateHttpError":
+        return {"items": [], "error": True}
+    if not entry.get("body_snapshot_ready"):
+        return {"items": [], "error": bool(entry.get("body_snapshot_error_type"))}
+    body = entry.get("body_snapshot")
+    first_char = _classify_first_non_whitespace_character(body) if body is not None else "empty"
+    if first_char not in ("{", "["):
+        return {"items": [], "error": True}
+    try:
+        data = json.loads(body)
+    except Exception:
+        return {"items": [], "error": True}
+    return {"items": _extract_list_items(data), "error": False}
+
+
+def _harvest_all_candidates(ctx: "_QueryObservationContext") -> list:
+    """지금까지 관측된 candidate 전부를 파싱해 raw item 목록으로 합친다(page당
+    호출 빈도가 낮고 candidate 수가 많지 않아, 인덱스 기반 증분 harvest 대신
+    매번 전체를 다시 파싱하는 단순한 방식을 택했다)."""
+    raw_items: list = []
+    for entry in ctx.candidates:
+        parsed = _parse_candidate_entry_items(entry)
+        if not parsed["error"]:
+            raw_items.extend(parsed["items"])
+    return raw_items
+
+
+def _has_blocking_http_status(ctx: "_QueryObservationContext", statuses=(403, 405)) -> bool:
+    return any(e.get("status") in statuses for e in ctx.candidates)
+
+
+def _wait_for_dom_page_transition(page, frame, expected_page_number: int, previous_signature: dict, *,
+                                   hard_cap_ms: int = 15000, poll_ms: int = 300) -> dict:
+    """클릭 이후 다음 페이지 전환 완료를 DOM 기준으로 확인한다(요청서 §5/§7 -
+    page 번호/active 속성만으로 완료 처리 금지). expected_page_number와
+    실제 활성 페이지 번호가 같고, top-10 signature가 이전 페이지와 달라야
+    confirmed=True. hard_cap_ms 안에 확인되지 않으면 reason으로 "active 페이지
+    번호 자체가 한 번도 기대값과 일치하지 않음"(transition_timeout)과 "번호는
+    일치했지만 signature가 그대로임"(signature_unchanged)을 구분해 반환한다."""
+    elapsed_ms = 0
+    saw_expected_page = False
+    while elapsed_ms < hard_cap_ms:
+        page.wait_for_timeout(poll_ms)
+        elapsed_ms += poll_ms
+        try:
+            result = frame.evaluate(_CURRENT_PAGE_AND_TOP10_JS)
+        except Exception:
+            continue
+        actual_page = result.get("page")
+        if actual_page == expected_page_number:
+            saw_expected_page = True
+        top10 = result.get("top10") or []
+        new_signature = compute_page_signature([{"normalized_name": n} for n in top10])
+        current_flag_ok = actual_page is not None
+        if page_transition_confirmed(expected_page_number, actual_page, current_flag_ok, previous_signature, new_signature):
+            return {"confirmed": True, "elapsed_ms": elapsed_ms, "reason": "confirmed"}
+    reason = "signature_unchanged" if saw_expected_page else "transition_timeout"
+    return {"confirmed": False, "elapsed_ms": elapsed_ms, "reason": reason}
+
+
+def collect_dom_membership_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
+    """단일 검색어에서 DOM membership 기준으로 최대 max_pages 페이지를 수집한다.
+
+    반환: {"rows", "final_unique_count", "page_count", "stop_reason",
+    "active_captcha_detected", "status_429_seen", "navigation_error",
+    "navigation_error_message", "per_page_diagnostics", "page_signatures"}.
+    rows는 exporter.MERGED_COLUMNS(11컬럼) 키 + 내부 place_id/source_page/
+    dom_index/match_confidence/_dedup_raw_text를 가진 dict 목록이며, DOM
+    표시 순서를 그대로 보존한다.
+
+    이 함수는 UI/network_pipeline.run_collection_plan에 연결되지 않은
+    독립 함수다(요청서 §7 - 최소 변경, 기존 collect_network_query는
+    수정하지 않고 그 helper들만 재사용한다).
+    """
+    ctx = _QueryObservationContext()
+    response_handler = _make_response_handler(ctx)
+    request_finished_handler = _make_request_finished_handler(ctx)
+    request_failed_handler = _make_request_failed_handler(ctx)
+    registered_listeners: list = []
+    try:
+        for event, handler in (
+            ("response", response_handler),
+            ("requestfinished", request_finished_handler),
+            ("requestfailed", request_failed_handler),
+        ):
+            page.on(event, handler)
+            registered_listeners.append((event, handler))
+    except Exception:
+        for event, handler in registered_listeners:
+            try:
+                page.off(event, handler)
+            except Exception:
+                pass
+        raise
+
+    result = {
+        "rows": [],
+        "final_unique_count": 0,
+        "page_count": 0,
+        "stop_reason": None,
+        "active_captcha_detected": False,
+        "status_429_seen": False,
+        "navigation_error": False,
+        "navigation_error_message": "",
+        "per_page_diagnostics": [],
+        "page_signatures": [],
+    }
+
+    try:
+        search_url = _SEARCH_URL_TEMPLATE.format(query=quote(job["query"]))
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+        except PlaywrightTimeoutError:
+            pass
+        except Exception as exc:
+            result["navigation_error"] = True
+            result["navigation_error_message"] = f"{type(exc).__name__}: {exc}"
+            result["stop_reason"] = "navigation_error"
+            return result
+
+        frame = _find_search_frame(page)
+        if frame is None:
+            result["stop_reason"] = "dom_frame_not_found"
+            return result
+
+        all_rows: list = []
+        seen: set = set()
+        page_number = 1
+
+        while True:
+            probe = _probe_captcha_state(page)
+            signal = classify_captcha_signal(
+                marker_present_in_dom=probe["marker_present"],
+                element_visible=probe["visible"],
+                bounding_box_area=probe["bounding_box_area"],
+                click_exception_message=probe["click_intercepted_message"],
+            )
+            if signal["active_captcha_detected"]:
+                result["active_captcha_detected"] = True
+                result["stop_reason"] = "captcha_detected"
+                break
+            if ctx.status_429_seen:
+                result["status_429_seen"] = True
+                result["stop_reason"] = "status_429_seen"
+                break
+
+            scroll_result = frame.evaluate(_DOM_SCROLL_JS)
+            if scroll_result.get("status") == "no_container":
+                result["stop_reason"] = "dom_container_lost"
+                break
+
+            # PAGE300-DOM-2: Apollo를 DOM row 정규화보다 먼저 추출한다 -
+            # resolve_dom_identifier의 guard(§apollo_key_exists_for_id)가
+            # Apollo 원본 key 목록을 필요로 하기 때문이다. _APOLLO_ENTITY_
+            # EXTRACTION_JS가 이미 각 entity의 apollo_key를 반환하므로 추가
+            # evaluate 없이 그 키들을 집합으로 재사용한다.
+            try:
+                apollo_raw = frame.evaluate(_APOLLO_ENTITY_EXTRACTION_JS)
+            except Exception:
+                apollo_raw = {"available": False, "entities": []}
+            apollo_available = bool(apollo_raw.get("available"))
+            apollo_entities = apollo_raw.get("entities") or [] if apollo_available else []
+            apollo_raw_keys = {e.get("apollo_key") for e in apollo_entities if e.get("apollo_key")}
+            apollo_index = build_entity_index([
+                to_common_entity(entity, id_key="place_id", name_key="name", category_key="category", address_key="address")
+                for entity in apollo_entities
+            ])
+
+            raw_dom_rows = frame.evaluate(_DOM_ROW_EXTRACTION_JS) or []
+            normalized_rows = [normalize_dom_row(r, page_number, apollo_raw_keys) for r in raw_dom_rows]
+            kept_rows = [r for r in normalized_rows if not is_skeleton_dom_row(r)]
+
+            page.wait_for_timeout(500)
+            if _has_blocking_http_status(ctx):
+                result["stop_reason"] = "candidate_http_error"
+                break
+            if ctx.status_429_seen:
+                result["status_429_seen"] = True
+                result["stop_reason"] = "status_429_seen"
+                break
+
+            network_raw_items = _harvest_all_candidates(ctx)
+            network_rows = [
+                _map_item_to_row(item, collected_at, source_page=page_number, source_query=job.get("query"))
+                for item in network_raw_items
+            ]
+            network_index = build_entity_index([
+                to_common_entity(
+                    row, id_key="place_id", name_key="업체명", category_key="업종",
+                    address_key="주소", url_key="플레이스 URL",
+                )
+                for row in network_rows
+            ])
+
+            page_built_rows = []
+            match_results = []
+            network_exact_id_count = 0
+            apollo_exact_id_count = 0
+            for dom_row in kept_rows:
+                network_match = resolve_match(dom_row, network_index)
+                apollo_match = resolve_match(dom_row, apollo_index)
+                built_row = merge_dom_row_fields(dom_row, network_match, apollo_match, collected_at)
+                page_built_rows.append(built_row)
+                match_results.append({"overall": overall_row_confidence(network_match, apollo_match)})
+                if network_match.get("confidence") == "EXACT_ID":
+                    network_exact_id_count += 1
+                if apollo_match.get("confidence") == "EXACT_ID":
+                    apollo_exact_id_count += 1
+
+            page_signature = compute_page_signature(kept_rows)
+            result["page_signatures"].append(page_signature)
+
+            newly_unique = dedup_membership_rows(page_built_rows, seen)
+            all_rows.extend(newly_unique)
+            result["page_count"] = page_number
+
+            diagnostics = summarize_membership_diagnostics(match_results)
+            diagnostics["duplicate_count"] = len(page_built_rows) - len(newly_unique)
+            diagnostics["final_unique_count"] = len(all_rows)
+            # PAGE300-DOM-2: identifier_method별 집계(§11 Live 측정 요구사항).
+            identifier_method_counts: dict = {}
+            for dom_row in kept_rows:
+                method = dom_row.get("identifier_method") or "UNRESOLVED"
+                identifier_method_counts[method] = identifier_method_counts.get(method, 0) + 1
+            resolved_place_ids = {dom_row.get("place_id") for dom_row in kept_rows if dom_row.get("place_id")}
+            result["per_page_diagnostics"].append({
+                "page_number": page_number,
+                "dom_row_count": len(kept_rows),
+                "scroll_iters": scroll_result.get("iters"),
+                "network_raw_item_count": len(network_raw_items),
+                "apollo_available": apollo_available,
+                "apollo_entity_count": len(apollo_entities),
+                "identifier_method_counts": identifier_method_counts,
+                "identifier_resolved_count": len(resolved_place_ids),
+                "network_exact_id_count": network_exact_id_count,
+                "apollo_exact_id_count": apollo_exact_id_count,
+                **diagnostics,
+            })
+
+            if target_count and len(all_rows) >= target_count:
+                result["stop_reason"] = "target_reached"
+                break
+            if page_number >= max_pages:
+                result["stop_reason"] = "max_page_count_reached"
+                break
+
+            frame = _find_search_frame(page)
+            if frame is None:
+                result["stop_reason"] = "dom_frame_not_found"
+                break
+
+            button_locator = _find_page_button(frame, page_number + 1)
+            try:
+                button_count = button_locator.count() if button_locator is not None else 0
+            except Exception:
+                button_count = 0
+            if button_count == 0:
+                result["stop_reason"] = "next_page_button_not_found"
+                break
+            if button_count > 1:
+                result["stop_reason"] = "ambiguous_page_button"
+                break
+
+            target_locator = button_locator.first
+            try:
+                is_ready = bool(target_locator.is_visible()) and bool(target_locator.is_enabled())
+            except Exception:
+                result["stop_reason"] = "pagination_click_error"
+                break
+            if not is_ready:
+                result["stop_reason"] = "pagination_click_error"
+                break
+
+            try:
+                target_locator.scroll_into_view_if_needed()
+                target_locator.click()
+            except Exception:
+                result["stop_reason"] = "pagination_click_error"
+                break
+
+            transition = _wait_for_dom_page_transition(page, frame, page_number + 1, page_signature)
+            if not transition["confirmed"]:
+                result["stop_reason"] = (
+                    "next_page_dom_signature_unchanged" if transition["reason"] == "signature_unchanged"
+                    else "next_page_dom_transition_timeout"
+                )
+                break
+
+            page_number += 1
+
+        trimmed_rows = trim_membership_rows_to_target(all_rows, target_count)
+        result["rows"] = trimmed_rows
+        result["final_unique_count"] = len(trimmed_rows)
+        return result
+    finally:
+        for event, handler in registered_listeners:
+            try:
+                page.off(event, handler)
+            except Exception:
+                pass
+
+
+class DomMembershipCollector:
+    """DOM-first membership production collector(PAGE300-DOM-2).
+
+    `NetworkBrowserCollector`와 동일한 계약(컨텍스트 매니저 + `collect_query(job,
+    per_query_limit)`)을 제공하되, 내부적으로 `collect_network_query` 대신
+    `collect_dom_membership_query`를 호출한다. `src/ui.py`의
+    `_run_network_pipeline` 기본 `collector_factory`로 배선되어 있다(2026-07-21,
+    사용자 확인 - AskUserQuestion 응답: "실제 production 기본 경로는 새
+    DomMembershipCollector를 사용하도록 배선"). `run_collection_plan`이 넘기는
+    `per_query_limit`을 `collect_dom_membership_query`의 `target_count`로 그대로
+    전달한다 - 검색 조합 큐가 여러 job이면 job마다 그 상한까지, 단일 job 큐면
+    사실상 그 값이 최종 목표가 된다(기존 `NetworkBrowserCollector.collect_query`가
+    `per_query_limit`을 `collect_network_query`에 그대로 전달하는 것과 동일한
+    per-job 상한 의미론).
+
+    `NetworkBrowserCollector`(collect_network_query 기반)는 이 클래스 추가로
+    전혀 수정되지 않았고 legacy/회귀 테스트/비상 복구 경로로 그대로 보존된다.
+    생명주기 코드가 `NetworkBrowserCollector`와 거의 동일해 보일 수 있으나,
+    그 클래스를 건드리지 않기 위해 의도적으로 별도 작성했다(작은 중복을 감수).
+    """
+
+    def __init__(self, *, collected_at, session_factory=None, max_pages: int = 5):
+        self.collected_at = collected_at
+        self.max_pages = max_pages
+        self._session_factory = session_factory or _default_session_factory
+        self._session_cm = None
+        self._session = None
+
+    def __enter__(self):
+        self._session_cm = self._session_factory()
+        self._session = self._session_cm.__enter__()
+        self._close_initial_page_if_present()
+        return self
+
+    def _close_initial_page_if_present(self) -> None:
+        """BrowserSession.__enter__가 미리 만든 초기 page(session.page)는 쿼리별
+        page 생성 방식과 무관하므로 수집용으로 쓰지 않고 즉시 닫는다(best-effort)."""
+        initial_page = getattr(self._session, "page", None)
+        if initial_page is None:
+            return
+        try:
+            initial_page.close()
+        except Exception:
+            pass
+
+    def collect_query(self, job, per_query_limit) -> dict:
+        """run_collection_plan이 기대하는 collect_query(job, per_query_limit)
+        시그니처를 만족하는 bound method. 공유 context에서 새 page를 만들어
+        collect_dom_membership_query에 위임하고, 결과를 반환한 뒤 page를
+        best-effort로 닫는다."""
+        page = self._session.context.new_page()
+        try:
+            return collect_dom_membership_query(
+                page,
+                job,
+                per_query_limit,
+                collected_at=self.collected_at,
+                max_pages=self.max_pages,
             )
         finally:
             try:

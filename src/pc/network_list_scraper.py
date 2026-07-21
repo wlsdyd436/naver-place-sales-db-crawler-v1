@@ -19,6 +19,9 @@
 # safety.is_captcha_or_security_message는 읽기 전용으로 재사용한다(src/pc/safety.py는
 # 수정하지 않는다) - 클릭 예외 메시지의 CAPTCHA/보안 차단 키워드 판정 로직을
 # 중복 구현하지 않기 위함이다.
+import hashlib
+import re
+
 from src.pc.safety import is_captcha_or_security_message
 
 _CANDIDATE_RESOURCE_TYPES = ("xhr", "fetch")
@@ -508,3 +511,447 @@ def should_stop_for_target(current_count: int, target: int) -> bool:
     if target <= 0:
         return False
     return current_count >= target
+
+
+# ============================================================================
+# DOM-first membership (PAGE300-DOM-1): 단일 검색어 300건 수집에서 DOM에 실제
+# 렌더링된 업체 목록을 최종 membership 기준으로 삼고, Network/Apollo는 필드
+# 보강(enrichment)에만 쓰기 위한 순수 함수들. Playwright/브라우저 객체를 전혀
+# 다루지 않으며(dict/list 입출력만), 실제 DOM row 추출·스크롤·Apollo state
+# 접근은 network_browser_collector.py의 collect_dom_membership_query가 담당한다.
+#
+# 매핑 우선순위(요청서 §10): place_id -> normalized place_url -> (업체명,업종,
+# 주소) -> (업체명,업종) 순. "업체명+업종+raw_text" 단계는 Network/Apollo
+# entity 자체가 raw_text 필드를 갖지 않으므로(그 필드는 DOM 카드 고유의
+# 값이다) source 매칭에는 적용하지 않는다 - 대신 dedup_key_for_membership_row
+# (최종 확정된 row끼리의 중복 판정)에서만 raw_text 기반 fallback으로 쓰인다.
+# "업체명+업종"만 일치하는 마지막 단계는 후보가 있어도 AMBIGUOUS로 강등한다
+# (느슨한 키이므로 임의 채택 금지 - 요청서 §10).
+# ============================================================================
+
+_REVIEW_COUNT_TEXT_PATTERN = re.compile(r"리뷰\s*([\d,]+)")
+_ADDRESS_HINT_PATTERN = re.compile(r"[가-힣]+(?:시|도)\s?[가-힣]+구\s?[가-힣0-9]+동")
+_PLACE_ID_NAMED_SEGMENT_PATTERN = re.compile(r"/(?:restaurant|place|hairshop|beauty)/(\d+)")
+_PLACE_ID_GENERIC_SEGMENT_PATTERN = re.compile(r"/(\d{5,})(?:[/?]|$)")
+
+_MATCH_CONFIDENCE_RANK = {
+    "EXACT_ID": 4,
+    "EXACT_URL": 3,
+    "STRONG_COMPOSITE": 2,
+    "AMBIGUOUS": 1,
+    "UNMATCHED": 0,
+}
+
+
+def _normalize_text(value) -> str:
+    """공백을 정리한 문자열로 정규화한다(None/숫자 등도 안전하게 문자열화)."""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def normalize_place_url(url) -> str:
+    """플레이스 URL을 query string/fragment/trailing slash 없이 정규화한다."""
+    if not url:
+        return ""
+    text = str(url).strip()
+    text = text.split("?", 1)[0]
+    text = text.split("#", 1)[0]
+    return text.rstrip("/")
+
+
+def extract_place_id_from_url(url) -> str:
+    """URL에서 숫자 place_id를 best-effort로 추출한다(세그먼트 이름을 가정하지
+    않는다 - 실측에서 /restaurant/{id}/home, /place/{id}/... 두 세그먼트가 모두
+    확인됨). 알려진 세그먼트를 우선 시도하고, 실패하면 5자리 이상 숫자 세그먼트를
+    범용으로 찾는다. 못 찾으면 빈 문자열."""
+    if not url:
+        return ""
+    text = str(url)
+    match = _PLACE_ID_NAMED_SEGMENT_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    match = _PLACE_ID_GENERIC_SEGMENT_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def parse_raw_text_fallback(raw_text: str) -> dict:
+    """DOM row의 raw_text(카드 전체 innerText)에서 리뷰수/주소를 최소 정규식으로
+    추출한다(억지 매칭 금지 - 못 찾으면 빈 문자열). Network/Apollo enrichment가
+    실패했을 때만 쓰는 최후 fallback이다."""
+    text = str(raw_text or "")
+    review_match = _REVIEW_COUNT_TEXT_PATTERN.search(text)
+    review_guess = review_match.group(1).replace(",", "") if review_match else ""
+    address_match = _ADDRESS_HINT_PATTERN.search(text)
+    address_guess = address_match.group(0) if address_match else ""
+    return {"review_count_guess": review_guess, "address_guess": address_guess}
+
+
+# PAGE300-DOM-2: React Fiber 기반 place_id guard. DOM anchor href가 전부 "#"
+# placeholder임이 실측으로 재확인되어(scratchpad/page300_4d_dom_place_id_audit),
+# React가 DOM node에 심어두는 __reactFiber$*/__reactProps$* 속성에서 얻은 후보를
+# 우선 신뢰한다. 실제 Fiber 트리 탐색(fast path 우선 시도 + bounded recursive
+# search fallback)은 브라우저 전용이라 network_browser_collector.py의 JS가
+# 수행하고, 여기서는 그 JS가 반환한 원시 후보(raw_row["identifier_candidates"])에
+# 대한 검증/우선순위 판정만 담당한다(순수 로직 - fake 테스트로 브라우저 없이 검증
+# 가능하도록 분리).
+_DIGIT_ONLY_PATTERN = re.compile(r"^\d+$")
+_MIN_PLACE_ID_LENGTH = 5
+_MAX_PLACE_ID_LENGTH = 15
+_APOLLO_KEY_PREFIXES = ("PlaceListBusinessesItem:{id}:{id}", "RestaurantBase:{id}")
+
+
+def _is_valid_place_id_format(value) -> bool:
+    """숫자로만 구성되고 비정상적으로 짧거나 긴 값을 거부한다."""
+    text = str(value or "").strip()
+    if not _DIGIT_ONLY_PATTERN.match(text):
+        return False
+    return _MIN_PLACE_ID_LENGTH <= len(text) <= _MAX_PLACE_ID_LENGTH
+
+
+def apollo_key_exists_for_id(apollo_raw_keys, place_id: str) -> bool:
+    """Apollo State의 원본 key 목록(예: "PlaceListBusinessesItem:123:123")에서
+    place_id에 대응하는 key가 존재하는지 확인한다(정보성 - 존재하지 않아도 다른
+    경로로 이미 확정된 place_id를 무효화하지 않는다. Apollo State는 페이지당
+    약 78개로 제한적임이 이전 감사에서 이미 확인됨)."""
+    if not place_id or not apollo_raw_keys:
+        return False
+    candidates = {template.format(id=place_id) for template in _APOLLO_KEY_PREFIXES}
+    return bool(candidates & set(apollo_raw_keys))
+
+
+def resolve_dom_identifier(raw_row: dict, apollo_raw_keys=None) -> dict:
+    """DOM row의 identifier_candidates(JS가 수집한 원시 후보)로부터 place_id를
+    확정한다. 우선순위: fast path(item.id/apolloCacheId 상호 검증) > bounded
+    search(distinct 유효값이 정확히 1개일 때만) > href 파싱. 각 단계에서 서로
+    다른 유효 후보가 2개 이상이면 그 단계에서 즉시 CONFLICT로 확정하고 더 느슨한
+    단계로 내려가 임의로 채택하지 않는다.
+
+    반환: {"place_id", "identifier_method"(FIBER_FAST_PATH/FIBER_BOUNDED_SEARCH/
+    HREF_ID/CONFLICT/UNRESOLVED), "identifier_validated", "identifier_conflict",
+    "identifier_apollo_confirmed"}.
+    """
+    candidates = (raw_row or {}).get("identifier_candidates") or {}
+
+    fast_item_id = _normalize_text(candidates.get("fast_item_id"))
+    fast_apollo_id = _normalize_text(candidates.get("fast_apollo_cache_id"))
+    fast_item_valid = _is_valid_place_id_format(fast_item_id)
+    fast_apollo_valid = _is_valid_place_id_format(fast_apollo_id)
+
+    def _finalize(place_id: str, method: str, validated: bool, conflict: bool) -> dict:
+        return {
+            "place_id": place_id,
+            "identifier_method": method,
+            "identifier_validated": validated,
+            "identifier_conflict": conflict,
+            "identifier_apollo_confirmed": apollo_key_exists_for_id(apollo_raw_keys, place_id),
+        }
+
+    if fast_item_valid and fast_apollo_valid:
+        if fast_item_id != fast_apollo_id:
+            return _finalize("", "CONFLICT", False, True)
+        return _finalize(fast_item_id, "FIBER_FAST_PATH", True, False)
+    if fast_item_valid:
+        return _finalize(fast_item_id, "FIBER_FAST_PATH", True, False)
+    if fast_apollo_valid:
+        return _finalize(fast_apollo_id, "FIBER_FAST_PATH", True, False)
+
+    bounded = candidates.get("bounded_candidates") or []
+    distinct_values = set()
+    for item in bounded:
+        raw_value = item.get("value") if isinstance(item, dict) else item
+        value = _normalize_text(raw_value)
+        if _is_valid_place_id_format(value):
+            distinct_values.add(value)
+    if len(distinct_values) == 1:
+        return _finalize(next(iter(distinct_values)), "FIBER_BOUNDED_SEARCH", True, False)
+    if len(distinct_values) > 1:
+        return _finalize("", "CONFLICT", False, True)
+
+    for href in (raw_row or {}).get("anchor_hrefs") or []:
+        href_id = extract_place_id_from_url(href)
+        if _is_valid_place_id_format(href_id):
+            return _finalize(href_id, "HREF_ID", True, False)
+
+    return _finalize("", "UNRESOLVED", False, False)
+
+
+def normalize_dom_row(raw_row: dict, page_number: int, apollo_raw_keys=None) -> dict:
+    """DOM에서 추출한 row 하나(dom_index/name/category/raw_text/
+    identifier_candidates/place_url/anchor_hrefs/data_attributes)를 정규화한다.
+    place_id는 resolve_dom_identifier(React Fiber 기반 guard)가 확정하며, 실패
+    (UNRESOLVED/CONFLICT)해도 row 자체를 삭제하지 않는다(그 판단은
+    is_skeleton_dom_row가 업체명 기준으로 별도 담당). place_url(anchor href 기반,
+    "플레이스 URL" 필드용)은 식별자 판단과 별개로 기존 로직을 유지한다."""
+    if not isinstance(raw_row, dict):
+        raw_row = {}
+
+    name = _normalize_text(raw_row.get("name"))
+    category = _normalize_text(raw_row.get("category"))
+    raw_text = str(raw_row.get("raw_text") or "")
+    place_url = str(raw_row.get("place_url") or "").strip()
+    anchor_hrefs = list(raw_row.get("anchor_hrefs") or [])
+    data_attributes = dict(raw_row.get("data_attributes") or {})
+
+    if not place_url:
+        for href in anchor_hrefs:
+            if href and extract_place_id_from_url(href):
+                place_url = href
+                break
+
+    identifier = resolve_dom_identifier(raw_row, apollo_raw_keys)
+
+    address_text = _normalize_text(raw_row.get("address_text"))
+    if not address_text:
+        address_text = parse_raw_text_fallback(raw_text)["address_guess"]
+
+    return {
+        "page_number": page_number,
+        "dom_index": raw_row.get("dom_index"),
+        "name": name,
+        "category": category,
+        "raw_text": raw_text,
+        "address_text": address_text,
+        "place_id": identifier["place_id"],
+        "place_url": place_url,
+        "anchor_hrefs": anchor_hrefs,
+        "data_attributes": data_attributes,
+        "identifier_method": identifier["identifier_method"],
+        "identifier_validated": identifier["identifier_validated"],
+        "identifier_conflict": identifier["identifier_conflict"],
+        "identifier_apollo_confirmed": identifier["identifier_apollo_confirmed"],
+        "normalized_name": name,
+        "normalized_place_url": normalize_place_url(place_url),
+        "normalized_raw_text": _normalize_text(raw_text),
+    }
+
+
+def is_skeleton_dom_row(dom_row: dict) -> bool:
+    """업체명이 없는 row(광고 placeholder/skeleton/구분자 등으로 간주)인지 확인한다."""
+    return not (dom_row or {}).get("normalized_name")
+
+
+def to_common_entity(row: dict, *, id_key, name_key, category_key, address_key, url_key=None) -> dict:
+    """Network 매핑 row(한글 키)와 Apollo entity(영문 키)를 동일한 공용 형태로
+    변환한다(build_entity_index가 소스 종류와 무관하게 동작하도록). source_row는
+    원본 dict를 그대로 보존한다(merge_dom_row_fields가 나머지 필드를 그 원본에서
+    직접 읽는다)."""
+    return {
+        "id": _normalize_text(row.get(id_key)),
+        "url": normalize_place_url(row.get(url_key)) if url_key else "",
+        "name": _normalize_text(row.get(name_key)),
+        "category": _normalize_text(row.get(category_key)),
+        "address": _normalize_text(row.get(address_key)),
+        "source_row": row,
+    }
+
+
+def build_entity_index(common_rows: list) -> dict:
+    """to_common_entity로 변환된 row 목록을 place_id/URL/(이름,업종,주소)/
+    (이름,업종) 4단 인덱스로 만든다. 값은 항상 list다 - 후보가 2건 이상이면
+    resolve_match가 그 사실 자체를 AMBIGUOUS 판정 근거로 쓴다."""
+    by_id: dict = {}
+    by_url: dict = {}
+    by_addr: dict = {}
+    by_name_category: dict = {}
+    for row in common_rows:
+        if row["id"]:
+            by_id.setdefault(row["id"], []).append(row)
+        if row["url"]:
+            by_url.setdefault(row["url"], []).append(row)
+        if row["name"] and row["category"]:
+            by_name_category.setdefault((row["name"], row["category"]), []).append(row)
+            if row["address"]:
+                by_addr.setdefault((row["name"], row["category"], row["address"]), []).append(row)
+    return {"by_id": by_id, "by_url": by_url, "by_addr": by_addr, "by_name_category": by_name_category}
+
+
+def resolve_match(dom_row: dict, index: dict) -> dict:
+    """DOM row 하나를 하나의 entity index(Network 또는 Apollo, 독립적으로 호출)에
+    대해 매칭한다. 반환: {"row": dict|None, "confidence": "EXACT_ID"|"EXACT_URL"|
+    "STRONG_COMPOSITE"|"AMBIGUOUS"|"UNMATCHED"}. 각 단계에서 후보가 2건 이상이면
+    그 단계에서 즉시 AMBIGUOUS로 확정한다(더 느슨한 하위 단계로 내려가 임의로
+    골라잡지 않는다)."""
+    place_id = dom_row.get("place_id") or ""
+    if place_id:
+        candidates = index["by_id"].get(place_id)
+        if candidates is not None:
+            if len(candidates) != 1:
+                return {"row": None, "confidence": "AMBIGUOUS"}
+            return {"row": candidates[0]["source_row"], "confidence": "EXACT_ID"}
+
+    place_url = dom_row.get("normalized_place_url") or ""
+    if place_url:
+        candidates = index["by_url"].get(place_url)
+        if candidates is not None:
+            if len(candidates) != 1:
+                return {"row": None, "confidence": "AMBIGUOUS"}
+            return {"row": candidates[0]["source_row"], "confidence": "EXACT_URL"}
+
+    name = dom_row.get("normalized_name") or ""
+    category = dom_row.get("category") or ""
+    address = dom_row.get("address_text") or ""
+    if name and category and address:
+        candidates = index["by_addr"].get((name, category, address))
+        if candidates is not None:
+            if len(candidates) != 1:
+                return {"row": None, "confidence": "AMBIGUOUS"}
+            return {"row": candidates[0]["source_row"], "confidence": "STRONG_COMPOSITE"}
+
+    if name and category and (name, category) in index["by_name_category"]:
+        return {"row": None, "confidence": "AMBIGUOUS"}
+
+    return {"row": None, "confidence": "UNMATCHED"}
+
+
+def overall_row_confidence(network_result: dict, apollo_result: dict) -> str:
+    """두 소스(Network/Apollo) 중 더 강한 신뢰도를 채택한다."""
+    nc = (network_result or {}).get("confidence", "UNMATCHED")
+    ac = (apollo_result or {}).get("confidence", "UNMATCHED")
+    return nc if _MATCH_CONFIDENCE_RANK.get(nc, 0) >= _MATCH_CONFIDENCE_RANK.get(ac, 0) else ac
+
+
+def merge_dom_row_fields(dom_row: dict, network_result: dict, apollo_result: dict, collected_at: str) -> dict:
+    """필드 우선순위(요청서 §10): 1)Network 검증값 2)Apollo 구조화값 3)DOM 직접값
+    4)DOM raw_text 정규식 파싱값 5)빈값. 업체명은 항상 DOM 값(정규화만). 플레이스
+    URL은 DOM anchor href를 최우선으로 쓴다 - _build_place_url의 구성 fallback
+    ("/place/{id}/home")은 실측 URL 세그먼트(/restaurant/{id}/home)와 달라 이
+    경로에서는 신뢰하지 않는다(그 fallback으로 만들어진 값인지는 "/place/"
+    포함 여부로 방어적으로 걸러낸다)."""
+    network_row = (network_result or {}).get("row") or {}
+    apollo_row = (apollo_result or {}).get("row") or {}
+    raw_fallback = parse_raw_text_fallback(dom_row.get("raw_text") or "")
+
+    def _pick(network_key, apollo_key, dom_value):
+        if network_key:
+            value = _normalize_text(network_row.get(network_key))
+            if value:
+                return value
+        if apollo_key:
+            value = _normalize_text(apollo_row.get(apollo_key))
+            if value:
+                return value
+        return _normalize_text(dom_value)
+
+    place_url = dom_row.get("place_url") or ""
+    if not place_url:
+        network_url = str(network_row.get("플레이스 URL") or "")
+        if network_url and "/place/" not in network_url:
+            place_url = network_url
+
+    row = {
+        "업체명": dom_row.get("normalized_name") or "",
+        "업종": _pick("업종", "category", dom_row.get("category")),
+        "새로오픈여부": "",
+        "리뷰수": _pick("리뷰수", "review_count", raw_fallback["review_count_guess"]),
+        "주소": _pick("주소", "address", dom_row.get("address_text") or raw_fallback["address_guess"]),
+        "대표전화": _pick("대표전화", None, ""),
+        "플레이스 URL": place_url,
+        "수집일": collected_at,
+        "홈페이지": _normalize_text(network_row.get("홈페이지")),
+        "인스타": _normalize_text(network_row.get("인스타")),
+        "블로그": _normalize_text(network_row.get("블로그")),
+        "place_id": dom_row.get("place_id") or network_row.get("place_id") or apollo_row.get("place_id") or "",
+        "source_page": dom_row.get("page_number"),
+        "dom_index": dom_row.get("dom_index"),
+        "match_confidence": overall_row_confidence(network_result, apollo_result),
+        "_dedup_raw_text": dom_row.get("normalized_raw_text") or "",
+    }
+    return row
+
+
+def compute_page_signature(dom_rows: list) -> dict:
+    """DOM row 배열의 표시 순서를 그대로 써서 first/top5/top10 시그니처를
+    계산한다(comprehensive_cdp_tester.calculate_signature와 동일한 top-N
+    join+md5 관례). Apollo/Network 순서는 전혀 참조하지 않는다."""
+    names = [row.get("normalized_name") or row.get("name") or "" for row in dom_rows]
+    top5 = names[:5]
+    top10 = names[:10]
+    return {
+        "first_name": names[0] if names else "",
+        "top5": top5,
+        "top10": top10,
+        "top5_hash": hashlib.md5("|".join(top5).encode("utf-8")).hexdigest(),
+        "top10_hash": hashlib.md5("|".join(top10).encode("utf-8")).hexdigest(),
+    }
+
+
+def page_transition_confirmed(
+    expected_page_number, actual_page_number, current_flag_ok, previous_signature, new_signature
+) -> bool:
+    """expected_page_number==actual_page_number AND 현재 페이지 활성 표시 확인
+    AND top10 signature가 이전 페이지와 다름을 모두 만족해야 전환 완료로
+    인정한다(요청서 §5/§7 - page 번호/active 속성만으로는 완료 처리 금지)."""
+    if expected_page_number != actual_page_number:
+        return False
+    if not current_flag_ok:
+        return False
+    new_hash = (new_signature or {}).get("top10_hash")
+    if not new_hash:
+        return False
+    prev_hash = (previous_signature or {}).get("top10_hash")
+    return prev_hash != new_hash
+
+
+def dedup_key_for_membership_row(row: dict) -> str:
+    """우선순위: place_id > normalized place_url > (업체명,업종,주소) >
+    (업체명,업종,raw_text) > (업체명, source_page, dom_index)로 유일성을 보장한다.
+    업체명 단독으로는 절대 dedup하지 않는다(마지막 fallback도 page/dom_index로
+    row별 유일성을 유지해, 서로 다른 지점을 잘못 합치지 않는다)."""
+    place_id = _normalize_text(row.get("place_id"))
+    if place_id:
+        return f"id:{place_id}"
+    url = normalize_place_url(row.get("플레이스 URL"))
+    if url:
+        return f"url:{url}"
+    name = _normalize_text(row.get("업체명"))
+    category = _normalize_text(row.get("업종"))
+    address = _normalize_text(row.get("주소"))
+    if name and category and address:
+        return f"addr:{name}|{category}|{address}"
+    raw_text = _normalize_text(row.get("_dedup_raw_text"))
+    if name and raw_text:
+        return f"raw:{name}|{category}|{raw_text}"
+    if name:
+        return f"nameonly:{name}|{row.get('source_page')}|{row.get('dom_index')}"
+    return ""
+
+
+def dedup_membership_rows(rows: list, seen: set) -> list:
+    """dedup_rows와 동일한 in-place seen 패턴(여러 page에 걸쳐 seen을 재사용)."""
+    unique_rows = []
+    for row in rows:
+        key = dedup_key_for_membership_row(row)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    return unique_rows
+
+
+def summarize_membership_diagnostics(match_results: list) -> dict:
+    """요청서 §13 진단 카운터(중복/최종 유일 개수는 dedup 이후 호출자가 채운다)."""
+    total_dom_raw = len(match_results)
+    exact_id = sum(1 for m in match_results if m.get("overall") == "EXACT_ID")
+    exact_url = sum(1 for m in match_results if m.get("overall") == "EXACT_URL")
+    composite = sum(1 for m in match_results if m.get("overall") == "STRONG_COMPOSITE")
+    ambiguous = sum(1 for m in match_results if m.get("overall") == "AMBIGUOUS")
+    unmatched = sum(1 for m in match_results if m.get("overall") == "UNMATCHED")
+    return {
+        "total_dom_raw": total_dom_raw,
+        "total_enriched": exact_id + exact_url + composite,
+        "exact_id_match_count": exact_id,
+        "exact_url_match_count": exact_url,
+        "composite_match_count": composite,
+        "ambiguous_count": ambiguous,
+        "unmatched_count": unmatched,
+    }
+
+
+def trim_membership_rows_to_target(rows: list, target: int) -> list:
+    """DOM 표시 순서를 보존한 채 target 개수로 trim한다(target<=0이면 그대로)."""
+    if not target or target <= 0:
+        return list(rows)
+    return list(rows[:target])

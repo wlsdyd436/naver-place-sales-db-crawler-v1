@@ -152,8 +152,8 @@ naver-place-sales-db-crawler-v1/
 │       ├── safety.py                    # 예외 분류
 │       ├── diagnostics.py               # 진단 산출물 저장
 │       ├── browser_session.py           # BrowserSession(launch)/NativeCdpBrowserSession(native_cdp, 기본값)
-│       ├── network_list_scraper.py      # 목록 응답 파싱/매핑/dedup(현재 기본 엔진)
-│       ├── network_browser_collector.py # 검색 조합 1건 단위 응답 관찰(현재 기본 엔진)
+│       ├── network_list_scraper.py      # 목록 응답 파싱/매핑/dedup + DOM membership/식별자 guard(현재 기본 엔진)
+│       ├── network_browser_collector.py # DomMembershipCollector(현재 기본, DOM-first+Fiber place_id) / NetworkBrowserCollector(레거시 보존, 명시 지정 시만 사용)
 │       ├── network_pipeline.py          # 검색 조합 큐 오케스트레이션(현재 기본 엔진)
 │       ├── list_scraper.py              # 레거시 searchIframe 리스트 수집(내부 롤백 경로)
 │       ├── detail_scraper.py            # 레거시 카드 클릭 → entryIframe 상세 수집(내부 롤백 경로)
@@ -274,3 +274,21 @@ build.bat
 본 프로젝트는 공개 사업장 대표 정보를 영업 조사 및 방문/전화 영업 준비용으로 정리하는 도구입니다.
 
 광고성 문자, 이메일, 카카오톡 등 전자적 광고 발송은 관련 법령에 따른 수신 동의와 수신거부 절차를 준수해야 합니다. 자세한 내용은 `LEGAL_NOTICE.md`를 확인해야 합니다.
+
+---
+
+## 8. DOM-first 단일 검색어 300건 수집(2026-07-21부터 기본 엔진)
+
+`src/pc/network_browser_collector.py`의 `collect_dom_membership_query`(및 그 production wrapper인 `DomMembershipCollector`)가 제공합니다. **2026-07-21부터 `app.py`의 "수집 시작" 기본 동작이 이 엔진을 사용합니다**(`src/ui.py`의 `_run_network_pipeline` 기본 `collector_factory`가 `DomMembershipCollector`로 배선됨 - UI에 별도 토글은 없습니다). 이전 엔진(`NetworkBrowserCollector`/`collect_network_query`, Network 응답 관찰 기반)은 코드에 그대로 보존되어 있으며, 필요 시 코드에서 `collector_factory=NetworkBrowserCollector`를 명시적으로 지정하면 이전 경로로 되돌릴 수 있습니다(현재 UI에는 이 전환을 위한 화면 옵션이 없습니다).
+
+- **DOM-first membership**: 검색 목록 화면(`iframe#searchIframe`)에서 검증된 scrollBy 증분 스크롤(`cdp_validation_tests/comprehensive_cdp_tester.py` 기준 - scrollHeight/row수/업체명수 3개 지표가 함께 안정될 때까지 단일 `frame.evaluate()` 안에서 반복)로 리스트를 끝까지 렌더링한 뒤, `li.UEzoS.rTjJo` row를 그대로 최종 업체 목록(membership)과 표시 순서로 사용합니다. Network 응답과 `window.__APOLLO_STATE__`는 그 DOM 업체의 구조화 필드(업종/리뷰수/주소 등)를 보강하는 용도로만 쓰이고, DOM에 없는 Network/Apollo 항목은 결과에 추가되지 않습니다.
+- **React Fiber 기반 place_id 식별자(2026-07-21 추가)**: DOM 카드의 링크(`<a href>`)는 실측 결과 전부 `href="#"`(placeholder)라 URL에서 업체 ID를 안정적으로 얻을 수 없습니다. 대신 React가 각 DOM 노드에 심어두는 내부 속성(`__reactFiber$*`/`__reactProps$*` - 접두사 뒤 임의 문자열은 페이지 로드마다 바뀌므로 `Object.keys()`로 동적 탐색)에서 실제 업체 ID(`item.id`/`item.apolloCacheId`)를 읽습니다. 이 속성은 **React의 비공개 내부 구현이며 공식 API가 아닙니다** - Naver Map 프론트엔드 구조가 바뀌면 이 경로가 깨질 수 있습니다. 이를 대비해 다음 guard를 둡니다.
+  - 1차: 알려진 경로(fast path)에서 `item.id`와 `item.apolloCacheId`를 각각 확인하고, 둘 다 있는데 값이 다르면 **CONFLICT로 판정하고 임의로 하나를 선택하지 않습니다**.
+  - 2차(fast path 실패 시만): 깊이·방문 객체 수·순환 참조를 제한한 범위 탐색(bounded search)으로 `id`류 이름의 값을 찾되, 서로 다른 값이 2개 이상이면 역시 CONFLICT로 판정합니다.
+  - 3차(그래도 없을 때): DOM anchor href 파싱을 최후 수단으로 시도합니다.
+  - 숫자가 아니거나 비정상적으로 짧거나/긴 값은 애초에 후보로 인정하지 않습니다.
+  - 어떤 방법으로도 확정하지 못해도(UNRESOLVED) **업체 row 자체는 삭제하지 않습니다** - 업체명/업종 등 DOM에서 바로 얻은 값은 그대로 보존됩니다.
+- 단일 검색어, 최대 5페이지, 목표 300건 계약입니다.
+- **상세 필드 채움률(구조적 한계 - 2026-07-21 Live 검증 300건 실측 기준)**: place_id 식별이 안정화된 뒤(300/300 확보, 충돌·미해결 0건) 업체명·업종·수집일 300/300, **주소 300/300**, 리뷰수 285/300까지는 정상적으로 채워집니다. 그러나 **대표전화(18/300)·플레이스 URL(17/300)·홈페이지(5/300)·인스타(5/300)·블로그(0/300)는 여전히 낮습니다** - 이는 매칭 정확도 문제가 아니라, 검색 목록 API 응답 자체에 전화번호/홈페이지 필드가 없기 때문입니다(실측 확인). 이 값들을 안정적으로 채우려면 업체 상세 페이지(entryIframe) 진입이 필요한데, 이는 "카드를 클릭해 상세 화면으로 진입하지 않습니다"라는 현재 제품의 핵심 설계 원칙(§1)과 충돌하고 300건 순차 클릭이라는 새로운 차단 위험을 추가하므로 현재는 채택하지 않았습니다.
+- **안전 중단**: 기존과 동일하게 CAPTCHA·HTTP 403·405·429·iframe/list container 소실 시 즉시 중단하고 그때까지 결과를 보존합니다. 페이지 전환 완료는 "기대 페이지 번호와 실제 활성 페이지 번호 일치 + DOM top-10 이름 signature 변화"를 모두 확인해야 인정합니다(페이지 번호만으로 판단하지 않음).
+- **문제 해결**: 300건 미만으로 끝나면 성공으로 표시하지 않습니다. CAPTCHA/HTTP 오류/전환 실패/식별자 확보 실패는 각각 별도로 진단 기록에 남습니다(자동 보완이나 재시도를 하지 않음).
