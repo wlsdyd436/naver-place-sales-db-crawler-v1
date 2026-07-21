@@ -7442,3 +7442,142 @@ NaverPlaceSalesDbCrawler\browser_profiles\edge`.
 않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
 `scratchpad/page300_dom_place_id_live/`는 `.gitignore`의 `scratchpad/`
 패턴에 포함되어 tracked 변경에 나타나지 않는다.
+
+---
+
+# 2026-07-21 PAGE300-DETAIL-1: 300개 업체 Excel 컬럼 실데이터 보강(상세정보 enrichment)
+
+## 배경/기준
+시작 HEAD `c7a83d972afa7619c49cbb00b0bd7dfc8c141718`("기능: DOM 기반 300개
+수집기 프로덕션 배선" - 이전 두 라운드 작업이 사용자에 의해 이 커밋으로
+합쳐짐), 시작 working tree clean. 업체 수(300)/place_id(300/300)/주소
+(300/300)는 이미 확보된 상태에서, 나머지 Excel 컬럼(새로오픈여부/대표전화/
+플레이스 URL/홈페이지/인스타/블로그)을 실제 데이터로 채우는 작업.
+
+## 감사 결과
+- **`detail_scraper.py`의 `collect_full`은 place_id를 입력받는 함수가
+  아니다.** 카드를 처음부터 다시 찾아 index로 클릭한 뒤 entryIframe URL에서
+  place_id를 사후 확보하는 완전히 다른 순회 구조라 "300개 place_id를 넣으면
+  상세를 반환"하는 기존 함수가 없었다 - 새 진입/순회 로직(`_fetch_place_
+  detail`)만 새로 작성하고, entryIframe 콘텐츠 추출 로직(`_extract_entry_
+  phone`/`_extract_entry_address`/`_extract_entry_sns`/`_entry_title`/
+  `_title_matches`)은 detail_scraper.py에서 그대로 import해 재사용했다(재구현
+  없음).
+- `session.find_entry_frame()`은 `BrowserSession`에만 있고 production
+  기본인 `NativeCdpBrowserSession`에는 없어, `_find_search_frame(page)`와
+  동일한 패턴의 새 자유 함수 `_find_entry_frame_like(page)`를 작성했다(못
+  찾으면 `page` 자신을 반환 - Live로 실측한 결과 실제로는 `page.frame(name=
+  "entryIframe")`로 정상적으로 찾아졌다).
+- `src/parser.py`에 이미 검증된 `detect_new_open_pc`/`extract_review_count_
+  pc`/`extract_address_from_pc_text`가 있었는데 DOM-first 경로는 이를 쓰지
+  않고 자체 regex를 쓰고 있었다 - 이번에 교체했다("1.2만"류 한국어 축약 표기
+  처리는 기존 정책에 없어 추가하지 않음).
+- `_DEFAULT_COLLECTION_ENGINE`(ui.py 내부 상수, network/legacy 이진 스위치)는
+  이번 요청(DOM-first 300개에 상세 enrichment를 세밀하게 얹는 것)과 무관해
+  "이미 있는 공식 설정"으로 재사용하지 않았다 - 요청서 §9가 스스로 "10개
+  표본까지만, 300개 전체 자동 실행 금지"로 범위를 좁혀놓아, 이번 라운드는
+  UI 배선을 변경하지 않고 `DomMembershipCollector.enrich_detail()`을 새
+  capability로만 추가했다(자동 호출 없음).
+- 플레이스 URL: DOM anchor href가 전부 `#`라 실측 vertical 세그먼트를 알 수
+  없어, 범용(`/place/{id}/home`) 형태를 채택했다 - **Live B에서 10/10 성공적으로
+  렌더링/타이틀 일치 확인되어 vertical 추측 없이도 정상 동작함이 실측
+  확인됨**.
+
+## 컬럼 우선순위 변경/구현
+업종: DOM 우선(기존 Network 우선에서 변경). 새로오픈여부: `detect_new_open_
+pc`(DOM raw_text). 리뷰수: Network 구조화값 → `extract_review_count_pc`.
+주소: Network/Apollo(기존 유지) → 상세정보 → `extract_address_from_pc_text`.
+대표전화/홈페이지/인스타/블로그: 상세정보 우선 → Network(일부 항목에 tel이
+실제로 존재함이 이번 Live로 처음 확인됨). 플레이스 URL: 상세 확인 URL → DOM
+anchor href → `build_place_url_from_id(place_id)` → 빈값.
+
+## 실제 수정/추가 파일
+- `src/pc/network_list_scraper.py`: `src.parser` 함수 import해 `parse_raw_
+  text_fallback` 교체(새로오픈여부 판정 추가), `build_place_url_from_id`/
+  `merge_detail_into_row` 신규, `merge_dom_row_fields`에 `detail_result=None`
+  선택 인자 추가(하위 호환) + 업종 우선순위 DOM-first로 변경.
+- `src/pc/network_browser_collector.py`: `detail_scraper.py`에서 추출/상수
+  함수 재사용 import, `_find_entry_frame_like`/`_fetch_place_detail`(단건 상세
+  방문+재시도+CAPTCHA/HTTP 안전중단) 신규, `DomMembershipCollector.enrich_
+  detail(rows, max_targets=None)` 신규 메서드(순차 실행, 연속 실패 임계·
+  CAPTCHA·HTTP 403/405/429 시 즉시 중단, 부분 결과 보존). **collect_query/
+  기본 UI 흐름에서 자동 호출되지 않음** - 300개 전체 자동 실행은 이번 범위
+  밖.
+- `tests/test_pc_dom_membership.py`(갱신): 업종 우선순위 변경 반영 기존 3개
+  테스트 갱신 + 신규 9개(place URL 생성/malformed 거부, 새로오픈여부, detail_
+  result 우선순위, merge_detail_into_row exact-match/실패시 유지/URL exact
+  match). 총 46개(기존 37 + 신규 9).
+- 신규 `tests/test_pc_detail_enrichment.py`: `_fetch_place_detail`/`enrich_
+  detail` 10개 검증(성공/place_id없음/title불일치 재시도/HTTP 차단/CAPTCHA/
+  retry회복/max_targets/CAPTCHA중단시 부분보존/연속실패중단/성공병합). 실제
+  브라우저 미실행.
+- 신규 `scratchpad/page300_detail_enrichment_live/run_live_verification.py`
+  (production 코드 아님): Live A+B 러너.
+- 수정하지 않음: `detail_scraper.py`(재사용만), `list_scraper.py`,
+  `pipeline.py`, `export_adapter.py`, `exporter.py`, `browser_session.py`,
+  `config.py`, `network_pipeline.py`, `src/ui.py`(이번 라운드 UI 배선 변경
+  없음), 기존 `test_pc_detail_scraper.py`.
+
+## 테스트 결과
+`test_pc_dom_membership.py` 46/46, `test_pc_dom_membership_collector.py`
+20/20, 신규 `test_pc_detail_enrichment.py` 10/10. 전체 회귀(`tests/*.py`
+31개) 30 PASS / 1 FAIL(`test_excel_validation.py`, baseline과 동일, 신규
+실패 없음).
+
+## Live A 결과(production 경로, 상세 페이지 방문 없음)
+검색어 "서울특별시 강동구 천호동 카페", Edge, PID 23396. final_count=300,
+place_id_resolved=300/unique=300, **place_url_filled_count=300/300**(범용
+URL 생성만으로 300/300 달성).
+
+## Live B 결과(같은 세션, DOM 순서 앞쪽 10개만 실제 상세 페이지 방문)
+소요 12.4초(10건, 평균 약 1.24초/건). **10/10 전부 detail_success**(대표전화
+10/10, 실제 지역번호/0507 안심번호 형식 확인, 주소는 Network/Apollo보다 더
+상세한 지번/동호수 포함, 플레이스 URL 10/10 렌더링 성공·업체명 title 일치
+확인 - 범용 `/place/{id}/home` 형태가 실제로 정상 동작함을 실측 확인). SNS는
+표본 특성상 인스타 3/10, 홈페이지 2/10(스타벅스 공식 홈페이지, 카카오채널)
+확인, 블로그는 표본에서 0/10(전체 300건 기준으로도 0 - 이 검색/표본에서는
+업체가 blog.naver.com류 링크를 등록하지 않은 것으로 추정, 매칭 로직
+결함이 아님). CAPTCHA/HTTP 403·405·429 없음.
+
+## Excel(300건 전체, 10건만 상세 반영)
+rows=300, columns=11(순서 일치). 컬럼별 채움: 업체명 300, 업종 300,
+**새로오픈여부 4**(기존 항상 0이었음 - `detect_new_open_pc` 연동 효과 최초
+확인), 리뷰수 285, 주소 300, **대표전화 18**(상세 방문 10건 + Network에
+실제로 tel이 존재하는 일부 항목 - "Network에 tel이 없다"는 이전 라운드
+결론이 전량은 아니었음이 이번 실측으로 정정됨), **플레이스 URL 300**(직전
+라운드 17에서 300으로), 수집일 300, 홈페이지 5, 인스타 7, 블로그 0.
+
+## 분리 판정
+DOM300_PASS / PLACE_ID_300_PASS / PLACE_URL_300_PASS / DETAIL_PIPELINE_PASS
+/ EXCEL_11COL_PASS / DETAIL_SAMPLE_PASS
+
+## 전체 판정
+**EXCEL_ENRICHMENT_READY**
+
+## 남은 위험/다음 단계
+1. **300개 전체 상세 자동 실행은 아직 하지 않았다.** 10건 기준 평균
+   1.24초/건을 단순 선형 외삽하면 300건은 약 6~7분 예상되지만, 이는 표본
+   10건의 관찰치를 그대로 늘린 추정일 뿐 - 실제 300건 연속 방문 시 네이버
+   측 rate limit/CAPTCHA 트리거 여부는 검증되지 않았다. `enrich_detail`은
+   `_CONSECUTIVE_FAILURE_LIMIT`(5)와 CAPTCHA/HTTP 403·405·429 안전중단을
+   갖추고 있으나, 이번 10건 표본에서는 단 한 번도 실패/차단이 발생하지 않아
+   그 안전장치들이 실제로 발동하는 상황은 실측되지 않았다.
+2. 대표전화 18/300 중 정확히 몇 건이 Network 기존 tel 필드에서 왔고 몇 건이
+   이번 상세 방문 10건에서 왔는지 세분화 로그는 남기지 않았다(추후 필요 시
+   diagnostics 필드 추가 검토).
+3. `enrich_detail`은 `DomMembershipCollector`의 새 메서드로만 존재하고
+   UI/collect_query 흐름에 자동 연결되지 않았다 - 실제 사용자가 상세
+   enrichment를 쓰려면 이 메서드를 호출하는 배선 작업이 별도로 필요하다
+   (300개 전체 실행의 소요시간/차단 위험이 이번 10건 표본만으로는 완전히
+   검증되지 않았으므로, 그 배선은 사용자의 별도 결정을 기다린다).
+4. 블로그 컬럼은 이번 검색(카페 300건)에서 0/300이었다 - blog.naver.com
+   분류 로직 자체는 `_extract_entry_sns`(기존 코드, 무수정)가 담당하며
+   detail_scraper 테스트에서 이미 검증되어 있으나, 이번 특정 검색/표본에서
+   해당 링크를 등록한 업체가 없었을 뿐 실제 결함 여부는 다른 검색어로
+   재확인이 필요할 수 있다.
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean` 전부 수행하지
+않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
+`scratchpad/page300_detail_enrichment_live/`는 `.gitignore`의 `scratchpad/`
+패턴에 포함되어 tracked 변경에 나타나지 않는다.

@@ -13,11 +13,13 @@ from src.exporter import MERGED_COLUMNS
 from src.pc.network_list_scraper import (
     apollo_key_exists_for_id,
     build_entity_index,
+    build_place_url_from_id,
     compute_page_signature,
     dedup_key_for_membership_row,
     dedup_membership_rows,
     extract_place_id_from_url,
     is_skeleton_dom_row,
+    merge_detail_into_row,
     merge_dom_row_fields,
     normalize_dom_row,
     normalize_place_url,
@@ -236,9 +238,9 @@ def check_merge_dom_network_only(reporter: ValidationReporter) -> None:
     }
     apollo_result = {"row": None, "confidence": "UNMATCHED"}
     row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
-    ok = row["업체명"] == "카페 A" and row["업종"] == "카페(Network)" and row["리뷰수"] == "10"
+    ok = row["업체명"] == "카페 A" and row["리뷰수"] == "10" and row["주소"] == "서울 강동구"
     if ok:
-        reporter.pass_("merge_dom_row_fields: DOM+Network only 조합, Network 값이 업종/리뷰수 우선 채택")
+        reporter.pass_("merge_dom_row_fields: DOM+Network only 조합, Network 값이 리뷰수/주소로 채택")
     else:
         reporter.fail(f"DOM+Network only 병합 이상: {row}")
 
@@ -248,22 +250,35 @@ def check_merge_dom_apollo_only(reporter: ValidationReporter) -> None:
     network_result = {"row": None, "confidence": "UNMATCHED"}
     apollo_result = {"row": {"category": "카페(Apollo)", "address": "서울 강동구 천호동"}, "confidence": "STRONG_COMPOSITE"}
     row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
-    ok = row["업종"] == "카페(Apollo)" and row["주소"] == "서울 강동구 천호동"
+    ok = row["주소"] == "서울 강동구 천호동"
     if ok:
-        reporter.pass_("merge_dom_row_fields: DOM+Apollo only 조합, Apollo 값으로 업종/주소 보강")
+        reporter.pass_("merge_dom_row_fields: DOM+Apollo only 조합, Apollo 값으로 주소 보강")
     else:
         reporter.fail(f"DOM+Apollo only 병합 이상: {row}")
 
 
-def check_merge_dom_network_apollo_network_wins(reporter: ValidationReporter) -> None:
+def check_category_prefers_dom_over_network_apollo(reporter: ValidationReporter) -> None:
+    """PAGE300-DETAIL-1 §3: 업종은 DOM -> Network/Apollo -> 상세정보 순(기존
+    Network 우선 순서에서 변경됨)."""
     dom_row = normalize_dom_row({"name": "카페 C", "category": "카페(DOM)"}, page_number=1)
     network_result = {"row": {"업종": "카페(Network)"}, "confidence": "EXACT_ID"}
     apollo_result = {"row": {"category": "카페(Apollo)"}, "confidence": "STRONG_COMPOSITE"}
     row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
-    if row["업종"] == "카페(Network)":
-        reporter.pass_("merge_dom_row_fields: DOM+Network+Apollo 동시 존재 시 Network가 우선")
+    if row["업종"] == "카페(DOM)":
+        reporter.pass_("merge_dom_row_fields: DOM 업종 값이 Network/Apollo보다 우선 채택됨")
     else:
-        reporter.fail(f"Network 우선순위가 지켜지지 않음: {row}")
+        reporter.fail(f"업종 DOM 우선순위가 지켜지지 않음: {row}")
+
+
+def check_category_falls_back_to_network_when_dom_empty(reporter: ValidationReporter) -> None:
+    dom_row = normalize_dom_row({"name": "카페 C2", "category": ""}, page_number=1)
+    network_result = {"row": {"업종": "카페(Network)"}, "confidence": "EXACT_ID"}
+    apollo_result = {"row": {"category": "카페(Apollo)"}, "confidence": "STRONG_COMPOSITE"}
+    row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
+    if row["업종"] == "카페(Network)":
+        reporter.pass_("merge_dom_row_fields: DOM 업종이 비어있으면 Network로 폴백")
+    else:
+        reporter.fail(f"업종 폴백 이상: {row}")
 
 
 def check_merge_enrichment_failed_keeps_dom_row(reporter: ValidationReporter) -> None:
@@ -587,6 +602,122 @@ def check_identifier_places_300_unique_via_fast_path(reporter: ValidationReporte
         reporter.fail(f"place_id uniqueness 이상: {len(place_ids)}/300")
 
 
+# ---------------------------------------------------------------------------
+# 9. 상세정보 enrichment 병합 / place URL 생성 (PAGE300-DETAIL-1)
+# ---------------------------------------------------------------------------
+
+
+def check_build_place_url_from_id_valid(reporter: ValidationReporter) -> None:
+    url = build_place_url_from_id("2014880028")
+    if url == "https://pcmap.place.naver.com/place/2014880028/home":
+        reporter.pass_("build_place_url_from_id: 유효한 숫자 ID로 범용 place URL 생성")
+    else:
+        reporter.fail(f"build_place_url_from_id 결과 이상: {url}")
+
+
+def check_build_place_url_from_id_rejects_malformed(reporter: ValidationReporter) -> None:
+    empty = build_place_url_from_id("")
+    non_numeric = build_place_url_from_id("abc123")
+    none_value = build_place_url_from_id(None)
+    if empty == "" and non_numeric == "" and none_value == "":
+        reporter.pass_("build_place_url_from_id: 빈 값/비숫자 ID는 URL을 만들지 않고 거부")
+    else:
+        reporter.fail(f"malformed ID 처리 이상: empty={empty!r} non_numeric={non_numeric!r} none={none_value!r}")
+
+
+def check_new_open_detected_from_raw_text(reporter: ValidationReporter) -> None:
+    dom_row = normalize_dom_row({"name": "카페 신규", "category": "카페", "raw_text": "카페 신규카페\n새로오픈리뷰 3"}, page_number=1)
+    row = merge_dom_row_fields(dom_row, {"row": None, "confidence": "UNMATCHED"}, {"row": None, "confidence": "UNMATCHED"}, "2026-07-21")
+    if row["새로오픈여부"] == "O":
+        reporter.pass_("merge_dom_row_fields: raw_text의 '새로오픈' 문구를 기존 parser.detect_new_open_pc로 인식")
+    else:
+        reporter.fail(f"새로오픈여부 판정 이상: {row}")
+
+
+def check_new_open_blank_when_no_signal(reporter: ValidationReporter) -> None:
+    dom_row = normalize_dom_row({"name": "카페 기존", "category": "카페", "raw_text": "카페 기존카페\n리뷰 300"}, page_number=1)
+    row = merge_dom_row_fields(dom_row, {"row": None, "confidence": "UNMATCHED"}, {"row": None, "confidence": "UNMATCHED"}, "2026-07-21")
+    if row["새로오픈여부"] == "":
+        reporter.pass_("merge_dom_row_fields: 새로오픈 근거가 없으면 기존 정책대로 빈값 유지")
+    else:
+        reporter.fail(f"새로오픈여부 빈값 유지 실패: {row}")
+
+
+def check_merge_dom_row_fields_detail_priority_for_phone_address_sns(reporter: ValidationReporter) -> None:
+    dom_row = normalize_dom_row({"name": "카페 상세", "category": "카페"}, page_number=1)
+    detail_result = {
+        "detail_success": True,
+        "place_id": "",
+        "대표전화": "02-1234-5678",
+        "주소": "서울 강동구 상세주소",
+        "플레이스 URL": "https://pcmap.place.naver.com/restaurant/999/home",
+        "홈페이지": "https://example.com",
+        "인스타": "https://instagram.com/example",
+        "블로그": "",
+    }
+    row = merge_dom_row_fields(
+        dom_row, {"row": None, "confidence": "UNMATCHED"}, {"row": None, "confidence": "UNMATCHED"}, "2026-07-21",
+        detail_result=detail_result,
+    )
+    ok = (
+        row["대표전화"] == "02-1234-5678"
+        and row["주소"] == "서울 강동구 상세주소"
+        and row["플레이스 URL"] == "https://pcmap.place.naver.com/restaurant/999/home"
+        and row["홈페이지"] == "https://example.com"
+        and row["인스타"] == "https://instagram.com/example"
+    )
+    if ok:
+        reporter.pass_("merge_dom_row_fields: detail_result이 있으면 대표전화/주소/URL/홈페이지/인스타에 최우선 반영")
+    else:
+        reporter.fail(f"detail_result 우선순위 반영 이상: {row}")
+
+
+def check_place_url_falls_back_to_generated_when_no_detail_or_anchor(reporter: ValidationReporter) -> None:
+    dom_row = normalize_dom_row(
+        {"name": "카페 URL생성", "category": "카페", "identifier_candidates": {"fast_item_id": "300000001"}},
+        page_number=1,
+    )
+    row = merge_dom_row_fields(dom_row, {"row": None, "confidence": "UNMATCHED"}, {"row": None, "confidence": "UNMATCHED"}, "2026-07-21")
+    if row["플레이스 URL"] == "https://pcmap.place.naver.com/place/300000001/home":
+        reporter.pass_("merge_dom_row_fields: 상세/anchor 정보가 없으면 place_id로 범용 URL을 생성해 채움")
+    else:
+        reporter.fail(f"플레이스 URL 생성 폴백 이상: {row}")
+
+
+def check_merge_detail_into_row_requires_place_id_or_url_exact_match(reporter: ValidationReporter) -> None:
+    row = {"업체명": "카페 X", "place_id": "111111", "플레이스 URL": "https://pcmap.place.naver.com/place/111111/home", "대표전화": ""}
+    matching_detail = {"detail_success": True, "place_id": "111111", "대표전화": "02-1111-2222"}
+    mismatched_detail = {"detail_success": True, "place_id": "222222", "대표전화": "02-9999-9999"}
+
+    merged_match = merge_detail_into_row(dict(row), matching_detail)
+    merged_mismatch = merge_detail_into_row(dict(row), mismatched_detail)
+
+    if merged_match["대표전화"] == "02-1111-2222" and merged_mismatch["대표전화"] == "":
+        reporter.pass_("merge_detail_into_row: place_id가 정확히 일치할 때만 병합, 업체명만으로는 병합하지 않음")
+    else:
+        reporter.fail(f"detail 병합 exact-match 검증 이상: match={merged_match} mismatch={merged_mismatch}")
+
+
+def check_merge_detail_into_row_failed_detail_keeps_row_unchanged(reporter: ValidationReporter) -> None:
+    row = {"업체명": "카페 Y", "place_id": "333333", "플레이스 URL": "", "대표전화": "", "주소": "기존주소"}
+    failed_detail = {"detail_success": False, "detail_stop_reason": "detail_timeout", "place_id": "333333", "대표전화": "02-0000-0000"}
+    merged = merge_detail_into_row(dict(row), failed_detail)
+    if merged == row:
+        reporter.pass_("merge_detail_into_row: 상세 수집 실패(detail_success=False) 시 row를 그대로 유지(삭제/오염 없음)")
+    else:
+        reporter.fail(f"상세 실패 시 row 변경됨: {merged}")
+
+
+def check_merge_detail_into_row_url_exact_match(reporter: ValidationReporter) -> None:
+    row = {"업체명": "카페 Z", "place_id": "", "플레이스 URL": "https://pcmap.place.naver.com/place/444444/home", "주소": ""}
+    detail = {"detail_success": True, "place_id": "", "플레이스 URL": "https://pcmap.place.naver.com/place/444444/home?query=1", "주소": "상세주소"}
+    merged = merge_detail_into_row(dict(row), detail)
+    if merged["주소"] == "상세주소":
+        reporter.pass_("merge_detail_into_row: place_id 없어도 normalized place URL exact 일치로 병합됨")
+    else:
+        reporter.fail(f"URL exact match 병합 이상: {merged}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
     checks = [
@@ -602,7 +733,8 @@ def main() -> int:
         check_match_unmatched,
         check_merge_dom_network_only,
         check_merge_dom_apollo_only,
-        check_merge_dom_network_apollo_network_wins,
+        check_category_prefers_dom_over_network_apollo,
+        check_category_falls_back_to_network_when_dom_empty,
         check_merge_enrichment_failed_keeps_dom_row,
         check_merge_place_url_prefers_dom_anchor,
         check_dedup_prefers_place_id_over_name,
@@ -626,6 +758,15 @@ def main() -> int:
         check_apollo_key_confirmation,
         check_identifier_apollo_confirmed_flag_propagates,
         check_identifier_places_300_unique_via_fast_path,
+        check_build_place_url_from_id_valid,
+        check_build_place_url_from_id_rejects_malformed,
+        check_new_open_detected_from_raw_text,
+        check_new_open_blank_when_no_signal,
+        check_merge_dom_row_fields_detail_priority_for_phone_address_sns,
+        check_place_url_falls_back_to_generated_when_no_detail_or_anchor,
+        check_merge_detail_into_row_requires_place_id_or_url_exact_match,
+        check_merge_detail_into_row_failed_detail_keeps_row_unchanged,
+        check_merge_detail_into_row_url_exact_match,
     ]
     for check in checks:
         check(reporter)

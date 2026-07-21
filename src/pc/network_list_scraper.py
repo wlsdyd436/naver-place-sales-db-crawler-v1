@@ -22,6 +22,7 @@
 import hashlib
 import re
 
+from src.parser import detect_new_open_pc, extract_address_from_pc_text, extract_review_count_pc
 from src.pc.safety import is_captcha_or_security_message
 
 _CANDIDATE_RESOURCE_TYPES = ("xhr", "fetch")
@@ -529,8 +530,6 @@ def should_stop_for_target(current_count: int, target: int) -> bool:
 # (느슨한 키이므로 임의 채택 금지 - 요청서 §10).
 # ============================================================================
 
-_REVIEW_COUNT_TEXT_PATTERN = re.compile(r"리뷰\s*([\d,]+)")
-_ADDRESS_HINT_PATTERN = re.compile(r"[가-힣]+(?:시|도)\s?[가-힣]+구\s?[가-힣0-9]+동")
 _PLACE_ID_NAMED_SEGMENT_PATTERN = re.compile(r"/(?:restaurant|place|hairshop|beauty)/(\d+)")
 _PLACE_ID_GENERIC_SEGMENT_PATTERN = re.compile(r"/(\d{5,})(?:[/?]|$)")
 
@@ -578,15 +577,17 @@ def extract_place_id_from_url(url) -> str:
 
 
 def parse_raw_text_fallback(raw_text: str) -> dict:
-    """DOM row의 raw_text(카드 전체 innerText)에서 리뷰수/주소를 최소 정규식으로
-    추출한다(억지 매칭 금지 - 못 찾으면 빈 문자열). Network/Apollo enrichment가
-    실패했을 때만 쓰는 최후 fallback이다."""
+    """DOM row의 raw_text(카드 전체 innerText)에서 리뷰수/주소/새로오픈여부를
+    추출한다(억지 매칭 금지 - 못 찾으면 빈 문자열). PAGE300-DETAIL-1: 자체
+    regex 대신 기존 PC 카드 파서(src/parser.py, list_scraper.py의 _build_row가
+    이미 쓰고 있던 검증된 규칙)를 그대로 재사용한다 - "1.2만" 같은 한국어 축약
+    표기 처리는 기존 정책에 없으므로 이번에도 추가하지 않는다. Network/Apollo
+    enrichment가 실패했을 때만 쓰는 최후 fallback이다."""
     text = str(raw_text or "")
-    review_match = _REVIEW_COUNT_TEXT_PATTERN.search(text)
-    review_guess = review_match.group(1).replace(",", "") if review_match else ""
-    address_match = _ADDRESS_HINT_PATTERN.search(text)
-    address_guess = address_match.group(0) if address_match else ""
-    return {"review_count_guess": review_guess, "address_guess": address_guess}
+    review_guess = extract_review_count_pc(text)
+    address_guess = extract_address_from_pc_text(text)
+    new_open_guess = detect_new_open_pc(text)
+    return {"review_count_guess": review_guess, "address_guess": address_guess, "new_open_guess": new_open_guess}
 
 
 # PAGE300-DOM-2: React Fiber 기반 place_id guard. DOM anchor href가 전부 "#"
@@ -813,46 +814,98 @@ def overall_row_confidence(network_result: dict, apollo_result: dict) -> str:
     return nc if _MATCH_CONFIDENCE_RANK.get(nc, 0) >= _MATCH_CONFIDENCE_RANK.get(ac, 0) else ac
 
 
-def merge_dom_row_fields(dom_row: dict, network_result: dict, apollo_result: dict, collected_at: str) -> dict:
-    """필드 우선순위(요청서 §10): 1)Network 검증값 2)Apollo 구조화값 3)DOM 직접값
-    4)DOM raw_text 정규식 파싱값 5)빈값. 업체명은 항상 DOM 값(정규화만). 플레이스
-    URL은 DOM anchor href를 최우선으로 쓴다 - _build_place_url의 구성 fallback
-    ("/place/{id}/home")은 실측 URL 세그먼트(/restaurant/{id}/home)와 달라 이
-    경로에서는 신뢰하지 않는다(그 fallback으로 만들어진 값인지는 "/place/"
-    포함 여부로 방어적으로 걸러낸다)."""
+def build_place_url_from_id(place_id) -> str:
+    """place_id로 범용(vertical 비의존) 플레이스 URL을 구성한다. DOM anchor
+    href가 전부 "#"라 실측 세그먼트(예: restaurant/hospital/hairshop)를 알 수
+    없으므로, 특정 vertical을 추측해 하드코딩하지 않고 네이버가 실제로 자동
+    리다이렉트하는 범용 세그먼트("place")를 사용한다(PAGE300-DETAIL-1 §7 -
+    Live 검증으로 실측 확인 필요, 잘못된 vertical을 임의로 붙이지 않는다).
+    place_id가 숫자 형식이 아니면 빈 문자열을 반환한다(malformed ID로 잘못된
+    URL을 만들지 않는다)."""
+    text = _normalize_text(place_id)
+    if not _DIGIT_ONLY_PATTERN.match(text):
+        return ""
+    return f"https://pcmap.place.naver.com/place/{text}/home"
+
+
+def merge_detail_into_row(row: dict, detail_result: dict) -> dict:
+    """이미 확정된 최종 row에 상세 페이지 결과(detail_result)를 사후 병합한다.
+    place_id 또는 normalized place URL이 정확히 일치할 때만 병합하고, 업체명만
+    으로는 병합하지 않는다(요청서 §4 - 업체명만 같은 다른 지점 오염 방지).
+    detail_result가 없거나 성공하지 못했으면 row를 그대로 반환한다(row 삭제
+    금지 - 실패해도 기존 값 보존)."""
+    if not detail_result or not detail_result.get("detail_success"):
+        return row
+    detail_place_id = _normalize_text(detail_result.get("place_id"))
+    detail_url = normalize_place_url(detail_result.get("플레이스 URL"))
+    row_place_id = _normalize_text(row.get("place_id"))
+    row_url = normalize_place_url(row.get("플레이스 URL"))
+    id_match = bool(detail_place_id) and detail_place_id == row_place_id
+    url_match = bool(detail_url) and detail_url == row_url
+    if not (id_match or url_match):
+        return row
+
+    merged = dict(row)
+    if detail_result.get("대표전화"):
+        merged["대표전화"] = detail_result["대표전화"]
+    if detail_result.get("주소"):
+        merged["주소"] = detail_result["주소"]
+    if detail_result.get("플레이스 URL"):
+        merged["플레이스 URL"] = detail_result["플레이스 URL"]
+    if detail_result.get("홈페이지"):
+        merged["홈페이지"] = detail_result["홈페이지"]
+    if detail_result.get("인스타"):
+        merged["인스타"] = detail_result["인스타"]
+    if detail_result.get("블로그"):
+        merged["블로그"] = detail_result["블로그"]
+    return merged
+
+
+def merge_dom_row_fields(
+    dom_row: dict, network_result: dict, apollo_result: dict, collected_at: str, detail_result: dict = None
+) -> dict:
+    """필드 우선순위(요청서 §3, PAGE300-DETAIL-1로 갱신): 업체명은 항상 DOM 값.
+    업종은 DOM -> Network/Apollo -> 상세정보. 새로오픈여부는 DOM raw_text 판정
+    (기존 parser.detect_new_open_pc 재사용). 리뷰수는 Network 구조화값 ->
+    DOM raw_text(parser.extract_review_count_pc). 주소는 Network/Apollo(기존
+    유지) -> 상세정보 -> DOM raw_text(parser.extract_address_from_pc_text).
+    대표전화/홈페이지/인스타/블로그는 상세정보 우선(Network/Apollo에는 이
+    필드가 없음이 실측 확인됨). 플레이스 URL은 상세정보로 확인된 실제 URL ->
+    DOM anchor href -> place_id로 구성한 범용 URL(build_place_url_from_id) ->
+    빈값. detail_result는 이번 호출 시점에 없을 수 있다(None, 기본값) - 이
+    함수 자체는 상세 페이지를 방문하지 않으며, 상세 병합은 detail_result가
+    이미 확보된 경우에만 이 우선순위에 반영된다(추가 상세 병합은
+    merge_detail_into_row로 사후에도 가능)."""
     network_row = (network_result or {}).get("row") or {}
     apollo_row = (apollo_result or {}).get("row") or {}
+    detail_row = detail_result or {}
     raw_fallback = parse_raw_text_fallback(dom_row.get("raw_text") or "")
 
-    def _pick(network_key, apollo_key, dom_value):
-        if network_key:
-            value = _normalize_text(network_row.get(network_key))
-            if value:
-                return value
-        if apollo_key:
-            value = _normalize_text(apollo_row.get(apollo_key))
-            if value:
-                return value
-        return _normalize_text(dom_value)
+    def _pick(*value_sources):
+        for value in value_sources:
+            normalized = _normalize_text(value)
+            if normalized:
+                return normalized
+        return ""
 
-    place_url = dom_row.get("place_url") or ""
-    if not place_url:
-        network_url = str(network_row.get("플레이스 URL") or "")
-        if network_url and "/place/" not in network_url:
-            place_url = network_url
+    place_url = _pick(
+        detail_row.get("플레이스 URL") if detail_row.get("detail_success") else "",
+        dom_row.get("place_url"),
+        build_place_url_from_id(dom_row.get("place_id")),
+    )
 
     row = {
         "업체명": dom_row.get("normalized_name") or "",
-        "업종": _pick("업종", "category", dom_row.get("category")),
-        "새로오픈여부": "",
-        "리뷰수": _pick("리뷰수", "review_count", raw_fallback["review_count_guess"]),
-        "주소": _pick("주소", "address", dom_row.get("address_text") or raw_fallback["address_guess"]),
-        "대표전화": _pick("대표전화", None, ""),
+        "업종": _pick(dom_row.get("category"), network_row.get("업종"), apollo_row.get("category"), detail_row.get("업종")),
+        "새로오픈여부": _pick(raw_fallback["new_open_guess"], detail_row.get("새로오픈여부")),
+        "리뷰수": _pick(network_row.get("리뷰수"), apollo_row.get("review_count"), raw_fallback["review_count_guess"]),
+        "주소": _pick(network_row.get("주소"), apollo_row.get("address"), detail_row.get("주소"), dom_row.get("address_text"), raw_fallback["address_guess"]),
+        "대표전화": _pick(detail_row.get("대표전화"), network_row.get("대표전화")),
         "플레이스 URL": place_url,
         "수집일": collected_at,
-        "홈페이지": _normalize_text(network_row.get("홈페이지")),
-        "인스타": _normalize_text(network_row.get("인스타")),
-        "블로그": _normalize_text(network_row.get("블로그")),
+        "홈페이지": _pick(detail_row.get("홈페이지"), network_row.get("홈페이지")),
+        "인스타": _pick(detail_row.get("인스타"), network_row.get("인스타")),
+        "블로그": _pick(detail_row.get("블로그"), network_row.get("블로그")),
         "place_id": dom_row.get("place_id") or network_row.get("place_id") or apollo_row.get("place_id") or "",
         "source_page": dom_row.get("page_number"),
         "dom_index": dom_row.get("dom_index"),

@@ -32,16 +32,27 @@ from urllib.parse import quote
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
+from src.pc.detail_scraper import (
+    _CONSECUTIVE_FAILURE_LIMIT,
+    _DETAIL_RETRY,
+    _entry_title,
+    _extract_entry_address,
+    _extract_entry_phone,
+    _extract_entry_sns,
+    _title_matches,
+)
 from src.pc.network_list_scraper import (
     _extract_list_items,
     _map_item_to_row,
     build_entity_index,
+    build_place_url_from_id,
     classify_captcha_signal,
     compute_page_signature,
     dedup_membership_rows,
     dedup_rows,
     is_candidate_response,
     is_skeleton_dom_row,
+    merge_detail_into_row,
     merge_dom_row_fields,
     normalize_dom_row,
     overall_row_confidence,
@@ -1928,6 +1939,159 @@ def _wait_for_dom_page_transition(page, frame, expected_page_number: int, previo
     return {"confirmed": False, "elapsed_ms": elapsed_ms, "reason": reason}
 
 
+# ============================================================================
+# PAGE300-DETAIL-1: place_id 기반 상세정보 enrichment(대표전화/주소/홈페이지/
+# 인스타/블로그/플레이스 URL 확정). src/pc/detail_scraper.py의 collect_full은
+# 카드를 처음부터 다시 찾아 클릭하는 순회형 collector라 place_id를 입력받는
+# 함수가 아니다(감사 결과, PROJECT_STATE.md 기록) - 그래서 새 순회/진입 로직
+# (_fetch_place_detail)만 새로 작성하고, entryIframe 콘텐츠 추출 로직
+# (_extract_entry_phone/_extract_entry_address/_extract_entry_sns/
+# _entry_title/_title_matches)은 detail_scraper.py에서 그대로 import해
+# 재사용한다(재구현 금지 원칙). session.find_entry_frame()은
+# NativeCdpBrowserSession에는 없으므로(BrowserSession 전용 메서드) 이 모듈의
+# 기존 _find_search_frame(page) 패턴을 그대로 따르는 자유 함수로 새로 만든다.
+# ============================================================================
+
+_DETAIL_HTTP_BLOCKING_STATUSES = (403, 405, 429)
+
+
+def _find_entry_frame_like(page):
+    """_find_search_frame(page)와 동일한 폴백 패턴으로 "entry"가 이름/URL에
+    포함된 frame을 찾는다. 못 찾으면(직접 URL 진입 시 iframe 없이 본문에 바로
+    렌더링되는 경우 대응 - Live로 실측 확인 필요) page 자신을 반환한다 -
+    이 모듈이 재사용하는 추출 함수들(_extract_entry_phone 등)은 `.locator()`만
+    쓰므로 Page/Frame 어느 쪽을 받아도 동일하게 동작한다."""
+    try:
+        frame = page.frame(name="entryIframe")
+        if frame:
+            return frame
+    except Exception:
+        pass
+    try:
+        for frame in page.frames:
+            frame_id = f"{getattr(frame, 'name', '')} {getattr(frame, 'url', '')}".lower()
+            if "entry" in frame_id:
+                return frame
+    except Exception:
+        pass
+    return page
+
+
+def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY) -> dict:
+    """row(place_id 포함)의 상세 페이지를 직접 URL로 방문해 대표전화/주소/
+    홈페이지/인스타/블로그/실제 플레이스 URL을 확보한다. 예외를 던지지 않고
+    항상 dict를 반환한다(row 삭제 방지 원칙 - 호출자는 실패해도 기존 값을
+    유지하면 된다). place_id가 없어 URL을 만들 수 없으면 즉시
+    detail_attempted=False로 반환한다."""
+    name = str(row.get("업체명") or "")
+    place_id = row.get("place_id") or ""
+    place_url = build_place_url_from_id(place_id)
+    result = {
+        "detail_attempted": False,
+        "detail_success": False,
+        "detail_stop_reason": "",
+        "detail_http_status": None,
+        "detail_source": "direct_place_url",
+        "detail_error_type": "",
+        "place_id": place_id,
+        "업종": "",
+        "새로오픈여부": "",
+        "대표전화": "",
+        "주소": "",
+        "플레이스 URL": "",
+        "홈페이지": "",
+        "인스타": "",
+        "블로그": "",
+    }
+    if not place_url:
+        result["detail_stop_reason"] = "no_place_url"
+        result["detail_error_type"] = "MissingPlaceId"
+        return result
+
+    result["detail_attempted"] = True
+    attempts_left = 1 + max(0, retry)
+    last_error_type = ""
+    last_stop_reason = "unknown_failure"
+
+    while attempts_left > 0:
+        attempts_left -= 1
+        http_statuses: list = []
+
+        def _handle_response(response, _statuses=http_statuses):
+            try:
+                if response.url == place_url or place_url in (response.url or ""):
+                    _statuses.append(response.status)
+            except Exception:
+                pass
+
+        try:
+            page.on("response", _handle_response)
+        except Exception:
+            pass
+        try:
+            try:
+                page.goto(place_url, wait_until="domcontentloaded", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            except Exception as exc:
+                last_error_type = type(exc).__name__
+                last_stop_reason = "navigation_error"
+                continue
+            finally:
+                try:
+                    page.off("response", _handle_response)
+                except Exception:
+                    pass
+
+            blocking = [s for s in http_statuses if s in _DETAIL_HTTP_BLOCKING_STATUSES]
+            if blocking:
+                result["detail_http_status"] = blocking[0]
+                result["detail_stop_reason"] = "detail_http_error"
+                result["detail_error_type"] = "DetailHttpError"
+                return result
+
+            probe = _probe_captcha_state(page)
+            signal = classify_captcha_signal(
+                marker_present_in_dom=probe["marker_present"],
+                element_visible=probe["visible"],
+                bounding_box_area=probe["bounding_box_area"],
+                click_exception_message=probe["click_intercepted_message"],
+            )
+            if signal["active_captcha_detected"]:
+                result["detail_stop_reason"] = "captcha_detected"
+                result["detail_error_type"] = "CaptchaDetected"
+                return result
+
+            entry_frame = _find_entry_frame_like(page)
+            title = _entry_title(entry_frame)
+            if not _title_matches(title, name):
+                last_error_type = "TitleMismatch"
+                last_stop_reason = "entry_title_mismatch"
+                continue
+
+            phone = _extract_entry_phone(entry_frame)
+            address = _extract_entry_address(entry_frame)
+            homepage, insta, blog = _extract_entry_sns(entry_frame)
+
+            result["detail_success"] = True
+            result["detail_stop_reason"] = ""
+            result["대표전화"] = phone
+            result["주소"] = address
+            result["플레이스 URL"] = place_url
+            result["홈페이지"] = homepage
+            result["인스타"] = insta
+            result["블로그"] = blog
+            return result
+        except Exception as exc:
+            last_error_type = type(exc).__name__
+            last_stop_reason = "unexpected_exception"
+            continue
+
+    result["detail_stop_reason"] = last_stop_reason
+    result["detail_error_type"] = last_error_type
+    return result
+
+
 def collect_dom_membership_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
     """단일 검색어에서 DOM membership 기준으로 최대 max_pages 페이지를 수집한다.
 
@@ -2234,6 +2398,50 @@ class DomMembershipCollector:
                 page.close()
             except Exception:
                 pass
+
+    def enrich_detail(self, rows: list, *, max_targets: int = None) -> list:
+        """PAGE300-DETAIL-1: 이미 확보된 rows(place_id 포함, DOM 순서)의 앞쪽
+        max_targets개(None이면 전체)만 상세 페이지를 순차 방문해 대표전화/주소/
+        홈페이지/인스타/블로그/플레이스 URL을 병합한 새 리스트를 반환한다.
+        동시성 없이 순차 실행하며, CAPTCHA/HTTP 403·405·429 감지 시 그 즉시
+        중단하고 그때까지의 결과(이미 병합된 rows + 아직 시도하지 않은 원본
+        rows)를 그대로 보존한다. 연속 실패가 _CONSECUTIVE_FAILURE_LIMIT를
+        넘어도 동일하게 중단한다. collect_query/기본 UI 흐름에서 자동
+        호출되지 않는다 - 300개 전체 자동 실행 여부는 이번 라운드의 Live
+        표본 결과를 본 뒤 별도로 결정한다(요청서 §9)."""
+        targets = list(rows[:max_targets]) if max_targets is not None else list(rows)
+        remainder = list(rows[max_targets:]) if max_targets is not None else []
+
+        page = self._session.context.new_page()
+        merged_rows: list = []
+        consecutive_failures = 0
+        stop_reason = None
+        try:
+            for row in targets:
+                if stop_reason is not None:
+                    merged_rows.append(row)
+                    continue
+                detail_result = _fetch_place_detail(page, row)
+                merged_rows.append(merge_detail_into_row(row, detail_result))
+
+                if detail_result["detail_success"]:
+                    consecutive_failures = 0
+                    continue
+
+                if detail_result["detail_stop_reason"] in ("captcha_detected", "detail_http_error"):
+                    stop_reason = detail_result["detail_stop_reason"]
+                    continue
+
+                consecutive_failures += 1
+                if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                    stop_reason = "consecutive_failure_limit"
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        return merged_rows + remainder
 
     def __exit__(self, exc_type, exc, tb):
         if self._session_cm is not None:
