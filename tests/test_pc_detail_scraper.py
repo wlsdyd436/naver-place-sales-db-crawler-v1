@@ -902,15 +902,16 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
     # 추가로 정당하게 수정되어 제외(해당 동작은 이 파일의 scroll 테스트가 검증).
     # 2026-07-08 SAFE-1: pipeline.py는 on_security_block 콜백 추가(CAPTCHA/보안 차단 감지를
     # ui.py에 알리는 최소 배선)로 정당하게 수정되어 제외(해당 동작은 test_pc_pipeline.py가 검증).
+    # 2026-07-21 Native Edge/Chrome + CDP Attach 통합: src/pc/config.py(BrowserBackendConfig
+    # 추가)와 src/pc/browser_session.py(NativeCdpBrowserSession 추가)는 승인된 browser
+    # backend 교체로 정당하게 수정되어 제외(해당 동작은 test_pc_browser_session_cdp.py가 검증).
     # 나머지 파일은 계속 수정 금지 대상.
     protected_files = [
         "src/pc_crawler.py",
         "src/parser.py",
         "src/crawler.py",
-        "src/pc/config.py",
         "src/pc/safety.py",
         "src/pc/diagnostics.py",
-        "src/pc/browser_session.py",
     ]
     try:
         result = subprocess.run(
@@ -922,7 +923,7 @@ def check_protected_files_unchanged(reporter: ValidationReporter) -> None:
         )
         output = result.stdout.strip()
         if result.returncode == 0 and output == "":
-            reporter.pass_("금지 파일 7개 모두 git 변경 없음(browser_session 포함)")
+            reporter.pass_("금지 파일 5개 모두 git 변경 없음(config/browser_session은 승인된 CDP 통합으로 제외)")
         else:
             reporter.fail(f"금지 파일 변경 감지 또는 git 실패: rc={result.returncode}, out={output!r}")
     except Exception as exc:

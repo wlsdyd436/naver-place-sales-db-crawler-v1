@@ -1424,9 +1424,13 @@ class FakeBrowserSessionLike:
 
     instances: list = []
 
-    def __init__(self, diagnostic_config=None):
+    def __init__(self, diagnostic_config=None, backend_config=None):
+        # backend_config는 NativeCdpBrowserSession(diagnostic_config, backend_config)
+        # 호출 시그니처와 맞추기 위한 선택 인자다(2026-07-21) - 이 fake는 두 클래스
+        # 이름 어느 쪽으로 monkeypatch되어도 동일하게 동작해야 한다.
         FakeBrowserSessionLike.instances.append(self)
         self.diagnostic_config = diagnostic_config
+        self.backend_config = backend_config
         self.context = FakeLifecycleContext()
         self.page = FakeLifecyclePage(0)
         self.enter_count = 0
@@ -1442,15 +1446,23 @@ class FakeBrowserSessionLike:
 
 
 def _run_with_fake_browser_session(body, *, raise_error: Exception | None = None):
-    """src.pc.browser_session.BrowserSession을 FakeBrowserSessionLike로 monkeypatch한
-    상태에서 body(collector)를 실행한다(session_factory 미지정 - 기본 factory 경로
-    검증용). collect_network_query도 함께 monkeypatch해 실제 응답 관찰을 하지 않는다.
+    """src.pc.browser_session.BrowserSession/NativeCdpBrowserSession을 모두
+    FakeBrowserSessionLike로 monkeypatch한 상태에서 body(collector)를 실행한다
+    (session_factory 미지정 - 기본 factory 경로 검증용). collect_network_query도
+    함께 monkeypatch해 실제 응답 관찰을 하지 않는다.
+
+    2026-07-21: _default_session_factory가 BrowserBackendConfig(기본값 native_cdp)에
+    따라 BrowserSession 또는 NativeCdpBrowserSession 중 하나를 선택하도록 바뀌었다.
+    어느 backend가 기본값이든 실제 Playwright/실제 브라우저 프로세스가 뜨지 않도록
+    두 클래스 이름을 모두 monkeypatch한다.
     """
     FakeBrowserSessionLike.instances.clear()
     original_browser_session = browser_session_module.BrowserSession
+    original_native_cdp_session = browser_session_module.NativeCdpBrowserSession
     original_collect = network_browser_collector.collect_network_query
     calls: list = []
     browser_session_module.BrowserSession = FakeBrowserSessionLike
+    browser_session_module.NativeCdpBrowserSession = FakeBrowserSessionLike
     network_browser_collector.collect_network_query = _fake_collect_network_query_recording(
         calls, raise_error=raise_error
     )
@@ -1459,14 +1471,17 @@ def _run_with_fake_browser_session(body, *, raise_error: Exception | None = None
             body(collector)
     finally:
         browser_session_module.BrowserSession = original_browser_session
+        browser_session_module.NativeCdpBrowserSession = original_native_cdp_session
         network_browser_collector.collect_network_query = original_collect
     return calls
 
 
 def check_default_factory_uses_browser_session(reporter: ValidationReporter) -> None:
-    """1) 기본 factory 경로: session_factory를 넘기지 않아도 src.pc.browser_session.
-    BrowserSession(monkeypatch됨)을 통해 세션이 만들어지고, 실제 Playwright는
-    시작되지 않는다(FakeBrowserSessionLike는 Playwright를 전혀 다루지 않음)."""
+    """1) 기본 factory 경로: session_factory를 넘기지 않아도 src.pc.browser_session의
+    BrowserSession/NativeCdpBrowserSession(monkeypatch됨)을 통해 세션이 만들어지고,
+    실제 Playwright/실제 브라우저는 시작되지 않는다(FakeBrowserSessionLike는
+    Playwright를 전혀 다루지 않음). 실제 backend 선택(native_cdp가 기본값)은
+    test_pc_browser_session_cdp.py가 별도로 검증한다."""
     _run_with_fake_browser_session(lambda collector: collector.collect_query({"query": "q1"}, 10))
 
     if len(FakeBrowserSessionLike.instances) == 1 and FakeBrowserSessionLike.instances[0].enter_count == 1:

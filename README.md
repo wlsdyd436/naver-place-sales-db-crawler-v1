@@ -148,10 +148,10 @@ naver-place-sales-db-crawler-v1/
 │   ├── pc_crawler.py         # 레거시 PC 리스트 수집(내부 롤백 경로로 보존)
 │   ├── ui.py                 # GUI / 수집 엔진 배선(기본: Network/List)
 │   └── pc/
-│       ├── config.py                    # DiagnosticConfig
+│       ├── config.py                    # DiagnosticConfig, BrowserBackendConfig
 │       ├── safety.py                    # 예외 분류
 │       ├── diagnostics.py               # 진단 산출물 저장
-│       ├── browser_session.py           # Playwright 세션 관리
+│       ├── browser_session.py           # BrowserSession(launch)/NativeCdpBrowserSession(native_cdp, 기본값)
 │       ├── network_list_scraper.py      # 목록 응답 파싱/매핑/dedup(현재 기본 엔진)
 │       ├── network_browser_collector.py # 검색 조합 1건 단위 응답 관찰(현재 기본 엔진)
 │       ├── network_pipeline.py          # 검색 조합 큐 오케스트레이션(현재 기본 엔진)
@@ -170,6 +170,7 @@ naver-place-sales-db-crawler-v1/
 │   ├── test_pc_pipeline.py
 │   ├── test_pc_list_scraper.py
 │   ├── test_pc_browser_session.py
+│   ├── test_pc_browser_session_cdp.py    # NativeCdpBrowserSession(native_cdp) 검증
 │   └── test_pc_detail_scraper.py
 ├── input/
 ├── logs/
@@ -193,6 +194,25 @@ pip install -r requirements.txt
 # 3. Playwright 브라우저 설치
 playwright install chromium
 ```
+
+### Windows Native Browser + CDP
+
+2026-07-21부터 기본 브라우저 backend는 Playwright 번들 Chromium을 직접 띄우는 방식(`launch`)이 아니라, **Windows에 설치된 네이티브 Microsoft Edge 또는 Google Chrome을 백그라운드로 실행한 뒤 CDP(Chrome DevTools Protocol)로 연결하는 방식(`native_cdp`)**입니다.
+
+- **요구사항**: Windows에 Microsoft Edge 또는 Google Chrome 중 하나 이상이 설치되어 있어야 합니다(대부분의 Windows 10/11에는 Edge가 기본 설치되어 있음).
+- **탐색 순서**: 1) 사용자가 지정한 custom browser 경로 → 2) Microsoft Edge → 3) Google Chrome. 아래 경로를 순서대로 탐색합니다.
+  - Edge: `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` → `C:\Program Files\Microsoft\Edge\Application\msedge.exe` → `%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe`
+  - Chrome: `C:\Program Files\Google\Chrome\Application\chrome.exe` → `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe` → `%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe`
+  - 둘 다 찾지 못하면 Playwright 번들 Chromium으로 조용히 대체하지 않고, 탐색한 경로와 해결 방법이 포함된 명확한 오류를 표시합니다.
+- **전용 profile**: 사용자의 평소 Edge/Chrome 프로필이 아니라 `%LOCALAPPDATA%\NaverPlaceSalesDbCrawler\browser_profiles\{edge|chrome}` 전용 프로필을 사용합니다. 동일 프로필을 두 프로세스가 동시에 사용하려 하면 `profile_in_use` 오류로 명확히 차단됩니다(다른 backend로 조용히 전환하지 않음).
+- **디버깅 포트**: 고정 포트가 아니라 매 실행마다 `127.0.0.1`에서만 열리는 임시(동적) 포트를 사용합니다. 외부 네트워크 인터페이스에는 노출되지 않습니다.
+- **정상 종료**: 프로그램이 실행한 브라우저 프로세스(PID)만 종료합니다. `taskkill /IM`처럼 이미지 이름으로 모든 Edge/Chrome 창을 닫는 방식은 사용하지 않으므로, 사용자가 평소 쓰던 Edge/Chrome 창에는 영향이 없습니다.
+- **launch backend(개발·테스트용)**: 기존 Playwright 번들 Chromium 실행 방식은 삭제되지 않고 개발·테스트 전용 fallback으로 보존되어 있습니다. 필요 시 환경 변수 `PCCRAWLER_BROWSER_BACKEND=launch`로 명시적으로 전환할 수 있으며(배포 EXE에서는 이 환경 변수가 무시되고 항상 `native_cdp`가 사용됩니다), 프로덕션 배포 시에는 사용하지 않습니다.
+- **문제 해결**:
+  - `BrowserExecutableNotFoundError`: Edge 또는 Chrome을 설치하거나, 환경 변수 `PCCRAWLER_BROWSER_PATH`로 실행 파일 경로를 직접 지정하세요.
+  - `profile_in_use`: 이미 실행 중인 다른 수집 프로세스가 끝날 때까지 기다린 뒤 다시 시도하세요.
+  - `CdpStartupError`(CDP 준비 실패/timeout): 브라우저가 비정상 종료되었거나 포트가 막혀있을 수 있습니다. 잠시 후 다시 시도하세요.
+- Native Browser + CDP 방식은 현재 Windows 환경과 검증 검색(서울특별시 강동구 천호동 카페)에서 Edge 2회·Chrome 2회 실측과 단일 Live 검증 모두 CAPTCHA·HTTP 403/405/429 없이 수집에 성공했으며, 기존 Playwright launch 환경(동일 검색에서 page 2 HTTP 405로 반복 중단)과 다른 결과를 보였습니다. 이는 모든 환경·검색어에서 항상 차단을 우회한다는 의미가 아니며, CAPTCHA·403·405·429 감지와 안전 중단 정책은 이 backend 교체와 무관하게 그대로 유지됩니다(§4. 수집 개수와 중단·저장 정책).
 
 ### 실행
 

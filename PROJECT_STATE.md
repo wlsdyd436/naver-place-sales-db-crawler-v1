@@ -6917,3 +6917,173 @@ page300_2b4b/`)뿐이며 scratchpad는 `.gitignore` 대상이라 tracked 변경�
 `PROJECT_STATE.md` 뿐이다. `git status --short`/`git diff --name-status`
 확인 결과 이 append 외 tracked 변경 없음. git add/commit/push/reset/
 restore/checkout 전부 수행하지 않았다.
+
+# 2026-07-21 Native Edge/Chrome + CDP Attach를 production 기본 browser backend로 통합
+
+## 배경/근거
+2026-07-20 PAGE-300-2B-4B live에서 launch(Playwright 번들 Chromium) 방식은
+동일 검색어(서울특별시 강동구 천호동 카페) page 2 candidate 요청에서 HTTP
+405가 재현되어 20건에서 안전 중단됐다(CAPABILITY HOLD). 별도로 사용자가
+Gemini에게 지시해 수행한 CDP 검증(`cdp_validation_tests/comprehensive_
+cdp_tester.py`, Edge 2회·Chrome 2회, 동일 검색어)은 4회 모두 CAPTCHA/HTTP
+403·405·429 없이 300건(70/70/70/70/20) 수집에 성공했다. 이 결과에 근거해
+네이티브 Edge/Chrome + CDP Attach 방식을 production 기본 browser backend로
+채택했다. `CDP_VALIDATION_REPORT_FOR_GPT.md`/`GPT_HANDOVER_REPORT.md`가
+지정한 대상 파일(`page300_3o_edge_cdp/edge_cdp_extractor.py`, `src/
+crawler.py`)은 저장소 감사 결과 실제와 달랐다 - 전자는 저장소에 존재하지
+않고 실제 검증 스크립트는 `comprehensive_cdp_tester.py`였으며, 후자는
+모바일 레거시 엔진으로 production PC 엔진과 무관했다. 실제 단일 책임
+browser lifecycle 소유자는 `src/pc/browser_session.py::BrowserSession`
+이었고(network 엔진 `_default_session_factory`와 legacy premium 엔진
+`list_scraper.build_collector`/`detail_scraper.build_full_collector`
+모두 이를 공유), 이번 작업은 여기에만 새 backend를 추가했다. 검증된 CDP
+실험은 `#_pcmap_list_scroll_container` DOM 스크롤+시그니처 방식이었지만
+production network 엔진(`network_browser_collector.py`, 1668줄)은 이미
+독립된 network response 가로채기 기반 pagination/CAPTCHA/HTTP 403·405·
+429 감지 로직을 갖고 있어(browser가 launch든 CDP든 무관하게 동작), 이
+로직은 이번 작업에서 전혀 수정하지 않았다.
+
+## 변경 파일
+- `src/pc/config.py`: 기존 `DiagnosticConfig`는 무수정. `BrowserBackendConfig`
+  dataclass 신규 추가(backend/browser_preference/browser_path/profile_root/
+  cdp_startup_timeout_sec/cdp_port_bind_max_attempts, 기본값 backend=
+  "native_cdp"). `from_env()`는 `PCCRAWLER_BROWSER_BACKEND`/`_PREFERENCE`/
+  `_PATH`/`_PROFILE_ROOT`/`_CDP_STARTUP_TIMEOUT_SEC`/`_CDP_PORT_BIND_MAX_
+  ATTEMPTS`를 읽되 frozen(배포 EXE)에서는 항상 `default()`.
+- `src/pc/browser_session.py`: 기존 `BrowserSession`(launch)은 한 줄도
+  수정하지 않음. 같은 파일에 `NativeCdpBrowserSession`(동일한 context
+  manager/.context/.page 계약)과 헬퍼(`_resolve_browser`, `_acquire_
+  profile_lock`/`_release_profile_lock`, `_pick_free_port`, `_build_
+  native_browser_args`, `_wait_for_cdp_ready`, `_terminate_owned_process`,
+  `_is_pid_running`)와 예외 4종(`BrowserExecutableNotFoundError`/
+  `ProfileInUseError`/`CdpStartupError`/`CdpConnectionError`)을 신규 추가.
+- `src/pc/network_browser_collector.py`: `_default_session_factory()`만
+  최소 분기 수정 - `BrowserBackendConfig.from_env().backend`가 "launch"면
+  `BrowserSession`, 그 외(기본값 "native_cdp")면 `NativeCdpBrowserSession`을
+  반환. `DiagnosticConfig.safe_default()` 사용은 그대로 유지(독립 축).
+  network response 처리/pagination/안전 중단/부분 결과 로직은 무수정.
+- `tests/test_pc_browser_session_cdp.py`(신규): 브라우저 탐색 우선순위(custom
+  path/Edge Program Files·LOCALAPPDATA/Chrome Program Files·LOCALAPPDATA/
+  둘 다 없음+명시적 preference 무시 금지)·동적 포트·profile lock(충돌/stale
+  복구/해제/Edge·Chrome 분리)·CDP readiness(성공/조기 종료/timeout)·subprocess
+  cleanup(terminate→kill→taskkill /PID(`/IM` 아님) 승격, 이미 죽은 process
+  no-op, 다른 process 미종료)·전체 NativeCdpBrowserSession __enter__/__exit__
+  성공·readiness timeout cleanup·connect 실패 cleanup·정상/예외 종료·backend
+  선택(native_cdp 기본값/launch 명시 선택/frozen 무시/silent fallback 없음)
+  34개 검증.
+- `tests/test_pc_detail_scraper.py`, `tests/test_pc_list_scraper.py`: 기존
+  "금지 파일 무변경" 가드 목록에서 `src/pc/config.py`(두 파일)와 `src/pc/
+  browser_session.py`(detail_scraper만 포함하고 있었음)를 승인된 CDP 통합
+  사유로 제외(기존 exporter.py/ui.py/list_scraper.py/pipeline.py 예외와
+  동일한 패턴).
+- `tests/test_pc_network_browser_collector.py`: `_run_with_fake_browser_
+  session`이 `BrowserSession`뿐 아니라 `NativeCdpBrowserSession`도 함께
+  monkeypatch하도록 수정(그렇지 않으면 backend 기본값이 native_cdp로
+  바뀌면서 이 "fake 전용" 테스트가 실제 브라우저를 띄우는 회귀가 있었음 -
+  아래 회귀 절 참고). `FakeBrowserSessionLike.__init__`에 `backend_config`
+  선택 인자 추가(두 클래스 시그니처 겸용).
+- `README.md`: "Windows Native Browser + CDP" 절 신규(요구사항/탐색 순서/
+  전용 profile/동적 포트/정상 종료/launch backend 역할/문제 해결), 프로젝트
+  구조의 browser_session.py/config.py 설명과 tests 목록 갱신.
+
+## 구현 중 발견한 회귀와 수정
+최초 구현 직후 전체 회귀에서 baseline 대비 신규 실패 3건이 나왔다(모두
+발견 즉시 원인 분석 후 수정, 우회 없음):
+1. `test_pc_detail_scraper.py`/`test_pc_list_scraper.py`의 "금지 파일
+   무변경" 가드가 이번에 정당하게 수정한 `src/pc/config.py`/`browser_
+   session.py`를 여전히 금지 목록에 포함하고 있어 FAIL - 위 변경 파일
+   절의 가드 목록 갱신으로 해결(과거 exporter.py/ui.py 등과 동일한
+   선례 패턴).
+2. `test_pc_network_browser_collector.py`의 `_run_with_fake_browser_
+   session`이 `browser_session_module.BrowserSession`만 monkeypatch하고
+   `_default_session_factory()`를 호출하는 방식으로 "기본 factory 경로"를
+   검증했는데, 기본 backend가 native_cdp로 바뀌면서 이 fake 전용 테스트가
+   monkeypatch를 우회해 **실제 네이티브 Edge를 실행했다가 정상 종료하는**
+   일이 있었다(고아 프로세스는 남지 않았음 - 이후 확인). `NativeCdpBrowser
+   Session`도 함께 monkeypatch하도록 수정해 재발 방지.
+이 회귀들을 모두 수정한 뒤 재실행한 전체 회귀는 아래 "핵심 회귀" 결과와
+동일(baseline과 동일하게 test_excel_validation.py 1건만 FAIL, 나머지 전부
+PASS).
+
+## baseline(구현 전, `.venv\Scripts\python.exe tests/<file>.py` 개별 실행)
+총 26개 스크립트, PASS 25/FAIL 1/전체 37s. 유일한 FAIL은 `test_excel_
+validation.py`(output/naver_place_merged_db*.xlsx 파일이 없어서 발생 -
+이 저장소에는 그 이름 패턴의 파일이 없고 naver_place_premium_db_*/
+wire4*_live_*만 존재함. 코드가 아니라 수동 QA용 산출물 명명 의존 스크립트로,
+이번 작업과 무관한 기존 상태로 판단해 baseline으로 기록만 하고 구현을
+진행했다).
+
+## 구현 후 전체 회귀(위 회귀 수정 반영, 총 27개 스크립트)
+PASS 26/FAIL 1(동일하게 test_excel_validation.py만, 사유 동일)/전체 29s.
+신규 `test_pc_browser_session_cdp.py` 34/34 PASS. `test_pc_network_
+browser_collector.py` 58/58 PASS(수정 후 재확인, 실제 브라우저 미실행
+확인). `test_pc_detail_scraper.py`/`test_pc_list_scraper.py` 가드 갱신
+반영 후 PASS.
+
+## live 1회 결과(`scratchpad/native_cdp_live300/live_run.py`, marker로
+중복 실행 방지)
+검색어 "서울특별시 강동구 천호동 카페", backend=native_cdp(코드 기본값),
+browser preference=edge(환경변수로 명시), target=300. 실제 사용 브라우저
+`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`, PID
+23176, CDP port 62651(동적, 127.0.0.1 전용), profile `%LOCALAPPDATA%\
+NaverPlaceSalesDbCrawler\browser_profiles\edge`. page별 raw_item_count
+= [20, 70, 70, 70, 20](합계 250) - CDP DOM 스크롤 실험의 70/70/70/70/20과
+page 1만 다른데, production network 엔진은 DOM 스크롤이 아니라 network
+candidate 캡처 방식이라 page 1 초기 캡처 크기가 실험과 다를 수 있음(이
+로직은 이번 작업에서 무수정). candidate_http_error_count=0, candidate_
+http_status_counts={}(**page 2 HTTP 405 재현 없음** - 2026-07-20 HOLD의
+핵심 반례), status_429_seen=False, CAPTCHA(active_captcha_detected)=
+False. pagination_page_count=5, pagination_click_count=4, pagination_
+stop_reason="max_page_count_reached"(안전 중단이 아닌 정상 종료). run_
+collection_plan stop_reason="queue_exhausted", before_trim_count=250,
+final_count=250(target 300 미도달은 실제 가용 결과가 250건이었던 것으로
+판단되며, best-effort 정책대로 250건을 그대로 저장함 - README §4).
+
+## Excel 검증
+`export_places_to_excel` 1회 호출, `output/native_cdp_live300_20260721_
+162906.xlsx`. `통합_결과` 헤더가 정확히 업체명/업종/새로오픈여부/리뷰수/
+주소/대표전화/플레이스 URL/수집일/홈페이지/인스타/블로그 11개(순서 동일),
+데이터 250행. `원본_모바일`/`원본_PC`는 헤더만 있는 빈 시트(1행) - 기존
+정책과 일치. place_id 등 내부 필드 비노출 확인.
+
+## browser cleanup 검증
+live 종료 후 PowerShell로 확인: `Get-Process -Id 23176` 결과 없음(프로세스
+종료 확인), `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'"`
+중 이 profile/port를 가진 프로세스 없음(자식 프로세스 잔존 없음),
+`Test-NetConnection 127.0.0.1:62651` TcpTestSucceeded=False(CDP port
+폐쇄 확인). taskkill PID 안전망은 이번 live에서는 필요하지 않았다
+(terminate()만으로 정상 종료됨).
+
+## 판정
+**PASS**. page 2~5 정상 진행, 기존 HTTP 405 미재현, CAPTCHA/403/429 없음,
+Excel 11컬럼 스키마 유지, owned process만 안전하게 종료됨을 모두 확인했다.
+다만 target 300 중 250건만 수집됐다(HTTP 차단이 아닌 실제 가용 결과 수
+차이로 판단) - "항상 정확히 300건을 보장한다"는 의미로 해석하지 않는다.
+
+## 확정하지 않은 것(과장 금지)
+이 결과는 "현재 Windows 환경과 이번 검증 검색어에서 Native Browser + CDP가
+Playwright launch 환경과 다른 결과를 보였다"는 의미이며, 특정 fingerprint
+항목이 차단의 정확한 원인이라거나, 모든 환경·검색어에서 항상 성공한다거나,
+CAPTCHA를 영구적으로 100% 우회한다는 의미가 아니다. CAPTCHA·HTTP 403·405·
+429 감지와 안전 중단 로직은 이 backend 교체와 무관하게 계속 유지된다.
+
+## 남은 위험/다음 단계
+1) page 1이 실험(70) 대비 network 엔진에서 20으로 나온 원인(초기 candidate
+캡처 크기 차이로 추정)은 이번 범위 밖이며, production 로직 무수정 원칙에
+따라 조사·수정하지 않았다. 2) 이번 live는 Edge 1개 조합 1회만 검증했다 -
+Chrome preference나 다른 검색어/지역 조합에 대한 반복 재현성은 확인되지
+않았다(사용자 판단에 맡김, 반복 실행하지 않음). 3) profile lock의 stale
+판정(`tasklist` 기반)은 Windows 표준 도구에 의존하며, 향후 환경에서 `
+tasklist`가 제거되면 보수적으로 "사용 중"으로만 판정한다(동작에 문제 없음,
+성능/UX 영향만 있을 수 있음). 4) `CDP_VALIDATION_REPORT_FOR_GPT.md`는
+저장소 문서로 유지할 가치와 과장 표현 여부를 사용자가 판단해야 한다(이번
+작업에서 삭제하지 않음, 최종 보고에서 별도 확인 요청).
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean` 전부
+수행하지 않았다. `git status --short`로 확인한 변경 파일은 §변경 파일에
+기록한 production/tests/README.md뿐이며, `scratchpad/native_cdp_
+live300/`(live harness+marker+결과 JSON)는 `.gitignore`의 `scratchpad/`
+패턴에 이미 포함되어 tracked 변경에 나타나지 않는다. `output/native_cdp_
+live300_20260721_162906.xlsx`도 `.gitignore`의 `output/*.xlsx` 패턴에
+포함된다.

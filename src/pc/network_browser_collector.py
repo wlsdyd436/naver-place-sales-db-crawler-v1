@@ -1566,16 +1566,26 @@ def collect_network_query(
 
 
 def _default_session_factory():
-    """실제 제품 배선용 기본 factory - BrowserSession을 참고하되, 이 함수가
-    호출되어 반환된 객체의 __enter__가 실제로 호출될 때만 Playwright가
-    시작된다(이 함수를 정의/참조하는 것만으로는 아무것도 시작하지 않는다).
-    테스트는 항상 session_factory를 fake로 주입하므로 이 함수는 테스트에서
-    호출되지 않는다.
-    """
-    from src.pc.browser_session import BrowserSession
-    from src.pc.config import DiagnosticConfig
+    """실제 제품 배선용 기본 factory - 이 함수가 호출되어 반환된 객체의
+    __enter__가 실제로 호출될 때만 Playwright/브라우저가 시작된다(이 함수를
+    정의/참조하는 것만으로는 아무것도 시작하지 않는다). 테스트는 항상
+    session_factory를 fake로 주입하므로 이 함수는 테스트에서 호출되지 않는다.
 
-    return BrowserSession(DiagnosticConfig.safe_default())
+    2026-07-21: BrowserBackendConfig.from_env().backend에 따라
+    NativeCdpBrowserSession(기본값, production)과 BrowserSession(launch,
+    명시적 backend="launch" 선택 시만 사용하는 개발·테스트 fallback) 중
+    하나를 반환한다. DiagnosticConfig는 기존과 동일하게 safe_default()를
+    사용한다(브라우저 backend 선택과 진단 플래그는 독립된 설정 축).
+    """
+    from src.pc.browser_session import BrowserSession, NativeCdpBrowserSession
+    from src.pc.config import BrowserBackendConfig, DiagnosticConfig
+
+    diagnostic_config = DiagnosticConfig.safe_default()
+    backend_config = BrowserBackendConfig.from_env()
+
+    if backend_config.backend == "launch":
+        return BrowserSession(diagnostic_config)
+    return NativeCdpBrowserSession(diagnostic_config, backend_config)
 
 
 class NetworkBrowserCollector:
