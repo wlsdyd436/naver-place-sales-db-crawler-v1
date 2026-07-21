@@ -11,3 +11,5 @@ logs/diagnostics/
 .pytest_cache/
 .vscode/
 scratchpad/
+
+cdp_validation_tests/
