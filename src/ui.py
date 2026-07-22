@@ -1732,35 +1732,6 @@ class SalesDbCrawlerApp(ctk.CTk):
                 on_security_block=self._note_security_block,
             )
 
-            # PAGE300-DETAIL-2: 목록 수집이 끝난 최종 dedup rows(전체 query job에
-            # 걸쳐 place_id 기준으로 이미 dedup된 상태 - run_collection_plan이
-            # 보장)에 한해서만, 같은 브라우저 세션이 열려 있는 이 with 블록
-            # 안에서 정확히 1회 상세정보 enrichment를 수행한다(query job마다
-            # 반복하지 않음). 목록 수집 자체가 이미 사용자 중지로 끝났다면
-            # (stop_event가 이미 set) 새 상세 방문을 시작하지 않는다("사용자가
-            # 중지하면 새로운 상세 방문 즉시 중단"을 목록/상세 경계에도 동일
-            # 적용). collector_factory로 legacy `NetworkBrowserCollector`가
-            # 명시적으로 주입된 경우(엔진 롤백, 이 클래스에는 enrich_detail이
-            # 없음) 이 블록 전체를 건너뛴다 - hasattr로 확인해 기존 collect_
-            # network_query 기반 경로의 동작을 조금도 바꾸지 않는다.
-            rows = result.get("rows") or []
-            if rows and not self.stop_event.is_set() and hasattr(collector, "enrich_detail"):
-                self.log(f"[ui][network] 목록 수집 완료: {len(rows)}개")
-                self.set_status(f"목록 수집 완료: {len(rows)}개, 상세정보 수집 준비 중...")
-                self._reset_detail_progress(len(rows))
-                enriched_rows = collector.enrich_detail(
-                    rows,
-                    max_targets=len(rows),
-                    should_continue=lambda: not self.stop_event.is_set(),
-                    on_progress=self._on_detail_progress,
-                )
-                result = dict(result, rows=enriched_rows)
-                self.log(
-                    f"[ui][network] 상세정보 수집 완료: {self._detail_success_count}/{len(enriched_rows)} 성공 "
-                    f"(실패 {self._detail_failure_count})"
-                )
-                self.set_status(f"상세정보 수집 완료: {self._detail_success_count}/{len(enriched_rows)} 성공")
-
         self.log(
             f"[ui][network] stop_reason={result.get('stop_reason')}, "
             f"executed={result.get('executed_query_count')}, skipped={result.get('skipped_query_count')}, "
@@ -1770,31 +1741,10 @@ class SalesDbCrawlerApp(ctk.CTk):
             nav_message = (result.get("navigation_error_message") or "")[:120]
             self.log(f"[ui][network] navigation_error 상세(로그 전용): {nav_message}")
 
-        self.set_status("Excel 저장 중...")
         result = self._export_network_result(result, output_path, excel_exporter)
 
         self.set_status(self._network_stop_message(result, target_count))
         return result
-
-    def _reset_detail_progress(self, total: int) -> None:
-        """상세정보 수집 단계 진행률 초기화(요청서 §5 - 기존 진행 상태 표시
-        재사용). 목록 수집 단계와 동일한 progress_bar/progress_percent_var를
-        그대로 재사용하되(새 위젯 추가 없음), 상세 단계 진행률로 다시 채운다."""
-        self._detail_success_count = 0
-        self._detail_failure_count = 0
-        self.after(0, lambda: self.progress_bar.set(0))
-        self.after(0, self.progress_percent_var.set, f"0/{total}")
-
-    def _on_detail_progress(self, completed: int, total: int, success_count: int, failure_count: int) -> None:
-        """collector.enrich_detail의 on_progress 콜백(워커 스레드에서 호출됨) -
-        self.after(0, ...)로 메인 스레드에 marshal한다(_set_queue_progress와
-        동일 패턴). 성공/실패를 구분해 보여준다(요청서 §5 "성공 116 / 실패 4")."""
-        self._detail_success_count = success_count
-        self._detail_failure_count = failure_count
-        progress = completed / total if total else 0
-        self.after(0, lambda: self.progress_bar.set(progress))
-        self.after(0, self.progress_percent_var.set, f"{completed}/{total}")
-        self.set_status(f"상세정보 수집 중 {completed}/{total} (성공 {success_count} / 실패 {failure_count})")
 
     def open_output_folder(self):
         output_dir = Path("output")

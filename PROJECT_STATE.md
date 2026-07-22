@@ -7694,3 +7694,104 @@ DETAIL_PRODUCTION_WIRING_PASS / DETAIL_PROGRESS_PASS / DETAIL_CANCEL_PASS*
 않았다. 수정/추가 파일은 위 "실제 수정/추가 파일" 절에 기록한 것이 전부이며,
 `scratchpad/page300_detail_production_live/`는 `.gitignore`의 `scratchpad/`
 패턴에 포함되어 tracked 변경에 나타나지 않는다.
+
+---
+
+# 2026-07-22 [전략 변경 알림] 자동 상세 production 배선 제거 - 기본 경로를 DOM + 목록 데이터로 복구
+
+## 배경
+직전 라운드(PAGE300-DETAIL-2, `49ba7e80d5b0296148eabfefb79d1a2e217a1b98`
+"기능: 상세정보 300개 수집 프로덕션 배선")가 사용자에 의해 이미 커밋되어
+HEAD가 되어 있었다(작업 시작 시 working tree는 clean). 이번 작업 지시는
+그 배선을 설계 재검토 결과로 되돌리는 것이었으므로, `git reset`/`revert` 등
+금지된 git 조작 대신 `e38c2847b5e20f8ba34ac5f0b6482d4d01a53ed4`(직전 안정
+커밋) 대비 `49ba7e8`의 diff를 파일별로 감사해 필요한 hunk만 코드 편집으로
+되돌렸다(커밋/git 조작 없음 - 결과는 working tree의 미커밋 변경으로 남음).
+
+기존:
+목록 300건 수집 후 같은 실행 안에서 `collector.enrich_detail()`이 자동
+호출되어 업체별 상세 페이지를 순회한 뒤 Excel로 저장(§ "2026-07-21
+PAGE300-DETAIL-2" 절 참고).
+
+변경:
+기본 "수집 시작"(Network/List) 실행은 `DomMembershipCollector`의 DOM +
+React Fiber place_id 확보 + 목록 Network/Apollo enrichment만 사용하고,
+목록 결과를 곧바로 `_export_network_result`로 넘겨 Excel 저장한다. 업체별
+상세 페이지 방문은 기본 경로에서 0회 발생한다.
+
+변경 이유:
+- 실행시간: 목록(약 2~3분) + 상세 300건(외삽 약 4.5분)으로 실행시간이
+  2배 이상 늘어나는 트레이드오프가 사전 승인 없이 기본값이 되어 있었다.
+- navigation 횟수: 상세 페이지 300회 방문이 매 실행마다 자동으로 추가된다.
+- CAPTCHA/rate-limit 위험: 300건 연속 상세 방문의 차단 위험은 30건 표본
+  범위를 넘어서는 미실측 상태로 production 기본 동작이 되어 있었다.
+- 원래 제품 설계와의 일치: `e38c284` 시점에는 `enrich_detail`이 "코드에서
+  명시적으로 호출해야 하는 별도 capability"로 의도적으로 남겨져 있었다
+  (README §9 원문). 이번 변경은 그 설계 의도로 복귀한 것이다.
+
+예상 영향:
+전화·SNS(대표전화/홈페이지/인스타/블로그) 채움률은 목록 API 응답에 해당
+필드가 거의 없어 낮아질 수 있으나(§8 실측: 상세 없이는 주소/리뷰수/
+플레이스URL은 채워지고 전화·SNS는 낮게 유지), 실행시간과 네이버 측 차단
+위험은 감소한다.
+
+## 보존한 것 (변경하지 않음)
+- `src/pc/network_browser_collector.py`의 `_fetch_place_detail`/
+  `DomMembershipCollector.enrich_detail` 전체(`should_continue`/
+  `on_progress` 파라미터 포함) - PAGE300-DETAIL-2에서 추가된 사용자 중지·
+  진행률 콜백은 엔진 자체의 범용 capability로 유용하다고 판단해 그대로
+  두었다.
+- `tests/test_pc_detail_enrichment.py`의 `should_continue`/`on_progress`
+  신규 검증 4건 포함 전체 - 엔진 단독 동작 검증이므로 production 배선
+  여부와 무관하게 유효하다.
+- 이전 상세 10건·30건 Live 검증 기록(§"2026-07-21 PAGE300-DETAIL-1"/
+  "PAGE300-DETAIL-2" 절) - 삭제하지 않고 역사적 기록으로 그대로 둔다.
+
+## 제거한 것
+- `src/ui.py` `_run_network_pipeline`: 목록 수집 직후 `hasattr(collector,
+  "enrich_detail")` 가드로 감싸 `collector.enrich_detail(...)`을 자동
+  호출하던 블록 전체, `_reset_detail_progress`/`_on_detail_progress`
+  메서드, `"Excel 저장 중..."` 상태 문구 1줄 - 결과적으로 `e38c284` 시점의
+  `_run_network_pipeline` 본문과 동일한 흐름(orchestrator → result 확인 →
+  `_export_network_result` → status)으로 복귀했다.
+- `tests/test_ui_network_wiring.py`: PAGE300-DETAIL-2가 추가한 production
+  wiring 검증 6건(`check_enrich_detail_called_once_after_list_before_
+  export` 등)과 그 전용 fake 인프라(`FakeProgressBar`/`FakeStringVar`/
+  `app.after`/`app.progress_bar`/`app.progress_percent_var`/
+  `FakeNetworkCollector.enrich_detail`) - `git diff e38c284 --
+  tests/test_ui_network_wiring.py`로 파일이 `e38c284` 시점과 완전히
+  동일함을 확인했다.
+- README.md §9: "목록 수집 후 자동 실행"이라는 표제와 본문을 "선택적
+  capability - 기본 흐름에는 미연결"로 정정하고, 기본 흐름 설명(DOM +
+  Network/Apollo → 곧바로 Excel)을 앞에 명시했다. 10건/30건 실측 기록은
+  "선택형 상세 엔진 검증 기록"으로 표현을 바꿔 보존했다(수치 삭제 없음).
+
+## 상세 엔진의 향후 용도
+- 누락 row(전화·SNS 공란)만 선택적으로 골라 재보강
+- 별도 "상세 모드" UI 진입점(이번 라운드에서는 신설하지 않음)
+- 고객 요구가 있을 때만 명시적으로 `enrich_detail()`을 호출하는 수동 보강
+
+## 테스트 결과
+Fake/회귀 테스트만 실행(Live 미실행 - 목록 데이터 소스 실측은 별도 AI가
+담당하는 범위이므로 이번 라운드에서 배제). 상세 결과는 이 커밋 시점의
+회귀 실행 로그를 참고.
+
+## 남은 위험
+1. `NetworkBrowserCollector`(legacy) 경로는 애초에 `enrich_detail`이 없어
+   이번 변경과 무관하게 그대로 동작한다(회귀 없음, §8 참고).
+2. 상세 엔진(`enrich_detail`)이 코드상 남아있지만 기본 UI 어디에서도
+   호출되지 않으므로, 향후 이 capability를 실제로 쓰려면 별도 진입점
+   설계가 필요하다 - 이번 라운드 범위 밖.
+3. 목록 데이터(React props/Apollo/Network 필드)의 실제 채움률 재감사는
+   Gemini + Antigravity가 별도로 수행할 예정이며, 이번 라운드에서는
+   다루지 않았다.
+
+## 남은 작업
+- 목록 React props·Apollo·Network 필드 감사(Gemini + Antigravity, 이번
+  Claude 라운드 범위 밖)
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash`
+전부 수행하지 않았다. 위에 기록한 파일(`src/ui.py`,
+`tests/test_ui_network_wiring.py`, `README.md`, `PROJECT_STATE.md`)만
+편집했다.
