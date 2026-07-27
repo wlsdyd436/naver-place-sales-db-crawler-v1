@@ -42,13 +42,31 @@ class ValidationReporter:
         print("====================")
 
 
-def check_default_collector_factory_is_dom_membership_collector(reporter: ValidationReporter) -> None:
+def check_default_collector_factory_is_no_longer_dom_membership_collector(reporter: ValidationReporter) -> None:
+    """2026-07-24(신규 두 모드, 사용자 승인): 기본 collector_factory가
+    DomMembershipCollector에서 ApolloFirstListCollector로 다시 교체됐다 -
+    이 파일 자신이 과거(PAGE300-DOM-2) 같은 방식으로 NetworkBrowserCollector ->
+    DomMembershipCollector 전환을 반영했던 선례를 그대로 따른다. 새 기본값에
+    대한 상세 검증은 tests/test_ui_apollo_list_wiring.py가 담당하고, 이
+    파일은 DomMembershipCollector가 더 이상 기본값이 아니라는 사실과, 여전히
+    비활성 fallback capability로 보존되어 있는지만 확인한다."""
     signature = inspect.signature(ui.SalesDbCrawlerApp._run_network_pipeline)
     default = signature.parameters["collector_factory"].default
-    if default is DomMembershipCollector:
-        reporter.pass_("_run_network_pipeline 기본 collector_factory가 DomMembershipCollector(DOM-first 생산 경로)임을 확인")
+    if default is not DomMembershipCollector:
+        reporter.pass_("_run_network_pipeline 기본 collector_factory가 더 이상 DomMembershipCollector가 아님(신규 ApolloFirstListCollector로 교체됨)")
     else:
-        reporter.fail(f"_run_network_pipeline 기본 collector_factory가 예상과 다름: {default!r}")
+        reporter.fail(f"_run_network_pipeline 기본 collector_factory가 여전히 DomMembershipCollector임: {default!r}")
+
+
+def check_dom_membership_collector_still_importable_for_rollback(reporter: ValidationReporter) -> None:
+    """DomMembershipCollector(DOM 풀스크롤 + Apollo + Network 3중 병합)는
+    이번 신규 두 모드 도입으로 삭제/수정되지 않고 비활성 fallback capability로
+    그대로 보존되어야 한다 - 필요 시 collector_factory=DomMembershipCollector를
+    명시적으로 주입해 이전 경로로 되돌릴 수 있다."""
+    if DomMembershipCollector is not None and hasattr(DomMembershipCollector, "collect_query"):
+        reporter.pass_("DomMembershipCollector가 그대로 보존되어 있어 명시적 opt-out(비상 복구)이 가능함")
+    else:
+        reporter.fail("DomMembershipCollector가 손상되었거나 collect_query 계약이 없음")
 
 
 def check_default_collector_factory_is_not_legacy_network_collector(reporter: ValidationReporter) -> None:
@@ -74,7 +92,8 @@ def check_network_browser_collector_still_importable_for_rollback(reporter: Vali
 def main() -> int:
     reporter = ValidationReporter()
     checks = [
-        check_default_collector_factory_is_dom_membership_collector,
+        check_default_collector_factory_is_no_longer_dom_membership_collector,
+        check_dom_membership_collector_still_importable_for_rollback,
         check_default_collector_factory_is_not_legacy_network_collector,
         check_network_browser_collector_still_importable_for_rollback,
     ]

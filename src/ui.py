@@ -21,7 +21,8 @@ from src.parser import parse_places
 from src.pc_crawler import crawl_places_pc
 from src.pc.config import DiagnosticConfig
 from src.pc.detail_scraper import build_full_collector
-from src.pc.network_browser_collector import DomMembershipCollector
+from src.pc.home_enrichment import enrich_home_details
+from src.pc.network_browser_collector import ApolloFirstListCollector
 from src.pc.network_pipeline import run_collection_plan
 from src.pc.pipeline import collect_pc_full
 from src.pc.region_data import load_region_layers
@@ -248,6 +249,9 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 수집모드 선택 UI는 제거하지만, 내부적으로는 기존 PC 상세 수집 경로
         # (premium)를 그대로 기본값으로 사용한다(엔진 코드는 삭제하지 않음).
         self.mode_var = ctk.StringVar(value="premium")
+        # 신규 두 모드(기본/홈페이지·SNS 포함) - mode_var(legacy 경로 전용)와는
+        # 별개의 값이다. "basic"이 기본 선택값이다(§_build_collection_mode_section).
+        self.collection_mode_var = ctk.StringVar(value="basic")
         self.output_path_var = ctk.StringVar(value="output/naver_place_premium_db.xlsx")
         self.new_open_only_var = ctk.BooleanVar(value=False)
         self.review_min_var = ctk.StringVar()
@@ -336,6 +340,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         self._build_filter_section()
         self._build_target_count_section()
         self._build_global_target_count_section()
+        self._build_collection_mode_section()
         self._build_dashboard_section()
         self._build_control_section()
         self._build_log_section()
@@ -566,6 +571,35 @@ class SalesDbCrawlerApp(ctk.CTk):
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+
+    def _build_collection_mode_section(self):
+        # 두 모드(기본/홈페이지·SNS 포함) 선택 - "프리미엄"/"유료"/"제한 모드"
+        # 같은 분류 문구는 쓰지 않는다(요청서 §0 금지 사항). 기본 선택값은
+        # collection_mode_var(§__init__)와 동일하게 "basic"이다.
+        ctk.CTkLabel(self.left_panel, text="7. 수집 모드", font=ctk.CTkFont(size=14, weight="bold")).grid(row=12, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        mode_frame = ctk.CTkFrame(self.left_panel)
+        mode_frame.grid(row=13, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
+        mode_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkRadioButton(
+            mode_frame, text="빠른 기본 수집", variable=self.collection_mode_var, value="basic",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(
+            mode_frame, text="업체·리뷰·주소·전화 등 목록 핵심정보를 빠르게 수집합니다.",
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=0, sticky="w", padx=28, pady=(0, 8))
+
+        ctk.CTkRadioButton(
+            mode_frame, text="홈페이지·SNS 포함 수집", variable=self.collection_mode_var, value="home_sns",
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(
+            mode_frame,
+            text=(
+                "기본정보에 홈페이지·인스타그램·블로그를 추가합니다.\n"
+                "업체 수에 따라 시간이 더 걸립니다."
+            ),
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
+        ).grid(row=3, column=0, sticky="w", padx=28, pady=(0, 10))
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
@@ -1363,19 +1397,29 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.eta_var.set("예상 남은 시간: 계산 중...")
         self.last_output_path = saved_output_path
 
+        collection_mode = self.collection_mode_var.get()
+
         self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
         self.log(f"[ui] 선택 구={', '.join(self.get_selected_districts())}")
         self.log(f"[ui] 키워드={keyword}")
         self.log(f"[ui] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
         self.log(f"[ui] 저장 경로={saved_output_path}")
+        self.log(f"[ui] 수집 모드={collection_mode}")
 
         threading.Thread(
             target=self._run_network_pipeline_worker,
-            args=(query_queue, per_query_limit, target_count, saved_output_path),
+            args=(query_queue, per_query_limit, target_count, saved_output_path, collection_mode),
             daemon=True,
         ).start()
 
-    def _run_network_pipeline_worker(self, query_queue: list[dict], per_query_limit: int, target_count: int, output_path: str):
+    def _run_network_pipeline_worker(
+        self,
+        query_queue: list[dict],
+        per_query_limit: int,
+        target_count: int,
+        output_path: str,
+        collection_mode: str = "basic",
+    ):
         """ARCH-300C WIRE-2C-2: `_run_network_pipeline` 호출을 감싸는 최종
         방어선 + UI 상태 복구 지점.
 
@@ -1389,7 +1433,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         원칙이다.
         """
         try:
-            self._run_network_pipeline(query_queue, per_query_limit, target_count, output_path)
+            self._run_network_pipeline(query_queue, per_query_limit, target_count, output_path, collection_mode=collection_mode)
         except Exception as exc:
             self.log(f"[ui][network] 예상하지 못한 오류: {exc}")
             self.set_status("수집 중 오류가 발생했습니다.")
@@ -1417,6 +1461,19 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 인스턴스 상태에 기록만 하고, 실제 Queue 중단/저장/안내는 _run_queue_pipeline이 담당한다.
         self._security_block_decision = decision
         self.log("[ui] 보안 확인(CAPTCHA) 감지: 안전 중단합니다.")
+
+    def _note_ssr_progress(self, completed: int, total: int, success_count: int, failure_count: int) -> None:
+        """PAGE300-SSR-1: enrich_detail_ssr의 on_progress 콜백. 목록 수집 단계
+        진행률(self.progress_percent_var)과는 별개의 상태 텍스트만 갱신한다
+        (요청서 §11 "상세 단계에서 목록 단계 진행률과 섞지 마세요") - 정확하지
+        않은 예상 남은 시간은 계산하지 않는다."""
+        self.set_status(f"상세정보 보강 중 {completed}/{total} (SSR/UI fallback 성공 {success_count}, 실패 {failure_count})")
+
+    def _note_home_progress(self, completed: int, total: int, success_count: int, failure_count: int) -> None:
+        """홈페이지·SNS 포함 모드의 home_enrichment_fn on_progress 콜백. 목록
+        수집 단계 진행률과는 별개의 상태 텍스트만 갱신한다(_note_ssr_progress와
+        동일한 원칙)."""
+        self.set_status(f"홈페이지/SNS 정보 수집 중: {completed} / {total} (성공 {success_count}, 실패 {failure_count})")
 
     def _collect_premium_query(self, query: str, limit: int, new_open_only=False) -> tuple[list[dict], list[dict], list[dict]]:
         # 2026-07-06 Stage 3D: premium 분기를 새 PC full engine(collect_pc_full)에 연결.
@@ -1608,6 +1665,43 @@ class SalesDbCrawlerApp(ctk.CTk):
         query_queue = [{"region": keyword, "keyword": "", "query": keyword}]
         self._run_queue_pipeline(query_queue, limit, output_path, mode)
 
+    def _ssr_stage_suffix(self, result: dict) -> str:
+        """PAGE300-SSR-1: SSR 상세정보 보강 단계 결과를 완료 문구에 덧붙인다.
+        상세 보강이 아예 실행되지 않았으면(목록 자체가 차단됐거나 rows가
+        0건) 빈 문자열을 반환해 기존 문구를 그대로 유지한다."""
+        attempted_anything = (
+            result.get("ssr_success_count", 0) or result.get("ui_fallback_used_count", 0)
+            or result.get("ssr_failure_count", 0) or result.get("ssr_not_attempted_count", 0)
+        )
+        if not attempted_anything:
+            return ""
+        ssr_stop_reason = result.get("ssr_stop_reason")
+        completion = " 상세정보 보강 완료." if ssr_stop_reason in (None, "") else " 상세정보 보강 부분 완료(중단)."
+        return (
+            f"{completion} SSR 성공 {result.get('ssr_success_count', 0)}건, "
+            f"UI fallback {result.get('ui_fallback_used_count', 0)}건, "
+            f"실패 {result.get('ssr_failure_count', 0)}건, "
+            f"미시도 {result.get('ssr_not_attempted_count', 0)}건."
+        )
+
+    def _home_stage_suffix(self, result: dict) -> str:
+        """홈페이지·SNS 포함 모드의 home 보강 단계 결과를 완료 문구에 덧붙인다
+        (_ssr_stage_suffix와 동일한 원칙). 실행되지 않았으면(기본 모드이거나
+        목록 자체가 차단/0건) 빈 문자열을 반환한다."""
+        attempted_anything = (
+            result.get("home_success_count", 0) or result.get("home_failure_count", 0)
+            or result.get("home_not_attempted_count", 0)
+        )
+        if not attempted_anything:
+            return ""
+        home_stop_reason = result.get("home_stop_reason")
+        completion = " 홈페이지/SNS 보강 완료." if home_stop_reason in (None, "") else " 홈페이지/SNS 보강 부분 완료(중단)."
+        return (
+            f"{completion} 성공 {result.get('home_success_count', 0)}건, "
+            f"실패 {result.get('home_failure_count', 0)}건, "
+            f"미시도 {result.get('home_not_attempted_count', 0)}건."
+        )
+
     def _network_stop_message(self, result: dict, target_count: int) -> str:
         """저장 결과까지 반영한 최종 상태 문구를 만든다(ARCH-300C WIRE-2C-1).
 
@@ -1616,6 +1710,8 @@ class SalesDbCrawlerApp(ctk.CTk):
         실제 저장이 성공(exported=True)했을 때만 쓴다 - export 실패 시 기존
         완료 문구만 보여 성공으로 오인시키지 않기 위해 가장 먼저 검사한다.
         navigation_error_message 전체는 여기서도 노출하지 않는다(로그 전용).
+        완료/부분 완료 문구에는 PAGE300-SSR-1 상세정보 보강 결과 요약(SSR
+        성공/UI fallback/실패/미시도 건수, 요청서 §11)을 덧붙인다.
         """
         if result.get("export_error"):
             return "수집 결과를 Excel로 저장하지 못했습니다."
@@ -1624,21 +1720,22 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         final_count = result.get("final_count", 0)
         stop_reason = result.get("stop_reason")
+        ssr_suffix = self._ssr_stage_suffix(result) + self._home_stage_suffix(result)
         if stop_reason == "target_reached":
-            return f"전체 목표 개수에 도달했습니다. {final_count}개를 저장했습니다."
+            return f"전체 목표 개수에 도달했습니다. {final_count}개를 저장했습니다.{ssr_suffix}"
         if stop_reason == "queue_exhausted":
             if target_count and final_count < target_count:
-                return f"선택한 지역 수집이 완료되었습니다. 목표에는 미달했으며 {final_count}개를 저장했습니다."
-            return f"선택한 지역 수집이 완료되었습니다. {final_count}개를 저장했습니다."
+                return f"선택한 지역 수집이 완료되었습니다. 목표에는 미달했으며 {final_count}개를 저장했습니다.{ssr_suffix}"
+            return f"선택한 지역 수집이 완료되었습니다. {final_count}개를 저장했습니다.{ssr_suffix}"
         if stop_reason == "security_blocked":
-            return f"보안 확인이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+            return f"보안 확인이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다.{ssr_suffix}"
         if stop_reason == "status_429":
-            return f"요청 제한이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+            return f"요청 제한이 감지되어 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다.{ssr_suffix}"
         if stop_reason == "navigation_error":
-            return f"브라우저 페이지 오류로 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
+            return f"브라우저 페이지 오류로 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다.{ssr_suffix}"
         if stop_reason == "user_stopped":
-            return f"사용자가 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다."
-        return f"수집이 종료되었습니다. {final_count}개를 저장했습니다. (stop_reason={stop_reason})"
+            return f"사용자가 수집을 중단했습니다. 현재까지 {final_count}개를 저장했습니다.{ssr_suffix}"
+        return f"수집이 종료되었습니다. {final_count}개를 저장했습니다. (stop_reason={stop_reason}){ssr_suffix}"
 
     def _export_network_result(self, result: dict, output_path: str, excel_exporter) -> dict:
         """orchestrator 결과의 rows를 Excel로 저장하는 단일 지점(ARCH-300C WIRE-2C-1).
@@ -1684,37 +1781,56 @@ class SalesDbCrawlerApp(ctk.CTk):
         target_count: int,
         output_path: str,
         *,
-        collector_factory=DomMembershipCollector,
+        collection_mode: str = "basic",
+        collector_factory=ApolloFirstListCollector,
         orchestrator=run_collection_plan,
         excel_exporter=export_places_to_excel,
+        home_enrichment_fn=enrich_home_details,
     ) -> dict:
         """ARCH-300C WIRE-2C-1: Network/List 제품 흐름 worker + Excel 저장 연결.
 
-        2026-07-21(PAGE300-DOM-2): 기본 collector_factory를 `NetworkBrowserCollector`
-        (collect_network_query, Network 응답 관찰 기반)에서 `DomMembershipCollector`
-        (collect_dom_membership_query, DOM-first membership + React Fiber
-        place_id + Network/Apollo enrichment 기반)로 교체했다(사용자 확인 후
-        production 기본 경로 변경). `NetworkBrowserCollector`/`collect_network_
-        query`는 이 변경으로 전혀 수정되지 않았고 legacy/회귀 테스트/비상 복구
-        경로로 그대로 남아있다 - 필요 시 `collector_factory=NetworkBrowserCollector`를
-        명시적으로 주입해 이전 경로로 되돌릴 수 있다.
+        2026-07-24(신규 두 모드 - 사용자 승인): 기본 `collector_factory`를
+        `DomMembershipCollector`(DOM 풀스크롤 + Apollo + Network 3중 병합)에서
+        `ApolloFirstListCollector`(1페이지 메인 placeList(...) Apollo 파싱 +
+        2페이지 이후 자연 발생 GraphQL, DOM 스크롤 없음)로 교체했다.
+        `DomMembershipCollector`/`collect_dom_membership_query`와
+        `NetworkBrowserCollector`/`collect_network_query`는 이 변경으로 전혀
+        수정되지 않았고 비활성 fallback capability로 그대로 남아있다 - 필요
+        시 `collector_factory=DomMembershipCollector`를 명시적으로 주입해
+        이전 경로로 되돌릴 수 있다. 새 두 모드(`collection_mode`)는 이
+        `ApolloFirstListCollector` 기반 목록 수집을 공통으로 사용하고,
+        `collection_mode="home_sns"`일 때만 목록 수집 이후 별도 단계
+        (`home_enrichment_fn`)로 place_id당 home HTML 보강을 추가한다.
 
-        collector_factory/orchestrator/excel_exporter는 의존성 주입 지점이다 -
-        기본값은 실제 DomMembershipCollector/run_collection_plan/
-        export_places_to_excel을 가리키지만, 기본값 참조만으로는 Playwright
-        시작도 파일 저장도 발생하지 않는다(실제로 호출될 때만 부작용이
-        생긴다). 이번 단계 테스트는 항상 fake를 주입해 실제 브라우저/파일
-        저장을 실행하지 않는다.
+        collector_factory/orchestrator/excel_exporter/home_enrichment_fn은
+        의존성 주입 지점이다 - 기본값 참조만으로는 Playwright 시작도 파일
+        저장도 발생하지 않는다(실제로 호출될 때만 부작용이 생긴다). 이번
+        단계 테스트는 항상 fake를 주입해 실제 브라우저/파일 저장을 실행하지
+        않는다.
 
         저장은 collector(브라우저/session/context)가 완전히 종료된 뒤
-        `_export_network_result`에서만 수행한다 - 브라우저 자원 정리와 파일
-        저장은 실패 원인이 서로 다르므로 같은 try 블록에 섞지 않는다. 이
-        worker의 책임은 collected_at 생성 → collector 생성 → run_collection_plan
-        호출 → collector 종료 → rows 확인 후 Excel 저장(0건이면 건너뜀) →
-        결과를 로그/상태에 반영 → result 반환까지다. legacy 경로
-        (_run_queue_pipeline, basic/premium)는 이 메서드와 무관하게 그대로
-        동작한다. target_count UI 활성화·start_crawl 실제 연결은 WIRE-2C-2에서
-        진행한다(이번 단계는 이 worker 자체만 다룬다).
+        `_export_network_result`에서만 수행한다. 이 worker의 책임은
+        collected_at 생성 → collector 생성 → run_collection_plan 호출 →
+        전역 dedup된 최종 rows에 SSR 상세정보 보강(collector.enrich_detail_ssr,
+        collector가 이 메서드를 가진 legacy collector로 명시 주입된 경우만
+        - `ApolloFirstListCollector`는 정의하지 않으므로 기본 흐름에서는
+        스킵됨) → collector 종료(Native Edge CDP owned process 종료 + profile
+        lock 해제) → `collection_mode="home_sns"`면 home_enrichment_fn으로
+        홈페이지/SNS 보강 → rows 확인 후 Excel 저장(0건이면 건너뜀) → 결과를
+        로그/상태에 반영 → result 반환까지다.
+
+        홈페이지/SNS 보강은 목록 수집 browser context가 완전히 닫힌(sync
+        Playwright + owned process가 전부 정리된) *이후에* 별도 asyncio
+        event loop(`home_enrichment_fn` 내부에서 `asyncio.run()`)로 실행한다
+        - 쿠키를 복사해 넘기지 않는다. `home_enrichment_fn`이 같은 persistent
+        profile을 가리키는 새 Native Edge/Chrome 프로세스에 순차적으로(동시
+        실행 아님 - profile lock으로 보장됨) 다시 연결해 그 실제
+        BrowserContext.request를 사용한다(5Z 벤치마크와 동일한 메커니즘,
+        PAGE300-6A-FIX1).
+
+        legacy 경로(_run_queue_pipeline, basic/premium)는 이 메서드와
+        무관하게 그대로 동작하며, 기존 DOM 방문 기반 `_fetch_place_detail`/
+        `enrich_detail`도 삭제하지 않았다.
         """
         collected_at = datetime.now().strftime("%Y-%m-%d")
         total = len(query_queue)
@@ -1730,6 +1846,76 @@ class SalesDbCrawlerApp(ctk.CTk):
                 collect_query=collector.collect_query,
                 should_continue=lambda: not self.stop_event.is_set(),
                 on_security_block=self._note_security_block,
+            )
+
+            rows = result.get("rows") or []
+            if rows and not result.get("security_blocked") and hasattr(collector, "enrich_detail_ssr"):
+                # collector_factory가 명시적으로 NetworkBrowserCollector(legacy
+                # emergency-recovery 경로, enrich_detail_ssr 없음)로 주입된 경우도
+                # 그대로 동작해야 하므로 hasattr로 방어한다 - production 기본
+                # collector_factory(DomMembershipCollector)는 항상 이 메서드를
+                # 가지므로 기본 흐름에서는 이 분기가 항상 실행된다(숨은 토글이
+                # 아니라 레거시 collector 하위호환 가드).
+                self.set_status(f"상세정보 보강 준비 중... (총 {len(rows)}건)")
+                self.log(f"[ui][network][ssr] 상세정보 보강 시작: 대상 {len(rows)}건")
+                ssr_result = collector.enrich_detail_ssr(
+                    rows,
+                    max_targets=len(rows),
+                    should_continue=lambda: not self.stop_event.is_set(),
+                    on_progress=self._note_ssr_progress,
+                )
+                result["rows"] = ssr_result["rows"]
+                result["ssr_stop_reason"] = ssr_result["stop_reason"]
+                result["ssr_security_blocked"] = ssr_result["security_blocked"]
+                result["ssr_success_count"] = ssr_result["ssr_success_count"]
+                result["ui_fallback_used_count"] = ssr_result["ui_fallback_used_count"]
+                result["ssr_failure_count"] = ssr_result["failure_count"]
+                result["ssr_not_attempted_count"] = ssr_result["not_attempted_count"]
+                self.log(
+                    f"[ui][network][ssr] 상세정보 보강 종료: stop_reason={ssr_result['stop_reason']}, "
+                    f"ssr_success={ssr_result['ssr_success_count']}, "
+                    f"ui_fallback_used={ssr_result['ui_fallback_used_count']}, "
+                    f"실패={ssr_result['failure_count']}, 미시도={ssr_result['not_attempted_count']}"
+                )
+            else:
+                result["ssr_stop_reason"] = None
+                result["ssr_security_blocked"] = False
+                result["ssr_success_count"] = 0
+                result["ui_fallback_used_count"] = 0
+                result["ssr_failure_count"] = 0
+                result["ssr_not_attempted_count"] = 0
+
+        # with 블록 종료: collector의 browser/context/Playwright(sync, Native
+        # Edge CDP owned process 포함)가 완전히 정리된 상태다(process 종료 +
+        # profile lock 해제). 홈페이지·SNS 보강은 여기서부터 별도 asyncio
+        # event loop(home_enrichment_fn 내부)로 실행한다 - 쿠키를 복사해
+        # 넘기지 않는다. home_enrichment_fn이 같은 persistent profile을
+        # 가리키는 새 Native Edge/Chrome에 다시 연결해 실제 BrowserContext의
+        # 세션을 그대로 사용한다(PAGE300-6A-FIX1).
+        result["home_stop_reason"] = None
+        result["home_security_blocked"] = False
+        result["home_success_count"] = 0
+        result["home_failure_count"] = 0
+        result["home_not_attempted_count"] = 0
+        rows = result.get("rows") or []
+        if collection_mode == "home_sns" and rows and not result.get("security_blocked"):
+            self.set_status(f"홈페이지/SNS 보강 준비 중... (총 {len(rows)}건)")
+            self.log(f"[ui][network][home] 홈페이지/SNS 보강 시작: 대상 {len(rows)}건")
+            home_result = home_enrichment_fn(
+                rows,
+                should_continue=lambda: not self.stop_event.is_set(),
+                on_progress=self._note_home_progress,
+            )
+            result["rows"] = home_result["rows"]
+            result["home_stop_reason"] = home_result["stop_reason"]
+            result["home_security_blocked"] = home_result["security_blocked"]
+            result["home_success_count"] = home_result["home_success_count"]
+            result["home_failure_count"] = home_result["failure_count"]
+            result["home_not_attempted_count"] = home_result["not_attempted_count"]
+            self.log(
+                f"[ui][network][home] 홈페이지/SNS 보강 종료: stop_reason={home_result['stop_reason']}, "
+                f"성공={home_result['home_success_count']}, 실패={home_result['failure_count']}, "
+                f"미시도={home_result['not_attempted_count']}"
             )
 
         self.log(

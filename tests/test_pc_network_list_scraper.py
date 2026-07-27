@@ -19,6 +19,7 @@ from src.pc.network_list_scraper import (
     count_rows_by_field,
     count_rows_by_source_page,
     dedup_rows,
+    format_common_address,
     is_candidate_response,
     should_stop_for_target,
 )
@@ -61,7 +62,7 @@ ALLSEARCH_FIXTURE = {
                     "category": "카페",
                     "roadAddress": "서울 강동구 성내로 1",
                     "tel": "02-1111-2222",
-                    "visitorReviewCount": 10,
+                    "visitorReviewsTotal": 10,
                 },
                 {
                     "id": "222222",
@@ -69,7 +70,7 @@ ALLSEARCH_FIXTURE = {
                     "categoryName": "커피전문점",
                     "address": "서울 강동구 성내로 2(지번)",
                     "virtualTel": "0507-1234-5678",
-                    "reviewCount": 5,
+                    "cafeBlogReviewsTotal": 5,
                     "homePage": "https://cafeb.example.com",
                 },
             ],
@@ -189,16 +190,18 @@ def check_map_item_to_row_11_columns(reporter: ValidationReporter) -> None:
     row = _map_item_to_row(item, "2026-07-08")
 
     expected_columns = {
-        "업체명", "업종", "새로오픈여부", "리뷰수", "주소", "대표전화",
-        "플레이스 URL", "수집일", "홈페이지", "인스타", "블로그",
+        "업체명", "업종", "새로오픈여부", "방문자리뷰수", "블로그리뷰수", "총리뷰수",
+        "주소", "대표전화", "플레이스 URL", "수집일", "홈페이지", "인스타", "블로그",
     }
     ok = (
         expected_columns.issubset(row.keys())
         and row["업체명"] == "카페 A"
         and row["업종"] == "카페"
         and row["대표전화"] == "02-1111-2222"
-        and row["주소"] == "서울 강동구 성내로 1"
-        and row["리뷰수"] == "10"
+        and row["주소"] == "서울특별시 강동구 성내로 1"
+        and row["방문자리뷰수"] == 10
+        and row["블로그리뷰수"] == ""
+        and row["총리뷰수"] == ""
         and row["수집일"] == "2026-07-08"
         and row["플레이스 URL"] == "https://pcmap.place.naver.com/place/111111/home"
         and row["새로오픈여부"] == ""
@@ -207,9 +210,9 @@ def check_map_item_to_row_11_columns(reporter: ValidationReporter) -> None:
         and row.get("place_id") == "111111"
     )
     if ok:
-        reporter.pass_("item -> 11컬럼 row 매핑 성공(place_id는 내부 필드로 별도 포함)")
+        reporter.pass_("item -> 13컬럼 row 매핑 성공(place_id는 내부 필드로 별도 포함)")
     else:
-        reporter.fail(f"11컬럼 매핑 결과가 예상과 다름: {row}")
+        reporter.fail(f"13컬럼 매핑 결과가 예상과 다름: {row}")
 
 
 def check_map_item_to_row_second_field_variant(reporter: ValidationReporter) -> None:
@@ -219,13 +222,15 @@ def check_map_item_to_row_second_field_variant(reporter: ValidationReporter) -> 
     ok = (
         row["업체명"] == "카페 B"
         and row["업종"] == "커피전문점"
-        and row["주소"] == "서울 강동구 성내로 2(지번)"
+        and row["주소"] == "서울특별시 강동구 성내로 2(지번)"
         and row["대표전화"] == "0507-1234-5678"
         and row["홈페이지"] == "https://cafeb.example.com"
-        and row["리뷰수"] == "5"
+        and row["블로그리뷰수"] == 5
+        and row["방문자리뷰수"] == ""
+        and row["총리뷰수"] == ""
     )
     if ok:
-        reporter.pass_("2순위 키 후보(categoryName/address/virtualTel/reviewCount)도 정상 매핑")
+        reporter.pass_("2순위 키 후보(categoryName/address/virtualTel/cafeBlogReviewsTotal)도 정상 매핑")
     else:
         reporter.fail(f"2순위 키 후보 매핑 결과가 예상과 다름: {row}")
 
@@ -239,7 +244,9 @@ def check_map_item_to_row_missing_keys(reporter: ValidationReporter) -> None:
         and row["업종"] == ""
         and row["주소"] == ""
         and row["대표전화"] == ""
-        and row["리뷰수"] == ""
+        and row["방문자리뷰수"] == ""
+        and row["블로그리뷰수"] == ""
+        and row["총리뷰수"] == ""
         and row["홈페이지"] == ""
         and row["플레이스 URL"] == "https://pcmap.place.naver.com/place/999999/home"
         and row.get("place_id") == "999999"
@@ -254,6 +261,173 @@ def check_map_item_to_row_missing_keys(reporter: ValidationReporter) -> None:
         reporter.pass_("완전히 빈 item({})도 예외 없이 전부 빈칸 row 반환")
     else:
         reporter.fail(f"빈 item 처리 결과가 예상과 다름: {empty_row}")
+
+
+def check_visitor_blog_review_mapping_from_list_entity_keys(reporter: ValidationReporter) -> None:
+    """2026-07-25 field parity 보정(A): 목록(PlaceListBusinessesItem) entity의
+    실제 필드명 visitorReviewCount/blogCafeReviewCount(실측:
+    scratchpad/page300_5m_r1_graphql_field_provenance_audit)가 정확히
+    매핑되고 총리뷰수가 둘의 합으로 계산되는지 확인한다."""
+    item = {"id": "1", "name": "테스트 카페", "visitorReviewCount": 241, "blogCafeReviewCount": 136}
+    row = _map_item_to_row(item, "2026-07-25")
+    if row["방문자리뷰수"] == 241 and row["블로그리뷰수"] == 136 and row["총리뷰수"] == 377:
+        reporter.pass_("A. visitorReviewCount=241/blogCafeReviewCount=136 -> 방문자241/블로그136/총377 매핑 성공")
+    else:
+        reporter.fail(f"A. 목록 entity 리뷰 매핑 실패: {row}")
+
+
+def check_review_both_missing_stays_blank(reporter: ValidationReporter) -> None:
+    """B: 방문자/블로그 리뷰 원본이 모두 없으면 세 컬럼 전부 공란(0 강제 변환 금지)."""
+    item = {"id": "2", "name": "리뷰 정보 없는 카페"}
+    row = _map_item_to_row(item, "2026-07-25")
+    if row["방문자리뷰수"] == "" and row["블로그리뷰수"] == "" and row["총리뷰수"] == "":
+        reporter.pass_("B. 리뷰 원본 모두 누락 시 방문자/블로그/총리뷰수 전부 공란 유지 성공")
+    else:
+        reporter.fail(f"B. 리뷰 전체 누락 처리 실패: {row}")
+
+
+def check_review_one_side_only_preserves_value_and_blank_total(reporter: ValidationReporter) -> None:
+    """C: 한쪽 리뷰만 존재하면 그 값은 보존하고, 총리뷰수는 둘 다 확인돼야만
+    합산한다는 정책에 따라 공란으로 유지된다(부분 합계를 총리뷰로 표시하지 않음)."""
+    visitor_only = _map_item_to_row({"id": "3", "name": "방문자만", "visitorReviewCount": 88}, "2026-07-25")
+    blog_only = _map_item_to_row({"id": "4", "name": "블로그만", "blogCafeReviewCount": 12}, "2026-07-25")
+    ok = (
+        visitor_only["방문자리뷰수"] == 88 and visitor_only["블로그리뷰수"] == "" and visitor_only["총리뷰수"] == ""
+        and blog_only["블로그리뷰수"] == 12 and blog_only["방문자리뷰수"] == "" and blog_only["총리뷰수"] == ""
+    )
+    if ok:
+        reporter.pass_("C. 한쪽 리뷰만 존재 시 그 값 보존 + 총리뷰수는 합산 정책에 따라 공란 유지 성공")
+    else:
+        reporter.fail(f"C. 한쪽 리뷰만 존재 처리 실패: visitor_only={visitor_only}, blog_only={blog_only}")
+
+
+def check_total_review_count_field_not_reused_as_total(reporter: ValidationReporter) -> None:
+    """D: totalReviewCount가 blogCafeReviewCount와 우연히 같은 값이어도
+    무시하고, 총리뷰수는 항상 visitor+blog 산술 계산 결과여야 한다(totalReviewCount
+    는 blogCafeReviewCount와 동일한 값으로 관찰된 오염된 필드 - 요청서 §3)."""
+    item = {
+        "id": "5", "name": "totalReviewCount 오염 카페",
+        "visitorReviewCount": 200, "blogCafeReviewCount": 50,
+        "totalReviewCount": 50,  # blogCafeReviewCount와 같은 값(실측 오염 패턴) - 무시돼야 함
+    }
+    row = _map_item_to_row(item, "2026-07-25")
+    if row["총리뷰수"] == 250 and row["방문자리뷰수"] == 200 and row["블로그리뷰수"] == 50:
+        reporter.pass_("D. totalReviewCount 값과 무관하게 총리뷰수 = 방문자+블로그(250)로 계산됨")
+    else:
+        reporter.fail(f"D. totalReviewCount 오용 방지 실패: {row}")
+
+
+def check_format_common_address_basic_combination(reporter: ValidationReporter) -> None:
+    """F: commonAddress(시·도/시·군·구/읍·면·동) + roadAddress(도로명+상세)
+    기본 결합 - 요청서 §9 F 예시 그대로."""
+    result = format_common_address("서울 강동구 천호동", "구천면로 140 2층 201호")
+    if result == "서울특별시 강동구 천호동 구천면로 140 2층 201호":
+        reporter.pass_("F. commonAddress+roadAddress 기본 결합 성공")
+    else:
+        reporter.fail(f"F. 기본 결합 실패: {result!r}")
+
+
+def check_format_common_address_dedup_when_road_address_repeats_region(reporter: ValidationReporter) -> None:
+    """F: roadAddress에 이미 "서울 강동구"(또는 정식 명칭 "서울특별시 강동구")가
+    포함돼 있으면 중복 없이 한 번만 나와야 한다."""
+    result_abbrev = format_common_address("서울 강동구 천호동", "서울 강동구 구천면로 140")
+    result_canonical = format_common_address("서울 강동구 천호동", "서울특별시 강동구 구천면로 140")
+    ok = (
+        result_abbrev == "서울특별시 강동구 천호동 구천면로 140"
+        and result_canonical == "서울특별시 강동구 천호동 구천면로 140"
+    )
+    if ok:
+        reporter.pass_("F. roadAddress에 이미 포함된 시·도/시·군·구(축약·정식 표기 모두)는 중복 없이 제거됨")
+    else:
+        reporter.fail(f"F. 중복 제거 실패: abbrev={result_abbrev!r}, canonical={result_canonical!r}")
+
+
+def check_format_common_address_preserves_already_canonical_name(reporter: ValidationReporter) -> None:
+    """F: commonAddress가 이미 정식 명칭이면 그대로 유지된다(재변환/이중 변환 없음)."""
+    result = format_common_address("서울특별시 강동구 천호동", "구천면로 140")
+    if result == "서울특별시 강동구 천호동 구천면로 140":
+        reporter.pass_("F. 이미 정식 명칭인 시·도는 그대로 유지됨")
+    else:
+        reporter.fail(f"F. 정식 명칭 보존 실패: {result!r}")
+
+
+def check_format_common_address_nationwide_sido_table(reporter: ValidationReporter) -> None:
+    """F: 요청서 §5가 예시로 든 전국 17개 시·도 축약명 전수 변환 확인."""
+    expected_pairs = [
+        ("서울", "서울특별시"), ("부산", "부산광역시"), ("대구", "대구광역시"),
+        ("인천", "인천광역시"), ("광주", "광주광역시"), ("대전", "대전광역시"),
+        ("울산", "울산광역시"), ("세종", "세종특별자치시"), ("경기", "경기도"),
+        ("강원", "강원특별자치도"), ("충북", "충청북도"), ("충남", "충청남도"),
+        ("전북", "전북특별자치도"), ("전남", "전라남도"), ("경북", "경상북도"),
+        ("경남", "경상남도"), ("제주", "제주특별자치도"),
+    ]
+    failures = []
+    for abbrev, canonical in expected_pairs:
+        result = format_common_address(f"{abbrev} 임의구 임의동", "상세주소 1")
+        if not result.startswith(canonical):
+            failures.append((abbrev, canonical, result))
+    if not failures:
+        reporter.pass_("F. 전국 17개 시·도 축약명 전수 정식 명칭 변환 성공")
+    else:
+        reporter.fail(f"F. 시·도 변환 실패 항목: {failures}")
+
+
+def check_format_common_address_preserves_building_floor_unit(reporter: ValidationReporter) -> None:
+    """F: 건물명/층/호수/쉼표가 결합 과정에서 유실되지 않아야 한다."""
+    result = format_common_address("서울 강동구 천호동", "구천면로 140 ABC빌딩, 2층 201호")
+    if result == "서울특별시 강동구 천호동 구천면로 140 ABC빌딩, 2층 201호":
+        reporter.pass_("F. 건물명/층/호수/쉼표 유실 없이 보존됨")
+    else:
+        reporter.fail(f"F. 건물명/층/호수 보존 실패: {result!r}")
+
+
+def check_format_common_address_does_not_contaminate_across_different_dong(reporter: ValidationReporter) -> None:
+    """F: 이 함수는 검색어(job/query)를 인자로 아예 받지 않으므로, 서로 다른
+    업체의 실제 commonAddress를 넣으면 서로 다른 동 주소가 그대로 나와야
+    한다(검색어 동을 모든 업체에 강제 주입하는 오염이 구조적으로 불가능함을
+    증명)."""
+    cheonho = format_common_address("서울 강동구 천호동", "구천면로 140")
+    other_dong = format_common_address("서울 강동구 성내동", "성내로 5")
+    if "천호동" in cheonho and "천호동" not in other_dong and "성내동" in other_dong:
+        reporter.pass_("F. 서로 다른 업체의 실제 commonAddress가 각각 그대로 반영되고 다른 동으로 오염되지 않음")
+    else:
+        reporter.fail(f"F. 동 오염 방지 실패: cheonho={cheonho!r}, other_dong={other_dong!r}")
+
+
+def check_format_common_address_fallback_without_common_address(reporter: ValidationReporter) -> None:
+    """F: commonAddress가 없을 때 roadAddress/address만으로 안전하게 폴백한다
+    (첫 토큰이 시·도로 보이면 정규화 시도, 나머지는 그대로)."""
+    result = format_common_address("", "부산 해운대구 우동 마린시티로 1")
+    if result == "부산광역시 해운대구 우동 마린시티로 1":
+        reporter.pass_("F. commonAddress 없을 때 roadAddress 단독 폴백 성공(시·도 정규화 포함)")
+    else:
+        reporter.fail(f"F. commonAddress 없음 폴백 실패: {result!r}")
+
+
+def check_format_common_address_all_blank_returns_empty(reporter: ValidationReporter) -> None:
+    """F: commonAddress/roadAddress/address 전부 없으면 예외 없이 빈 문자열."""
+    result = format_common_address("", "", "")
+    result_none = format_common_address(None, None, None)
+    if result == "" and result_none == "":
+        reporter.pass_("F. 주소 정보 전체 없음 시 예외 없이 공란 반환")
+    else:
+        reporter.fail(f"F. 전체 없음 처리 실패: result={result!r}, result_none={result_none!r}")
+
+
+def check_map_item_to_row_uses_common_address_formatter(reporter: ValidationReporter) -> None:
+    """_map_item_to_row가 실제로 format_common_address를 거쳐 주소를 만드는지
+    통합 확인(list entity 실측 형태: roadAddress는 지역 없이 도로명+상세만,
+    commonAddress가 시·도/시·군·구/동을 담당 - 요청서 §0/§5 실측)."""
+    item = {
+        "id": "6", "name": "구천면로 카페",
+        "commonAddress": "서울 강동구 천호동",
+        "roadAddress": "구천면로 140 2층 201호",
+    }
+    row = _map_item_to_row(item, "2026-07-25")
+    if row["주소"] == "서울특별시 강동구 천호동 구천면로 140 2층 201호":
+        reporter.pass_("_map_item_to_row가 commonAddress+roadAddress를 format_common_address로 결합함")
+    else:
+        reporter.fail(f"_map_item_to_row 주소 결합 실패: {row['주소']!r}")
 
 
 def check_dedup_rows(reporter: ValidationReporter) -> None:
@@ -731,6 +905,19 @@ def main() -> int:
     check_map_item_to_row_11_columns(reporter)
     check_map_item_to_row_second_field_variant(reporter)
     check_map_item_to_row_missing_keys(reporter)
+    check_visitor_blog_review_mapping_from_list_entity_keys(reporter)
+    check_review_both_missing_stays_blank(reporter)
+    check_review_one_side_only_preserves_value_and_blank_total(reporter)
+    check_total_review_count_field_not_reused_as_total(reporter)
+    check_format_common_address_basic_combination(reporter)
+    check_format_common_address_dedup_when_road_address_repeats_region(reporter)
+    check_format_common_address_preserves_already_canonical_name(reporter)
+    check_format_common_address_nationwide_sido_table(reporter)
+    check_format_common_address_preserves_building_floor_unit(reporter)
+    check_format_common_address_does_not_contaminate_across_different_dong(reporter)
+    check_format_common_address_fallback_without_common_address(reporter)
+    check_format_common_address_all_blank_returns_empty(reporter)
+    check_map_item_to_row_uses_common_address_formatter(reporter)
     check_dedup_rows(reporter)
     check_category_list_is_joined(reporter)
     check_homepage_instagram_url_classified_as_insta(reporter)

@@ -27,10 +27,15 @@
 # 그 외 예외는 timeout으로 위장하지 않고 navigation_error로 별도 분류한다
 # (browser_session.goto와 동일하게 PlaywrightTimeoutError만 관용적으로 흡수).
 import json
+import time
 from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from src.pc.apollo_list_adapter import (
+    build_rows_from_apollo_list_result,
+    extract_main_place_list_from_apollo,
+)
 from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
 from src.pc.detail_scraper import (
     _CONSECUTIVE_FAILURE_LIMIT,
@@ -42,7 +47,9 @@ from src.pc.detail_scraper import (
     _title_matches,
 )
 from src.pc.network_list_scraper import (
+    GlobalPlaceAccumulator,
     _extract_list_items,
+    _is_personal_mobile_phone,
     _map_item_to_row,
     build_entity_index,
     build_place_url_from_id,
@@ -50,6 +57,7 @@ from src.pc.network_list_scraper import (
     compute_page_signature,
     dedup_membership_rows,
     dedup_rows,
+    extract_normalized_apollo_detail,
     is_candidate_response,
     is_skeleton_dom_row,
     merge_detail_into_row,
@@ -1856,6 +1864,44 @@ _APOLLO_ENTITY_EXTRACTION_JS = """() => {
     return {available: true, entities: out};
 }"""
 
+# 5O(2026-07-23): 상세 페이지 방문 시 window.__APOLLO_STATE__에서 현재 place_id의
+# PlaceDetailBase(base)와, ROOT_QUERY 안의 placeDetail(...) parent 후보만 축소
+# 발췌한다(요청서 §8 - state 전체를 직렬화하지 않음). Base/Parent 선택·검증
+# (exact base.__ref 일치, stale 차단)은 여기서 하지 않고 순수 Python adapter
+# extract_normalized_apollo_detail()에 위임한다 - 이 JS는 후보를 좁히기만 한다.
+_APOLLO_DETAIL_EXTRACTION_JS = """(placeId) => {
+    const state = window.__APOLLO_STATE__;
+    if (!state || typeof state !== 'object') return {available: false, apollo_state: {}};
+    const bounded = {};
+    const baseKey = 'PlaceDetailBase:' + placeId;
+    if (state[baseKey] && typeof state[baseKey] === 'object') {
+        bounded[baseKey] = state[baseKey];
+    }
+    const rootQuery = state['ROOT_QUERY'];
+    if (rootQuery && typeof rootQuery === 'object') {
+        const quotedId = '"' + placeId + '"';
+        const boundedRoot = {};
+        for (const key of Object.keys(rootQuery)) {
+            if (key.indexOf('placeDetail(') >= 0 && key.indexOf(quotedId) >= 0) {
+                const value = rootQuery[key];
+                boundedRoot[key] = value;
+                // parent가 {"__ref": "..."} 형태면 참조 대상 entity도 1단계만 함께 담는다
+                // (adapter가 apollo_state에서 그 entity를 찾을 수 있도록).
+                if (value && typeof value === 'object' && typeof value.__ref === 'string') {
+                    const refEntity = state[value.__ref];
+                    if (refEntity && typeof refEntity === 'object') {
+                        bounded[value.__ref] = refEntity;
+                    }
+                }
+            }
+        }
+        if (Object.keys(boundedRoot).length > 0) {
+            bounded['ROOT_QUERY'] = boundedRoot;
+        }
+    }
+    return {available: true, apollo_state: bounded};
+}"""
+
 _CURRENT_PAGE_AND_TOP10_JS = """() => {
     const rows = Array.from(document.querySelectorAll('li.UEzoS.rTjJo'));
     const top10 = rows.slice(0, 10).map(r => {
@@ -1977,6 +2023,244 @@ def _find_entry_frame_like(page):
     return page
 
 
+_SSR_MAX_HTML_CHARS = 5_000_000
+_SSR_BLOCK_TEXT_MARKERS = ("보안 확인", "자동입력방지문자", "captcha_challenge", "captcha-wrapper")
+_SSR_APOLLO_STATE_PREFIX = "window.__APOLLO_STATE__"
+_SSR_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://m.place.naver.com/",
+}
+_SSR_REQUEST_TIMEOUT_MS = 15000
+
+
+def _parse_apollo_state_from_html(html_text: str) -> dict | None:
+    """SSR HTML 응답 본문에서 window.__APOLLO_STATE__ 값을 안전하게 추출한다.
+
+    5W 감사(page300_5w_r1_multirun_evidence_integrity_audit)가 `\\{.*?\\}` 형태의
+    non-greedy 정규식은 값 내부에 이스케이프된 `}` 문자열이 있으면 JSON 경계를
+    조기 절단할 위험이 있다고 지적했다 - 이 함수는 대신 `json.JSONDecoder().
+    raw_decode()`로 실제 JSON 문법 경계를 정확히 찾는다(중첩 객체/이스케이프
+    문자열/트레일링 `</script>`에 안전). 병적으로 큰 응답(_SSR_MAX_HTML_CHARS
+    초과)은 파싱을 시도하지 않고 None을 반환한다. 예외를 던지지 않고 항상
+    dict 또는 None만 반환한다."""
+    if not html_text or len(html_text) > _SSR_MAX_HTML_CHARS:
+        return None
+    marker_pos = html_text.find(_SSR_APOLLO_STATE_PREFIX)
+    if marker_pos < 0:
+        return None
+    eq_pos = html_text.find("=", marker_pos + len(_SSR_APOLLO_STATE_PREFIX))
+    if eq_pos < 0:
+        return None
+    start = eq_pos + 1
+    while start < len(html_text) and html_text[start] in " \t\r\n":
+        start += 1
+    try:
+        value, _end = json.JSONDecoder().raw_decode(html_text, start)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def _classify_ssr_block_signal(status_code, html_text: str) -> dict:
+    """SSR 응답이 차단(CAPTCHA/HTTP 403·405·429)인지 텍스트/상태 기준으로
+    판정한다. DOM 방문 기반 classify_captcha_signal은 렌더링된 page의
+    locator(bounding_box 등)를 요구하므로 이 경로(page.request, 렌더링 없음)에는
+    적용할 수 없다 - 5S/5T/5W가 실측으로 검증한 텍스트 마커를 그대로 재사용한
+    별도의 텍스트 기반 판정으로 대체한다."""
+    if status_code in _DETAIL_HTTP_BLOCKING_STATUSES:
+        return {"blocked": True, "block_type": f"HTTP_{status_code}"}
+    lowered = (html_text or "").lower()
+    for marker in _SSR_BLOCK_TEXT_MARKERS:
+        if marker in (html_text or "") or marker.lower() in lowered:
+            return {"blocked": True, "block_type": "CAPTCHA_CHALLENGE"}
+    return {"blocked": False, "block_type": ""}
+
+
+def _fetch_place_detail_ssr(page, row: dict, *, should_continue=None) -> dict:
+    """PAGE300-SSR-1: place_id 기반 상세정보를 BrowserContext-shared
+    APIRequestContext(page.request)로 HTML GET 1회만 수행해 확보한다(요청서
+    §3/§4). page.goto()로 렌더링하지 않으므로 상세 UI navigation은 0회다.
+
+    반환 dict는 항상 detail_ssr_* 진단 키 11개(요청서 §4)와, 성공 시
+    merge_detail_into_row가 바로 소비하는 병합용 필드(업종/새로오픈여부/
+    방문자리뷰수/블로그리뷰수/총리뷰수/대표전화/주소/플레이스 URL/홈페이지/
+    인스타/블로그/place_id/detail_success)를 포함한다. detail_success=True는
+    detail_ssr_status="success"일 때만 설정한다 - merge_detail_into_row는
+    detail_success 키만 확인하므로 이 함수는 그 계약을 그대로 재사용하고
+    수정하지 않는다.
+
+    예외를 던지지 않고 항상 dict를 반환한다(row 삭제 방지 원칙). retry는
+    수행하지 않는다(업체당 SSR 요청 최대 1회 - 실패 시 호출자가 기존 상세 UI
+    fallback을 별도로 판단한다)."""
+    place_id = str(row.get("place_id") or "").strip()
+    result = {
+        "detail_ssr_attempted": False,
+        "detail_ssr_status": "",
+        "detail_ssr_http_status": None,
+        "detail_ssr_apollo_found": False,
+        "detail_ssr_base_found": False,
+        "detail_ssr_parent_found": False,
+        "detail_ssr_place_id_exact": False,
+        "detail_ssr_adapter_success": False,
+        "detail_ssr_stop_reason": "",
+        "detail_ssr_error_type": "",
+        "detail_ssr_duration_seconds": 0.0,
+        "detail_success": False,
+        "place_id": place_id,
+        "업종": "",
+        "새로오픈여부": "",
+        "방문자리뷰수": "",
+        "블로그리뷰수": "",
+        "총리뷰수": "",
+        "대표전화": "",
+        "주소": "",
+        "플레이스 URL": "",
+        "홈페이지": "",
+        "인스타": "",
+        "블로그": "",
+    }
+    place_url = build_place_url_from_id(place_id)
+    if not place_url:
+        result["detail_ssr_status"] = "no_place_url"
+        result["detail_ssr_stop_reason"] = "no_place_url"
+        result["detail_ssr_error_type"] = "MissingPlaceId"
+        return result
+
+    if should_continue is not None and not should_continue():
+        result["detail_ssr_status"] = "user_stopped"
+        result["detail_ssr_stop_reason"] = "user_stopped"
+        result["detail_ssr_error_type"] = "UserStopped"
+        return result
+
+    result["detail_ssr_attempted"] = True
+    t0 = time.time()
+    try:
+        resp = page.request.get(place_url, headers=_SSR_REQUEST_HEADERS, timeout=_SSR_REQUEST_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_timeout"
+        result["detail_ssr_error_type"] = "Timeout"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+    except Exception as exc:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_request_error"
+        result["detail_ssr_error_type"] = type(exc).__name__
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    status_code = resp.status
+    result["detail_ssr_http_status"] = status_code
+    try:
+        content_type = resp.headers.get("content-type", "") if resp.headers else ""
+    except Exception:
+        content_type = ""
+    try:
+        html_text = resp.text()
+    except Exception:
+        html_text = ""
+
+    block_signal = _classify_ssr_block_signal(status_code, html_text[:4000])
+    if block_signal["blocked"]:
+        result["detail_ssr_status"] = "blocked"
+        result["detail_ssr_stop_reason"] = block_signal["block_type"]
+        result["detail_ssr_error_type"] = "Blocked"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    if should_continue is not None and not should_continue():
+        result["detail_ssr_status"] = "user_stopped"
+        result["detail_ssr_stop_reason"] = "user_stopped"
+        result["detail_ssr_error_type"] = "UserStopped"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    if status_code != 200 or "text/html" not in content_type:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_unexpected_response"
+        result["detail_ssr_error_type"] = "UnexpectedContentType" if status_code == 200 else "UnexpectedHttpStatus"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    apollo_state = _parse_apollo_state_from_html(html_text)
+    result["detail_ssr_apollo_found"] = apollo_state is not None
+    if apollo_state is None:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_apollo_missing"
+        result["detail_ssr_error_type"] = "ApolloStateNotFound"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    base_key = f"PlaceDetailBase:{place_id}"
+    base_entity = apollo_state.get(base_key)
+    base_found = isinstance(base_entity, dict)
+    result["detail_ssr_base_found"] = base_found
+    if base_found:
+        base_id = str(base_entity.get("id") or "").strip()
+        if base_id and base_id != place_id:
+            result["detail_ssr_status"] = "mismatch"
+            result["detail_ssr_stop_reason"] = "place_id_mismatch"
+            result["detail_ssr_error_type"] = "PlaceIdMismatch"
+            result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+            return result
+        result["detail_ssr_place_id_exact"] = True
+    else:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_base_missing"
+        result["detail_ssr_error_type"] = "BaseNotFound"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    apollo_detail = extract_normalized_apollo_detail(apollo_state, place_id)
+    if not apollo_detail:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_adapter_empty"
+        result["detail_ssr_error_type"] = "AdapterEmpty"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+    result["detail_ssr_adapter_success"] = True
+
+    parent_found = any(
+        apollo_detail.get(field) is not None for field in ("homepages", "newOpening", "phoneInfo")
+    )
+    result["detail_ssr_parent_found"] = parent_found
+    if not parent_found:
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_parent_missing"
+        result["detail_ssr_error_type"] = "ParentNotFound"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    apollo_row = _map_item_to_row(apollo_detail, "")
+    visitor_reviews = apollo_row.get("방문자리뷰수")
+    blog_reviews = apollo_row.get("블로그리뷰수")
+    if visitor_reviews in (None, "") and blog_reviews in (None, ""):
+        result["detail_ssr_status"] = "needs_fallback"
+        result["detail_ssr_stop_reason"] = "detail_ssr_reviews_missing"
+        result["detail_ssr_error_type"] = "ReviewFieldsMissing"
+        result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+        return result
+
+    result["detail_ssr_status"] = "success"
+    result["detail_success"] = True
+    result["업종"] = apollo_row.get("업종", "")
+    result["새로오픈여부"] = apollo_row.get("새로오픈여부", "")
+    result["방문자리뷰수"] = visitor_reviews if visitor_reviews not in (None,) else ""
+    result["블로그리뷰수"] = blog_reviews if blog_reviews not in (None,) else ""
+    result["총리뷰수"] = apollo_row.get("총리뷰수", "")
+    result["대표전화"] = apollo_row.get("대표전화", "")
+    result["주소"] = apollo_row.get("주소", "")
+    result["플레이스 URL"] = place_url
+    result["홈페이지"] = apollo_row.get("홈페이지", "")
+    result["인스타"] = apollo_row.get("인스타", "")
+    result["블로그"] = apollo_row.get("블로그", "")
+    result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
+    return result
+
+
 def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_continue=None) -> dict:
     """row(place_id 포함)의 상세 페이지를 직접 URL로 방문해 대표전화/주소/
     홈페이지/인스타/블로그/실제 플레이스 URL을 확보한다. 예외를 던지지 않고
@@ -2001,6 +2285,9 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_c
         "place_id": place_id,
         "업종": "",
         "새로오픈여부": "",
+        "방문자리뷰수": "",
+        "블로그리뷰수": "",
+        "총리뷰수": "",
         "대표전화": "",
         "주소": "",
         "플레이스 URL": "",
@@ -2079,6 +2366,10 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_c
                 continue
 
             phone = _extract_entry_phone(entry_frame)
+            if phone and _is_personal_mobile_phone(phone):
+                # 5O §9: DOM 상세 추출 결과 자체에서도 개인 휴대전화를 제거한다
+                # (merge_detail_into_row 단계에서만 걸러지던 기존 gap 보강).
+                phone = ""
             address = _extract_entry_address(entry_frame)
             homepage, insta, blog = _extract_entry_sns(entry_frame)
 
@@ -2090,6 +2381,37 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_c
             result["홈페이지"] = homepage
             result["인스타"] = insta
             result["블로그"] = blog
+
+            # 5O: Apollo State(PlaceDetailBase + parent PlaceDetail)로 방문자/
+            # 블로그 리뷰수·새로오픈여부·(비어있는 경우) 대표전화/주소/홈페이지/
+            # 인스타/블로그를 best-effort 보강한다. 실패해도 위에서 이미 확정된
+            # DOM 결과와 detail_success는 그대로 유지한다(§7 - fallback 보존).
+            try:
+                apollo_raw = entry_frame.evaluate(_APOLLO_DETAIL_EXTRACTION_JS, place_id)
+            except Exception:
+                apollo_raw = None
+            if isinstance(apollo_raw, dict) and apollo_raw.get("available"):
+                try:
+                    apollo_detail = extract_normalized_apollo_detail(apollo_raw.get("apollo_state") or {}, place_id)
+                except Exception:
+                    apollo_detail = {}
+                if apollo_detail:
+                    apollo_row = _map_item_to_row(apollo_detail, "")
+                    if not result["대표전화"] and apollo_row.get("대표전화"):
+                        result["대표전화"] = apollo_row["대표전화"]
+                    if not result["주소"] and apollo_row.get("주소"):
+                        result["주소"] = apollo_row["주소"]
+                    if not result["업종"] and apollo_row.get("업종"):
+                        result["업종"] = apollo_row["업종"]
+                    for field in ("홈페이지", "인스타", "블로그"):
+                        if not result[field] and apollo_row.get(field):
+                            result[field] = apollo_row[field]
+                    if not result["새로오픈여부"] and apollo_row.get("새로오픈여부"):
+                        result["새로오픈여부"] = apollo_row["새로오픈여부"]
+                    result["방문자리뷰수"] = apollo_row.get("방문자리뷰수", "")
+                    result["블로그리뷰수"] = apollo_row.get("블로그리뷰수", "")
+                    result["총리뷰수"] = apollo_row.get("총리뷰수", "")
+
             return result
         except Exception as exc:
             last_error_type = type(exc).__name__
@@ -2169,6 +2491,7 @@ def collect_dom_membership_query(page, job, target_count, *, collected_at, max_p
         all_rows: list = []
         seen: set = set()
         page_number = 1
+        accumulator = GlobalPlaceAccumulator(collected_at=collected_at)
 
         while True:
             probe = _probe_captcha_state(page)
@@ -2223,10 +2546,9 @@ def collect_dom_membership_query(page, job, target_count, *, collected_at, max_p
                 break
 
             network_raw_items = _harvest_all_candidates(ctx)
-            network_rows = [
-                _map_item_to_row(item, collected_at, source_page=page_number, source_query=job.get("query"))
-                for item in network_raw_items
-            ]
+            for item in network_raw_items:
+                accumulator.add_raw_item(item, source_page=page_number, source_query=job.get("query"))
+            network_rows = accumulator.get_all_rows()
             network_index = build_entity_index([
                 to_common_entity(
                     row, id_key="place_id", name_key="업체명", category_key="업종",
@@ -2331,6 +2653,7 @@ def collect_dom_membership_query(page, job, target_count, *, collected_at, max_p
 
             page_number += 1
 
+        all_rows = accumulator.merge_into_dom_rows(all_rows)
         trimmed_rows = trim_membership_rows_to_target(all_rows, target_count)
         result["rows"] = trimmed_rows
         result["final_unique_count"] = len(trimmed_rows)
@@ -2473,6 +2796,522 @@ class DomMembershipCollector:
                 pass
 
         return merged_rows + remainder
+
+    def enrich_detail_ssr(
+        self, rows: list, *, max_targets: int = None, should_continue=None, on_progress=None
+    ) -> dict:
+        """PAGE300-SSR-1: 이미 확보된 rows(전역 dedup 이후 최종 고유 목록,
+        DOM 순서)의 앞쪽 max_targets개(None이면 전체)를 BrowserContext-shared
+        SSR HTML GET(_fetch_place_detail_ssr)으로 순차 보강한다(요청서 §6/§7).
+
+        업체당 SSR 요청은 최대 1회다. 다음 조건에서만 기존 상세 UI 방문
+        방식(_fetch_place_detail)으로 업체당 최대 1회의 제한적 fallback을
+        시도한다: HTTP 500/timeout/Apollo·Base·Parent 누락/리뷰 필드 완전
+        누락(요청서 §8 "needs_fallback"). SSR 또는 fallback이 차단
+        (CAPTCHA/HTTP 403·405·429)을 감지하면 그 즉시 전체 상세 보강을
+        중단한다(우회/retry 없음). SSR이 place_id mismatch/stale response를
+        감지하면 그 row는 병합하지 않고 마찬가지로 전체를 안전 중단한다
+        (요청서 §8 - block과 별개의 독립된 중단 사유).
+
+        같은 place_id가 rows에 두 번 이상 나타나도(전역 dedup 이후에는
+        발생하지 않아야 하지만 방어적으로) SSR 요청은 place_id당 최초 1회만
+        보내고 이후에는 캐시된 결과를 재사용한다.
+
+        반환 dict: {"rows": 병합된 rows + 미시도 remainder, "stop_reason":
+        str|None, "security_blocked": bool, "attempted_count": int,
+        "ssr_success_count": int, "ui_fallback_used_count": int,
+        "ui_fallback_success_count": int, "failure_count": int,
+        "not_attempted_count": int}. 기존 enrich_detail(단순 list 반환)과
+        달리 dict를 반환한다 - 요청서 §11이 요구하는 SSR 성공/UI fallback/
+        실패/미시도 카운트를 호출자(UI)에 전달하기 위한 의도적인 차이다.
+        """
+        targets = list(rows[:max_targets]) if max_targets is not None else list(rows)
+        remainder = list(rows[max_targets:]) if max_targets is not None else []
+        total = len(targets)
+
+        empty_counts = dict(
+            attempted_count=0, ssr_success_count=0, ui_fallback_used_count=0,
+            ui_fallback_success_count=0, failure_count=0,
+        )
+
+        if should_continue is not None and not should_continue():
+            return {
+                "rows": targets + remainder, "stop_reason": "user_stopped",
+                "security_blocked": False, "not_attempted_count": total,
+                **empty_counts,
+            }
+
+        page = self._session.context.new_page()
+        merged_rows: list = []
+        ssr_cache: dict = {}
+        consecutive_failures = 0
+        attempted_count = 0
+        ssr_success_count = 0
+        ui_fallback_used_count = 0
+        ui_fallback_success_count = 0
+        failure_count = 0
+        stop_reason = None
+        security_blocked = False
+        not_attempted_in_targets = 0
+
+        try:
+            for row in targets:
+                if stop_reason is None and should_continue is not None and not should_continue():
+                    stop_reason = "user_stopped"
+                if stop_reason is not None:
+                    merged_rows.append(row)
+                    not_attempted_in_targets += 1
+                    continue
+
+                place_id = str(row.get("place_id") or "").strip()
+                if place_id and place_id in ssr_cache:
+                    detail_result = ssr_cache[place_id]
+                else:
+                    detail_result = _fetch_place_detail_ssr(page, row, should_continue=should_continue)
+                    if place_id:
+                        ssr_cache[place_id] = detail_result
+                if detail_result["detail_ssr_attempted"]:
+                    attempted_count += 1
+
+                status = detail_result["detail_ssr_status"]
+
+                if status == "success":
+                    merged_rows.append(merge_detail_into_row(row, detail_result))
+                    ssr_success_count += 1
+                    consecutive_failures = 0
+
+                elif status == "blocked":
+                    merged_rows.append(row)
+                    stop_reason = detail_result["detail_ssr_stop_reason"]
+                    security_blocked = True
+
+                elif status == "mismatch":
+                    merged_rows.append(row)
+                    stop_reason = "place_id_mismatch"
+
+                elif status == "user_stopped":
+                    merged_rows.append(row)
+                    if not detail_result["detail_ssr_attempted"]:
+                        not_attempted_in_targets += 1
+                    stop_reason = "user_stopped"
+
+                elif status == "no_place_url":
+                    merged_rows.append(row)
+                    failure_count += 1
+
+                else:  # needs_fallback
+                    if should_continue is not None and not should_continue():
+                        merged_rows.append(row)
+                        not_attempted_in_targets += 1
+                        stop_reason = "user_stopped"
+                        continue
+
+                    ui_fallback_used_count += 1
+                    fallback_result = _fetch_place_detail(page, row, should_continue=should_continue)
+
+                    if fallback_result["detail_success"]:
+                        merged_rows.append(merge_detail_into_row(row, fallback_result))
+                        ui_fallback_success_count += 1
+                        consecutive_failures = 0
+                    elif fallback_result["detail_stop_reason"] in ("captcha_detected", "detail_http_error"):
+                        merged_rows.append(row)
+                        stop_reason = fallback_result["detail_stop_reason"]
+                        security_blocked = True
+                    else:
+                        merged_rows.append(row)
+                        failure_count += 1
+                        consecutive_failures += 1
+                        if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                            stop_reason = "consecutive_failure_limit"
+
+                if on_progress is not None:
+                    try:
+                        on_progress(len(merged_rows), total, ssr_success_count + ui_fallback_success_count, failure_count)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        not_attempted_count = not_attempted_in_targets + len(remainder)
+        return {
+            "rows": merged_rows + remainder,
+            "stop_reason": stop_reason,
+            "security_blocked": security_blocked,
+            "attempted_count": attempted_count,
+            "ssr_success_count": ssr_success_count,
+            "ui_fallback_used_count": ui_fallback_used_count,
+            "ui_fallback_success_count": ui_fallback_success_count,
+            "failure_count": failure_count,
+            "not_attempted_count": not_attempted_count,
+        }
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._session_cm is not None:
+            self._session_cm.__exit__(exc_type, exc, tb)
+        self._session_cm = None
+        self._session = None
+        return False
+
+
+# ============================================================================
+# 신규 Apollo/GraphQL-first 두 모드 production 목록 수집 경로(사용자 승인 -
+# "신규 Apollo/GraphQL-first 경로를 두 모드의 production 기본 목록 수집
+# 방식으로 구현하세요"). DomMembershipCollector/collect_dom_membership_query
+# (DOM 풀스크롤 기반, 위)는 이 추가로 전혀 수정되지 않았고, 기존
+# DomMembershipCollector 및 DOM+Apollo+Network 병합 코드는 비활성 fallback
+# capability로 그대로 보존된다 - 이 신규 경로는 그것을 호출하지 않으며, 실패
+# 시에도 그쪽으로 조용히 전환하지 않고 navigation_error로 명확히 반환한다.
+#
+# 1페이지는 window.__APOLLO_STATE__의 ROOT_QUERY에서 현재 검색어와 정확히
+# 일치하는 메인 placeList(...) operation 하나만 선택해 businesses.items의
+# __ref만 추적한다(apollo_list_adapter.extract_main_place_list_from_apollo).
+# 목록 전체 DOM 스크롤은 호출하지 않는다. 2페이지 이후는 정상 페이지 이동으로
+# 자연 발생하는 GraphQL response만 사용하며, 기존 response listener 인프라
+# (_make_response_handler 등)와 _find_page_button/_wait_for_next_page_settle을
+# 재사용한다. collect_network_query의 기존 pagination 블록(DOM class-diff
+# 페이지 정체성 검증 포함)은 이미 여러 실측으로 하드닝된 코드라 수정하지
+# 않고, 이 함수는 그 블록을 복제하지 않은 더 단순한 새 루프로 작성했다 -
+# DOM row를 전혀 읽지 않으므로 DOM class-diff 검증의 전제(DOM row 오귀속
+# 방지)가 적용되지 않기 때문이다(Live 검증 후 추가 하드닝 필요 - 알려진 한계).
+# ============================================================================
+
+_APOLLO_FULL_STATE_JS = """() => {
+    const state = window.__APOLLO_STATE__;
+    if (!state || typeof state !== 'object') return {available: false, apollo_state: null, oversized: false};
+    try {
+        if (JSON.stringify(state).length > 5000000) {
+            return {available: true, apollo_state: null, oversized: true};
+        }
+    } catch (e) {
+        return {available: false, apollo_state: null, oversized: false};
+    }
+    return {available: true, apollo_state: state, oversized: false};
+}"""
+
+
+def _wait_for_apollo_list_ready(page, frame, expected_query: str, expected_start: int, hard_cap_ms: int = 5000) -> dict:
+    """1페이지 window.__APOLLO_STATE__에 메인 placeList(...) operation이 확인될
+    때까지 폴링한다. 매 tick마다 전체 apollo state를 다시 읽어
+    extract_main_place_list_from_apollo로 판정하고, error가 없어지면 즉시
+    반환한다(추가 대기 없음). hard_cap_ms 안에 끝내 확인되지 않으면 마지막
+    관찰된 list_result를 그대로 반환한다(호출자가 error 필드로 판단 -
+    이 함수 자체는 성공/실패를 판정하지 않는다)."""
+    elapsed_ms = 0
+    while True:
+        try:
+            state_result = frame.evaluate(_APOLLO_FULL_STATE_JS)
+        except Exception:
+            state_result = None
+        apollo_state = state_result.get("apollo_state") if isinstance(state_result, dict) else None
+        list_result = extract_main_place_list_from_apollo(apollo_state, expected_query, expected_start)
+        if not list_result["error"]:
+            return list_result
+        if elapsed_ms >= hard_cap_ms:
+            return list_result
+        page.wait_for_timeout(_POLL_INTERVAL_MS)
+        elapsed_ms += _POLL_INTERVAL_MS
+
+
+def collect_apollo_first_list_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
+    """신규 Apollo/GraphQL-first 목록 수집. 1페이지는 메인 placeList(...)
+    operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
+    response를 harvest한다. run_collection_plan이 기대하는 최소 계약
+    {"rows", "active_captcha_detected", "status_429_seen", "navigation_error",
+    "navigation_error_message"}을 그대로 만족해 network_pipeline.py는 무수정
+    으로 재사용된다.
+
+    실패 시맨틱: 1페이지 Apollo 구조 파싱 실패(search frame 없음/apollo_state
+    없음/메인 placeList 없음·모호함/businesses.items 없음)만
+    navigation_error=True로 취급한다(run_collection_plan이 이미 "즉시 큐
+    전체 중단, 이전 결과 보존"으로 처리하는 필드 - 조용한 DOM fallback
+    없음). 페이지네이션 소진/다음 페이지 버튼 없음/max_pages 도달은 정상
+    종료(navigation_error=False)로 처리한다.
+
+    반환에 추가된 진단 필드(navigation_error 계약 외): "page_count"(확정된
+    페이지 수), "pagination_stop_reason"(정상 종료 사유)."""
+    ctx = _QueryObservationContext()
+    response_handler = _make_response_handler(ctx)
+    request_finished_handler = _make_request_finished_handler(ctx)
+    request_failed_handler = _make_request_failed_handler(ctx)
+    _registered_listeners: list = []
+    try:
+        for _event, _handler in (
+            ("response", response_handler),
+            ("requestfinished", request_finished_handler),
+            ("requestfailed", request_failed_handler),
+        ):
+            page.on(_event, _handler)
+            _registered_listeners.append((_event, _handler))
+    except Exception:
+        for _event, _handler in _registered_listeners:
+            try:
+                page.off(_event, _handler)
+            except Exception:
+                pass
+        raise
+
+    def _navigation_error_result(message: str) -> dict:
+        return {
+            "rows": [],
+            "active_captcha_detected": False,
+            "status_429_seen": ctx.status_429_seen,
+            "navigation_error": True,
+            "navigation_error_message": message,
+            "page_count": 0,
+            "pagination_stop_reason": None,
+        }
+
+    try:
+        query_text = job.get("query") or ""
+        search_url = _SEARCH_URL_TEMPLATE.format(query=quote(query_text))
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+        except PlaywrightTimeoutError:
+            pass  # BrowserSession.goto와 동일: 느린 로드는 관용적으로 흡수하고 계속 진행.
+        except Exception as exc:
+            return _navigation_error_result(f"{type(exc).__name__}: {exc}")
+
+        frame = _find_search_frame(page)
+        if frame is None:
+            return _navigation_error_result("ApolloListParseError:search_frame_not_found")
+
+        list_result = _wait_for_apollo_list_ready(page, frame, query_text, 0, hard_cap_ms=5000)
+        if list_result["error"]:
+            return _navigation_error_result(f"ApolloListParseError:{list_result['error']}")
+
+        mapped_rows = build_rows_from_apollo_list_result(list_result, collected_at, source_query=query_text)
+        for row in mapped_rows:
+            row["source_page"] = 1
+            row["source_city"] = job.get("source_city")
+            row["source_district"] = job.get("source_district")
+            row["source_subregion"] = job.get("source_subregion")
+            row["source_layer"] = job.get("source_layer")
+
+        local_seen: set = set()
+        unique_rows = dedup_rows(mapped_rows, local_seen)
+
+        def _ensure_parsed_simple(index: int) -> dict:
+            """collect_network_query의 _ensure_parsed와 달리 candidate당 재확인
+            memoize를 하지 않는 단순화된 버전 - 신규 경로는 DOM class-diff 등
+            추가 하드닝이 없어 candidate 수 자체가 훨씬 적으므로 매 호출마다
+            다시 파싱해도 비용이 낮다(§3 - 새 pagination 루프는 의도적으로
+            더 단순하게 작성)."""
+            entry = ctx.candidates[index]
+            if entry["body_snapshot_ready"]:
+                if entry.get("candidate_error_type") == "CandidateHttpError":
+                    return {"items": [], "error": True}
+                try:
+                    data = json.loads(entry["body_snapshot"])
+                    return {"items": _extract_list_items(data), "error": False}
+                except Exception:
+                    return {"items": [], "error": True}
+            if entry["body_snapshot_error_type"]:
+                return {"items": [], "error": True}
+            return {"items": [], "error": False, "pending": True}
+
+        pagination_stop_reason = None
+        current_page_number = 1
+        final_captcha_signal = None
+
+        if target_count and len(unique_rows) >= target_count:
+            pagination_stop_reason = "per_query_limit_reached"
+        else:
+            while current_page_number < max_pages:
+                probe = _probe_captcha_state(page)
+                final_captcha_signal = classify_captcha_signal(
+                    marker_present_in_dom=probe["marker_present"],
+                    element_visible=probe["visible"],
+                    bounding_box_area=probe["bounding_box_area"],
+                    click_exception_message=probe["click_intercepted_message"],
+                )
+                if final_captcha_signal["active_captcha_detected"]:
+                    pagination_stop_reason = "captcha_detected"
+                    break
+                if ctx.status_429_seen:
+                    pagination_stop_reason = "status_429_seen"
+                    break
+
+                frame = _find_search_frame(page)
+                if frame is None:
+                    pagination_stop_reason = "pagination_exhausted"
+                    break
+
+                target_page_number = current_page_number + 1
+                button_locator = _find_page_button(frame, target_page_number)
+                try:
+                    button_count = button_locator.count() if button_locator is not None else 0
+                except Exception:
+                    button_count = 0
+                if button_count == 0:
+                    pagination_stop_reason = "pagination_exhausted"
+                    break
+                if button_count > 1:
+                    pagination_stop_reason = "ambiguous_page_button"
+                    break
+
+                target_locator = button_locator.first
+                try:
+                    is_ready = bool(target_locator.is_visible()) and bool(target_locator.is_enabled())
+                except Exception:
+                    pagination_stop_reason = "pagination_click_error"
+                    break
+                if not is_ready:
+                    pagination_stop_reason = "pagination_click_error"
+                    break
+
+                count_before_click = ctx.candidate_response_count
+                try:
+                    target_locator.click()
+                except Exception:
+                    pagination_stop_reason = "pagination_click_error"
+                    break
+
+                wait_result = _wait_for_next_page_settle(
+                    page, ctx, _ensure_parsed_simple, count_before_click, hard_cap_ms=5000
+                )
+
+                probe = _probe_captcha_state(page)
+                final_captcha_signal = classify_captcha_signal(
+                    marker_present_in_dom=probe["marker_present"],
+                    element_visible=probe["visible"],
+                    bounding_box_area=probe["bounding_box_area"],
+                    click_exception_message=probe["click_intercepted_message"],
+                )
+                if final_captcha_signal["active_captcha_detected"]:
+                    pagination_stop_reason = "captcha_detected"
+                    break
+                if ctx.status_429_seen:
+                    pagination_stop_reason = "status_429_seen"
+                    break
+                if not wait_result["got_new_response"]:
+                    pagination_stop_reason = "next_page_response_timeout"
+                    break
+
+                page_raw_items: list = []
+                for index in range(count_before_click, wait_result["final_count"]):
+                    parsed = _ensure_parsed_simple(index)
+                    if not parsed["error"]:
+                        page_raw_items.extend(parsed["items"])
+
+                page_mapped_rows = []
+                for item in page_raw_items:
+                    row = _map_item_to_row(
+                        item, collected_at, source_page=target_page_number, source_query=query_text
+                    )
+                    row["source_city"] = job.get("source_city")
+                    row["source_district"] = job.get("source_district")
+                    row["source_subregion"] = job.get("source_subregion")
+                    row["source_layer"] = job.get("source_layer")
+                    page_mapped_rows.append(row)
+
+                newly_unique = dedup_rows(page_mapped_rows, local_seen)
+                unique_rows.extend(newly_unique)
+                current_page_number = target_page_number
+
+                if target_count and len(unique_rows) >= target_count:
+                    pagination_stop_reason = "per_query_limit_reached"
+                    break
+                if current_page_number >= max_pages:
+                    pagination_stop_reason = "max_page_count_reached"
+                    break
+
+            if pagination_stop_reason is None:
+                pagination_stop_reason = "max_page_count_reached"
+
+        if final_captcha_signal is None:
+            probe = _probe_captcha_state(page)
+            final_captcha_signal = classify_captcha_signal(
+                marker_present_in_dom=probe["marker_present"],
+                element_visible=probe["visible"],
+                bounding_box_area=probe["bounding_box_area"],
+                click_exception_message=probe["click_intercepted_message"],
+            )
+
+        capped_rows = unique_rows[:target_count] if target_count else unique_rows
+        return {
+            "rows": capped_rows,
+            "active_captcha_detected": bool(final_captcha_signal["active_captcha_detected"]),
+            "status_429_seen": ctx.status_429_seen,
+            "navigation_error": False,
+            "navigation_error_message": "",
+            "page_count": current_page_number,
+            "pagination_stop_reason": pagination_stop_reason,
+        }
+    finally:
+        for event, event_handler in (
+            ("response", response_handler),
+            ("requestfinished", request_finished_handler),
+            ("requestfailed", request_failed_handler),
+        ):
+            try:
+                page.off(event, event_handler)
+            except Exception:
+                pass
+
+
+class ApolloFirstListCollector:
+    """신규 Apollo/GraphQL-first 목록 수집의 production 기본 collector.
+
+    `NetworkBrowserCollector`/`DomMembershipCollector`와 동일한 생명주기
+    계약(컨텍스트 매니저 + `collect_query(job, per_query_limit)`)을 만족해
+    `run_collection_plan`은 무수정으로 재사용된다. `enrich_detail`/
+    `enrich_detail_ssr`은 의도적으로 정의하지 않는다 - 홈페이지·SNS 포함
+    모드의 home 보강은 이 클래스가 아니라 `src/pc/home_enrichment.py`가,
+    이 컨텍스트가 닫힌(브라우저 세션이 종료된) 뒤 별도로 담당한다.
+    """
+
+    def __init__(self, *, collected_at, session_factory=None, max_pages: int = 5):
+        self.collected_at = collected_at
+        self.max_pages = max_pages
+        self._session_factory = session_factory or _default_session_factory
+        self._session_cm = None
+        self._session = None
+
+    def __enter__(self):
+        self._session_cm = self._session_factory()
+        self._session = self._session_cm.__enter__()
+        self._close_initial_page_if_present()
+        return self
+
+    def _close_initial_page_if_present(self) -> None:
+        initial_page = getattr(self._session, "page", None)
+        if initial_page is None:
+            return
+        try:
+            initial_page.close()
+        except Exception:
+            pass
+
+    def collect_query(self, job, per_query_limit) -> dict:
+        page = self._session.context.new_page()
+        try:
+            return collect_apollo_first_list_query(
+                page,
+                job,
+                per_query_limit,
+                collected_at=self.collected_at,
+                max_pages=self.max_pages,
+            )
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def capture_session_cookies(self) -> list:
+        """`with` 블록이 열려있는 동안(context가 닫히기 전) 호출해야 한다 -
+        홈페이지·SNS 포함 모드에서 sync Playwright 세션 종료 후 별도 async
+        home enrichment 단계로 쿠키를 이어주기 위한 것이다(Playwright 객체
+        자체는 넘기지 않고 순수 JSON 직렬화 가능한 list[dict]만 넘긴다 - 두
+        단계 사이에 Playwright 객체의 thread/event loop 공유가 없다).
+        best-effort이며 어떤 예외도 밖으로 던지지 않고 빈 list를 반환한다."""
+        try:
+            return self._session.context.cookies()
+        except Exception:
+            return []
 
     def __exit__(self, exc_type, exc, tb):
         if self._session_cm is not None:

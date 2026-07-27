@@ -1,0 +1,616 @@
+from pathlib import Path
+import json
+import sys
+
+
+# 신규 Apollo/GraphQL-first 목록 수집(collect_apollo_first_list_query/
+# ApolloFirstListCollector, src/pc/network_browser_collector.py) 검증용
+# standalone 스크립트(실제 Playwright/네이버 접속 없음). 기존
+# tests/test_pc_network_pagination.py의 FakePaginationPage/FakeSearchFrame/
+# FakePaginationButtonLocator 패턴을 이 파일 안에서 독립적으로 재구현하고,
+# 1페이지 window.__APOLLO_STATE__ 폴링을 위한 evaluate()만 추가한다(기존
+# 파일 무수정, 파일 간 import 없음 - 기존 관례 그대로).
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from src.pc.network_browser_collector import (
+    _APOLLO_FULL_STATE_JS,
+    _DOM_SCROLL_JS,
+    ApolloFirstListCollector,
+    collect_apollo_first_list_query,
+)
+import src.pc.network_browser_collector as network_browser_collector
+
+
+class ValidationReporter:
+    def __init__(self):
+        self.pass_count = 0
+        self.fail_count = 0
+
+    def pass_(self, message: str) -> None:
+        self.pass_count += 1
+        print(f"[PASS] {message}")
+
+    def fail(self, message: str) -> None:
+        self.fail_count += 1
+        print(f"[FAIL] {message}")
+
+    def summary(self) -> None:
+        final = "FAIL" if self.fail_count else "PASS"
+        print("====================")
+        print(f"PASS: {self.pass_count}")
+        print(f"FAIL: {self.fail_count}")
+        print(f"FINAL: {final}")
+        print("====================")
+
+
+JOB = {
+    "region": "서울특별시 강남구",
+    "keyword": "카페",
+    "query": "서울특별시 강남구 카페",
+    "source_city": "서울특별시",
+    "source_district": "강남구",
+    "source_subregion": "강남구",
+    "source_layer": "district",
+}
+
+
+def _op_key(input_obj: dict) -> str:
+    return f"placeList({json.dumps({'input': input_obj})})"
+
+
+def _item_entity(place_id: str, name: str) -> dict:
+    return {
+        "id": place_id,
+        "name": name,
+        "category": "카페",
+        "visitorReviewsTotal": 10,
+        "cafeBlogReviewsTotal": 5,
+        "roadAddress": "서울 강남구 테헤란로 1",
+        "phone": "02-000-0000",
+    }
+
+
+def _apollo_state(query: str, item_ids_and_names, start: int = 0) -> dict:
+    ref_key_of = lambda pid: f"PlaceListBusinessesItem:{pid}:{pid}"
+    state = {ref_key_of(pid): _item_entity(pid, name) for pid, name in item_ids_and_names}
+    state["ROOT_QUERY"] = {
+        _op_key({"query": query, "start": start, "display": 70}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, _ in item_ids_and_names]}
+        },
+    }
+    return state
+
+
+def _apollo_state_result(state) -> dict:
+    return {"available": True, "apollo_state": state, "oversized": False}
+
+
+class FakeCaptchaLocator:
+    def __init__(self, count=0, visible=False, box=None):
+        self._count = count
+        self._visible = visible
+        self._box = box or {"width": 0, "height": 0}
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return self._count
+
+    def is_visible(self, timeout=300):
+        return self._visible
+
+    def bounding_box(self):
+        return self._box
+
+
+class FakeRequest:
+    def __init__(self, resource_type, method="GET"):
+        self.resource_type = resource_type
+        self.method = method
+        self.failure = None
+        self._response = None
+
+    def response(self):
+        return self._response
+
+
+class FakeResponse:
+    def __init__(self, url, status, resource_type, *, body=None, headers=None):
+        self.url = url
+        self.status = status
+        self.request = FakeRequest(resource_type)
+        self.request._response = self
+        self._body = body
+        self.headers = headers if headers is not None else {}
+
+    def body(self):
+        return self._body
+
+    def text(self):
+        return (self._body or b"").decode("utf-8")
+
+
+CANDIDATE_URL = "https://map.naver.com/p/api/search/allSearch?query=x"
+
+
+def _place_response(item_ids_and_names, url=CANDIDATE_URL):
+    items = [{"id": item_id, "name": name} for item_id, name in item_ids_and_names]
+    body = json.dumps({"result": {"place": {"list": items}}}).encode("utf-8")
+    return FakeResponse(url, 200, "xhr", body=body)
+
+
+class FakePaginationButtonLocator:
+    def __init__(self, spec: dict):
+        self._spec = spec
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return self._spec.get("count", 0)
+
+    def is_visible(self, timeout=None):
+        return self._spec.get("visible", True)
+
+    def is_enabled(self):
+        return self._spec.get("enabled", True)
+
+    def click(self):
+        self._spec["click_calls"] = self._spec.get("click_calls", 0) + 1
+        error = self._spec.get("click_error")
+        if error is not None:
+            raise error
+
+
+class FakeApolloSearchFrame:
+    """searchIframe 흉내 - 1페이지 window.__APOLLO_STATE__ 폴링(evaluate)과
+    페이지 번호 버튼 조회(get_by_role) 둘 다 제공한다. apollo_state_sequence는
+    evaluate() 호출마다 순서대로 반환되며, 마지막 값은 그 뒤로도 계속 반복된다
+    (hard cap까지 폴링해도 끝내 확인되지 않는 상황을 표현하기 위함)."""
+
+    def __init__(self, apollo_state_sequence, click_plan=None, *, name="searchIframe", url="https://map.naver.com/p/search"):
+        self._sequence = list(apollo_state_sequence)
+        self._click_plan = click_plan or {}
+        self.name = name
+        self.url = url
+        self.evaluated_scripts: list = []
+        self.get_by_role_calls: list = []
+
+    def evaluate(self, script):
+        self.evaluated_scripts.append(script)
+        if len(self._sequence) > 1:
+            return self._sequence.pop(0)
+        if self._sequence:
+            return self._sequence[0]
+        return {"available": False, "apollo_state": None, "oversized": False}
+
+    def get_by_role(self, role, name=None, exact=None):
+        self.get_by_role_calls.append((role, name, exact))
+        spec = self._click_plan.get(name)
+        if spec is None:
+            return FakePaginationButtonLocator({"count": 0})
+        return FakePaginationButtonLocator(spec)
+
+
+class FakeApolloPage:
+    """collect_apollo_first_list_query 전용 fake clock page. wait_for_timeout(ms)
+    호출마다 누적 경과시간을 추적하고, 그 경과시간을 기준으로 예약된 response를
+    전달한다(FakePaginationPage와 동일한 원리). 페이지 버튼 click() 직후 새
+    response를 즉시(지연 0) 전달하도록 click_plan의 responses_after_click을
+    바로 harvest에 반영한다."""
+
+    def __init__(self, apollo_state_sequence, click_plan=None, *, captcha_selectors=None, goto_error=None, frame_missing=False):
+        self._handlers: dict = {}
+        self._captcha_selectors = captcha_selectors or {}
+        self._goto_error = goto_error
+        self._frame = None if frame_missing else FakeApolloSearchFrame(apollo_state_sequence, click_plan or {})
+        self.goto_calls: list = []
+        self.wait_calls: list = []
+        self._pending_responses: list = []
+
+    def on(self, event, handler):
+        self._handlers.setdefault(event, []).append(handler)
+
+    def off(self, event, handler):
+        handlers = self._handlers.get(event, [])
+        if handler in handlers:
+            handlers.remove(handler)
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.goto_calls.append(url)
+        if self._goto_error is not None:
+            raise self._goto_error
+
+    def wait_for_timeout(self, ms):
+        self.wait_calls.append(ms)
+        pending, self._pending_responses = self._pending_responses, []
+        for response in pending:
+            self._deliver(response)
+
+    def _deliver(self, response):
+        if getattr(response, "simulate_request_failed", False):
+            for handler in list(self._handlers.get("requestfailed", [])):
+                handler(response.request)
+        else:
+            for handler in list(self._handlers.get("response", [])):
+                handler(response)
+            for handler in list(self._handlers.get("requestfinished", [])):
+                handler(response.request)
+
+    def schedule_after_click(self, response):
+        self._pending_responses.append(response)
+
+    def locator(self, selector):
+        return self._captcha_selectors.get(selector, FakeCaptchaLocator(count=0))
+
+    def frame(self, name=None):
+        return self._frame
+
+
+def check_page1_success_builds_tagged_rows(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A"), ("222", "카페 B")])
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    row0 = result["rows"][0] if result["rows"] else {}
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 2
+        and row0.get("업체명") == "카페 A"
+        and row0.get("source_page") == 1
+        and row0.get("source_city") == "서울특별시"
+        and row0.get("source_district") == "강남구"
+    )
+    if ok:
+        reporter.pass_("1. 1페이지 성공: rows 태깅(source_page/city/district) 정상")
+    else:
+        reporter.fail(f"1. 1페이지 성공 케이스 실패: {result}")
+
+
+def check_page1_apollo_never_ready_is_navigation_error(reporter: ValidationReporter) -> None:
+    page = FakeApolloPage([{"available": False, "apollo_state": None, "oversized": False}])
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    ok = (
+        result["navigation_error"] is True
+        and "ApolloListParseError:" in result["navigation_error_message"]
+        and result["rows"] == []
+    )
+    if ok:
+        reporter.pass_("2. Apollo state 끝내 미확인: navigation_error=True + ApolloListParseError 메시지")
+    else:
+        reporter.fail(f"2. Apollo 미확인 케이스 실패: {result}")
+
+
+def check_page1_ambiguous_is_navigation_error(reporter: ValidationReporter) -> None:
+    # 두 후보가 동점(같은 query/start)이면서 서로 다른(비어있지 않은) 유효
+    # place_id 집합을 가져야 진짜 ambiguous 상황이 된다 - 두 후보 모두 items가
+    # 비어 있으면(id_set이 둘 다 빈 집합으로 동일) 새 알고리즘은 "동점이지만
+    # ID 집합이 같음"으로 보고 임의로 하나를 채택한다(중복 표현으로 간주 -
+    # 진짜 모호한 상황이 아님).
+    state = {
+        "PlaceListBusinessesItem:701:701": _item_entity("701", "카페701"),
+        "PlaceListBusinessesItem:702:702": _item_entity("702", "카페702"),
+        "ROOT_QUERY": {
+            _op_key({"query": JOB["query"], "start": 0, "tag": "a"}): {
+                "businesses": {"items": [{"__ref": "PlaceListBusinessesItem:701:701"}]}
+            },
+            _op_key({"query": JOB["query"], "start": 0, "tag": "b"}): {
+                "businesses": {"items": [{"__ref": "PlaceListBusinessesItem:702:702"}]}
+            },
+        },
+    }
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    ok = (
+        result["navigation_error"] is True
+        and "ambiguous_placelist_operation" in result["navigation_error_message"]
+    )
+    if ok:
+        reporter.pass_("3. ambiguous placeList: navigation_error=True + ambiguous_placelist_operation 메시지")
+    else:
+        reporter.fail(f"3. ambiguous 케이스 실패: {result}")
+
+
+def check_dom_scroll_js_never_evaluated(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    evaluated = page._frame.evaluated_scripts
+    ok = (
+        result["navigation_error"] is False
+        and _DOM_SCROLL_JS not in evaluated
+        and all(script == _APOLLO_FULL_STATE_JS for script in evaluated)
+    )
+    if ok:
+        reporter.pass_("4. _DOM_SCROLL_JS 미호출 확인(신규 경로는 DOM 풀스크롤을 전혀 실행하지 않음)")
+    else:
+        reporter.fail(f"4. DOM_SCROLL_JS 호출 스파이 실패: evaluated={evaluated}")
+
+
+def check_page2_graphql_harvest_and_dedup(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A"), ("222", "카페 B")])
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+
+    # click() 자체는 FakePaginationButtonLocator에서 즉시 반환되므로, 클릭
+    # "직후" 새 candidate response가 도착하는 상황을 흉내내려면 클릭 스펙에
+    # 반응을 등록하는 대신, 첫 wait_for_timeout 호출 이전에 pending queue에
+    # 넣어 둔다(FakeApolloPage.schedule_after_click).
+    original_click = page._frame.get_by_role
+
+    def _patched_get_by_role(role, name=None, exact=None):
+        locator = original_click(role, name=name, exact=exact)
+        if name == "2":
+            original_locator_click = locator.click
+
+            def _click_and_schedule():
+                original_locator_click()
+                page.schedule_after_click(_place_response([("111", "업체111(중복)"), ("333", "카페 C")]))
+
+            locator.click = _click_and_schedule
+        return locator
+
+    page._frame.get_by_role = _patched_get_by_role
+
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    place_ids = sorted(row["place_id"] for row in result["rows"])
+    ok = (
+        result["navigation_error"] is False
+        and place_ids == ["111", "222", "333"]
+        and result["page_count"] == 2
+    )
+    if ok:
+        reporter.pass_("5. 2페이지 자연 발생 GraphQL harvest + place_id dedup 성공")
+    else:
+        reporter.fail(f"5. 2페이지 harvest 케이스 실패: {result}, place_ids={place_ids}")
+
+
+def check_captcha_mid_pagination_stops_with_partial_rows(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+        captcha_selectors={"#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=True, box={"width": 100, "height": 100})},
+    )
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    ok = (
+        result["navigation_error"] is False
+        and result["active_captcha_detected"] is True
+        and result["pagination_stop_reason"] == "captcha_detected"
+        and len(result["rows"]) == 1
+    )
+    if ok:
+        reporter.pass_("6. CAPTCHA 감지 시 새 페이지 시도 없이 즉시 중단 + 부분 rows 보존")
+    else:
+        reporter.fail(f"6. CAPTCHA 중단 케이스 실패: {result}")
+
+
+def check_status_429_stops_with_partial_rows(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page = FakeApolloPage([_apollo_state_result(state)])
+    page.on("response", lambda response: None)  # no-op 등록 순서 확인용(실사용 영향 없음)
+    # goto 이후 429 응답을 즉시 흘려보낸다(1페이지 harvest와 무관, 429만 관찰됨).
+    original_goto = page.goto
+
+    def _goto_with_429(url, wait_until=None, timeout=None):
+        original_goto(url, wait_until=wait_until, timeout=timeout)
+        page._deliver(FakeResponse("https://map.naver.com/", 429, "document"))
+
+    page.goto = _goto_with_429
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    ok = result["navigation_error"] is False and result["status_429_seen"] is True
+    if ok:
+        reporter.pass_("7. HTTP 429 감지 시 status_429_seen=True로 안전 중단")
+    else:
+        reporter.fail(f"7. HTTP 429 케이스 실패: {result}")
+
+
+def check_pagination_exhausted_is_normal_stop(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page = FakeApolloPage([_apollo_state_result(state)], click_plan={})
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
+    ok = (
+        result["navigation_error"] is False
+        and result["pagination_stop_reason"] == "pagination_exhausted"
+        and len(result["rows"]) == 1
+    )
+    if ok:
+        reporter.pass_("8. 다음 페이지 버튼 없음: navigation_error=False(정상 종료)")
+    else:
+        reporter.fail(f"8. pagination_exhausted 케이스 실패: {result}")
+
+
+def check_max_pages_reached_is_normal_stop(reporter: ValidationReporter) -> None:
+    click_plan = {str(n): {"count": 1, "visible": True, "enabled": True} for n in range(2, 6)}
+    state = _apollo_state(JOB["query"], [("p1", "카페1")])
+    page = FakeApolloPage([_apollo_state_result(state)], click_plan=click_plan)
+
+    # 각 페이지 버튼 클릭 시 새 candidate 하나씩 흘려보내도록 patch한다.
+    original_get_by_role = page._frame.get_by_role
+
+    def _patched(role, name=None, exact=None):
+        locator = original_get_by_role(role, name=name, exact=exact)
+        if name in click_plan:
+            original_locator_click = locator.click
+
+            def _click_and_schedule(n=name):
+                original_locator_click()
+                page.schedule_after_click(_place_response([(f"p{n}", f"카페{n}")]))
+
+            locator.click = _click_and_schedule
+        return locator
+
+    page._frame.get_by_role = _patched
+    result = collect_apollo_first_list_query(page, JOB, 300, collected_at="2026-07-24", max_pages=5)
+    ok = (
+        result["navigation_error"] is False
+        and result["pagination_stop_reason"] == "max_page_count_reached"
+        and result["page_count"] == 5
+    )
+    if ok:
+        reporter.pass_("9. max_pages 도달: navigation_error=False, page_count=5로 정상 종료")
+    else:
+        reporter.fail(f"9. max_pages 케이스 실패: {result}")
+
+
+class FakeLifecyclePage:
+    def __init__(self):
+        self.close_call_count = 0
+        self.close_error = None
+
+    def close(self):
+        self.close_call_count += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeLifecycleContext:
+    def __init__(self, cookies_result=None, cookies_error=None):
+        self.new_page_call_count = 0
+        self.pages_created: list = []
+        self._cookies_result = cookies_result if cookies_result is not None else []
+        self._cookies_error = cookies_error
+
+    def new_page(self):
+        self.new_page_call_count += 1
+        page = FakeLifecyclePage()
+        self.pages_created.append(page)
+        return page
+
+    def cookies(self):
+        if self._cookies_error is not None:
+            raise self._cookies_error
+        return self._cookies_result
+
+
+class FakeLifecycleSession:
+    def __init__(self, context: FakeLifecycleContext):
+        self.context = context
+        self.enter_count = 0
+        self.exit_count = 0
+
+    def __enter__(self):
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.exit_count += 1
+        return False
+
+
+def check_capture_session_cookies_returns_context_cookies(reporter: ValidationReporter) -> None:
+    context = FakeLifecycleContext(cookies_result=[{"name": "NID_AUT", "value": "abc"}])
+    session = FakeLifecycleSession(context)
+    collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
+    with collector:
+        cookies = collector.capture_session_cookies()
+    if cookies == [{"name": "NID_AUT", "value": "abc"}]:
+        reporter.pass_("10. capture_session_cookies가 context.cookies()를 그대로 반환")
+    else:
+        reporter.fail(f"10. capture_session_cookies 결과가 예상과 다름: {cookies}")
+
+
+def check_capture_session_cookies_returns_empty_on_exception(reporter: ValidationReporter) -> None:
+    context = FakeLifecycleContext(cookies_error=RuntimeError("context closed"))
+    session = FakeLifecycleSession(context)
+    collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
+    with collector:
+        cookies = collector.capture_session_cookies()
+    if cookies == []:
+        reporter.pass_("11. context.cookies() 예외 시 빈 list 반환(예외를 밖으로 던지지 않음)")
+    else:
+        reporter.fail(f"11. capture_session_cookies 예외 처리 실패: {cookies}")
+
+
+def check_collector_opens_and_closes_one_page_per_query(reporter: ValidationReporter) -> None:
+    context = FakeLifecycleContext()
+    session = FakeLifecycleSession(context)
+    collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
+
+    calls: list = []
+    original = network_browser_collector.collect_apollo_first_list_query
+
+    def fake_collect(page, job, per_query_limit, *, collected_at, max_pages):
+        calls.append(page)
+        return {"rows": [], "active_captcha_detected": False, "status_429_seen": False,
+                "navigation_error": False, "navigation_error_message": "", "page_count": 1,
+                "pagination_stop_reason": "pagination_exhausted"}
+
+    network_browser_collector.collect_apollo_first_list_query = fake_collect
+    try:
+        with collector:
+            collector.collect_query(JOB, 30)
+            collector.collect_query(JOB, 30)
+    finally:
+        network_browser_collector.collect_apollo_first_list_query = original
+
+    ok = (
+        context.new_page_call_count == 2
+        and len(calls) == 2
+        and all(p.close_call_count == 1 for p in context.pages_created)
+    )
+    if ok:
+        reporter.pass_("12. collect_query 호출마다 새 page 생성 + 정확히 1회 close")
+    else:
+        reporter.fail(f"12. 생명주기 검증 실패: new_page={context.new_page_call_count}, pages={context.pages_created}")
+
+
+def check_collector_closes_page_even_when_collect_raises(reporter: ValidationReporter) -> None:
+    context = FakeLifecycleContext()
+    session = FakeLifecycleSession(context)
+    collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
+
+    original = network_browser_collector.collect_apollo_first_list_query
+
+    def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages):
+        raise RuntimeError("boom")
+
+    network_browser_collector.collect_apollo_first_list_query = fake_collect_raises
+    raised = False
+    try:
+        with collector:
+            try:
+                collector.collect_query(JOB, 30)
+            except RuntimeError:
+                raised = True
+    finally:
+        network_browser_collector.collect_apollo_first_list_query = original
+
+    ok = raised and len(context.pages_created) == 1 and context.pages_created[0].close_call_count == 1
+    if ok:
+        reporter.pass_("13. collect_apollo_first_list_query가 예외를 던져도 page.close()는 실행됨")
+    else:
+        reporter.fail(f"13. 예외 시 page close 보장 실패: raised={raised}, pages={context.pages_created}")
+
+
+def main() -> bool:
+    reporter = ValidationReporter()
+    checks = [
+        check_page1_success_builds_tagged_rows,
+        check_page1_apollo_never_ready_is_navigation_error,
+        check_page1_ambiguous_is_navigation_error,
+        check_dom_scroll_js_never_evaluated,
+        check_page2_graphql_harvest_and_dedup,
+        check_captcha_mid_pagination_stops_with_partial_rows,
+        check_status_429_stops_with_partial_rows,
+        check_pagination_exhausted_is_normal_stop,
+        check_max_pages_reached_is_normal_stop,
+        check_capture_session_cookies_returns_context_cookies,
+        check_capture_session_cookies_returns_empty_on_exception,
+        check_collector_opens_and_closes_one_page_per_query,
+        check_collector_closes_page_even_when_collect_raises,
+    ]
+    for check in checks:
+        check(reporter)
+    reporter.summary()
+    return reporter.fail_count == 0
+
+
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)

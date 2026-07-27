@@ -231,16 +231,27 @@ def check_match_unmatched(reporter: ValidationReporter) -> None:
 
 
 def check_merge_dom_network_only(reporter: ValidationReporter) -> None:
+    """5M-R1 정책(2026-07-23): 단일 '리뷰수' 컬럼은 더 이상 존재하지 않는다 -
+    방문자리뷰수/블로그리뷰수를 Network 구조화값(정수)에서 각각 채택하고,
+    총리뷰수는 둘 다 확인된 경우에만 합산한다(_compute_total_review_count).
+    _pick_numeric은 실제 int 타입만 채택하므로(문자열 "10" 등은 미확인 취급),
+    fixture도 정수로 준다."""
     dom_row = normalize_dom_row({"name": "카페 A", "category": "카페(DOM)"}, page_number=1)
     network_result = {
-        "row": {"업종": "카페(Network)", "리뷰수": "10", "주소": "서울 강동구", "플레이스 URL": "/restaurant/1/home"},
+        "row": {"업종": "카페(Network)", "방문자리뷰수": 7, "블로그리뷰수": 3, "주소": "서울 강동구", "플레이스 URL": "/restaurant/1/home"},
         "confidence": "EXACT_ID",
     }
     apollo_result = {"row": None, "confidence": "UNMATCHED"}
     row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
-    ok = row["업체명"] == "카페 A" and row["리뷰수"] == "10" and row["주소"] == "서울 강동구"
+    ok = (
+        row["업체명"] == "카페 A"
+        and row["방문자리뷰수"] == 7
+        and row["블로그리뷰수"] == 3
+        and row["총리뷰수"] == 10
+        and row["주소"] == "서울 강동구"
+    )
     if ok:
-        reporter.pass_("merge_dom_row_fields: DOM+Network only 조합, Network 값이 리뷰수/주소로 채택")
+        reporter.pass_("merge_dom_row_fields: DOM+Network only 조합, 방문자/블로그 리뷰수가 각각 채택되고 총리뷰수는 둘 다 확인된 경우에만 합산됨")
     else:
         reporter.fail(f"DOM+Network only 병합 이상: {row}")
 
@@ -282,15 +293,26 @@ def check_category_falls_back_to_network_when_dom_empty(reporter: ValidationRepo
 
 
 def check_merge_enrichment_failed_keeps_dom_row(reporter: ValidationReporter) -> None:
+    """5M-R1 정책: 방문자/블로그 리뷰수는 Network/Apollo 구조화값만 사용하고
+    DOM raw_text 정규식은 사용하지 않는다(오귀속 방지) - enrichment가 실패해도
+    raw_text의 "리뷰 42"를 리뷰수로 추측하지 않고 미확인(공란)으로 남긴다.
+    DOM 기반 값(업체명/업종)은 그대로 유지되고 row 자체는 삭제되지 않는다."""
     dom_row = normalize_dom_row(
         {"name": "카페 D", "category": "카페", "raw_text": "카페 D카페\n리뷰 42"}, page_number=1
     )
     network_result = {"row": None, "confidence": "UNMATCHED"}
     apollo_result = {"row": None, "confidence": "UNMATCHED"}
     row = merge_dom_row_fields(dom_row, network_result, apollo_result, "2026-07-21")
-    ok = row["업체명"] == "카페 D" and row["업종"] == "카페" and row["리뷰수"] == "42" and row["대표전화"] == ""
+    ok = (
+        row["업체명"] == "카페 D"
+        and row["업종"] == "카페"
+        and row["방문자리뷰수"] == ""
+        and row["블로그리뷰수"] == ""
+        and row["총리뷰수"] == ""
+        and row["대표전화"] == ""
+    )
     if ok:
-        reporter.pass_("merge_dom_row_fields: enrichment 실패해도 DOM/raw_text 기반 값 유지, row 삭제 없음")
+        reporter.pass_("merge_dom_row_fields: enrichment 실패 시 DOM 값(업체명/업종) 유지 + 리뷰수는 raw_text로 추측하지 않고 미확인 공란 유지, row 삭제 없음")
     else:
         reporter.fail(f"enrichment 실패 row 처리 이상: {row}")
 

@@ -139,6 +139,7 @@ def _make_app(*, districts=("강동구",), query_queue=None):
     app.review_min_var = FakeVar("")
     app.review_max_var = FakeVar("")
     app.mode_var = FakeVar("premium")
+    app.collection_mode_var = FakeVar("basic")
 
     app.total_found_var = FakeVar("")
     app.duplicate_removed_var = FakeVar("")

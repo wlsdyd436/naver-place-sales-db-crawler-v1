@@ -5,12 +5,13 @@ import tempfile
 from openpyxl import load_workbook
 
 
-# Stage 3C: exporter 단일 스키마 확장(통합_결과 온라인 채널 컬럼 append) 검증 스크립트.
+# 5M-R1(2026-07-23): exporter 통합_결과 스키마를 13컬럼으로 확정(방문자/블로그/
+# 총리뷰수 분리, 기존 단일 "리뷰수" 컬럼 제거). 원본_모바일/원본_PC(MOBILE_COLUMNS/
+# PC_COLUMNS)는 legacy 엔진 전용이라 이번 변경 대상이 아니며 그대로 검증한다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src import exporter
 from src.exporter import (
     MERGED_COLUMNS,
     MOBILE_COLUMNS,
@@ -19,19 +20,21 @@ from src.exporter import (
 )
 
 
-# 기존 8개 컬럼(순서/이름 불변) + 신규 3개 append.
-FROZEN_MERGED_HEAD = [
+EXPECTED_MERGED = [
     "업체명",
     "업종",
     "새로오픈여부",
-    "리뷰수",
+    "방문자리뷰수",
+    "블로그리뷰수",
+    "총리뷰수",
     "주소",
     "대표전화",
     "플레이스 URL",
     "수집일",
+    "홈페이지",
+    "인스타",
+    "블로그",
 ]
-NEW_MERGED_TAIL = ["홈페이지", "인스타", "블로그"]
-EXPECTED_MERGED = FROZEN_MERGED_HEAD + NEW_MERGED_TAIL
 EXPECTED_MOBILE = ["업체명", "업종", "주소", "대표전화", "플레이스 URL", "수집일"]
 EXPECTED_PC = ["업체명", "업종", "새로오픈여부", "리뷰수", "주소", "수집일"]
 
@@ -62,12 +65,15 @@ class ValidationReporter:
 
 
 def _new_engine_row():
-    # collect_pc_full 결과 형태(가산 필드 + place_id 포함).
+    # collect_pc_full 결과 형태(가산 필드 + place_id 포함). 5M-R1: 방문자/블로그
+    # 리뷰수는 정수로, 총리뷰수는 둘 다 확인됐을 때만 합산해 저장한다.
     return {
         "업체명": "오베르캄프 본점",
         "업종": "베이커리",
         "새로오픈여부": "",
-        "리뷰수": "2469",
+        "방문자리뷰수": 2400,
+        "블로그리뷰수": 69,
+        "총리뷰수": 2469,
         "주소": "서울 강동구 성내로14길 48 1층",
         "대표전화": "0507-1387-4967",
         "플레이스 URL": "https://pcmap.place.naver.com/restaurant/1171815551/home",
@@ -80,12 +86,15 @@ def _new_engine_row():
 
 
 def _legacy_row():
-    # SNS 필드가 없는 기존 흐름 행(모바일/merge 결과 형태).
+    # SNS 필드가 없는 기존 흐름 행(모바일/merge 결과 형태). 방문자/블로그 리뷰수는
+    # 미확인(빈 문자열)이므로 총리뷰수도 공란이어야 한다(부분합계 금지).
     return {
         "업체명": "레거시 카페",
         "업종": "카페",
         "새로오픈여부": "O",
-        "리뷰수": "10",
+        "방문자리뷰수": "",
+        "블로그리뷰수": "",
+        "총리뷰수": "",
         "주소": "서울 강동구 어딘가",
         "대표전화": "02-000-0000",
         "플레이스 URL": "https://m.place.naver.com/place/1/home",
@@ -115,15 +124,15 @@ def _read_rows(path, sheet_name):
 
 
 def check_merged_columns_constant(reporter: ValidationReporter) -> None:
-    if MERGED_COLUMNS[:8] == FROZEN_MERGED_HEAD:
-        reporter.pass_("MERGED_COLUMNS 앞 8개 컬럼 이름/순서 불변")
-    else:
-        reporter.fail(f"기존 8개 컬럼이 변경됨: {MERGED_COLUMNS[:8]}")
-
     if MERGED_COLUMNS == EXPECTED_MERGED:
-        reporter.pass_("MERGED_COLUMNS = 기존 8개 + [홈페이지, 인스타, 블로그] append")
+        reporter.pass_("MERGED_COLUMNS = 5M-R1 확정 13컬럼(방문자/블로그/총리뷰수 분리, 단일 리뷰수 제거)")
     else:
-        reporter.fail(f"MERGED_COLUMNS 확장 결과가 예상과 다름: {MERGED_COLUMNS}")
+        reporter.fail(f"MERGED_COLUMNS이 예상 13컬럼과 다름: {MERGED_COLUMNS}")
+
+    if "리뷰수" not in MERGED_COLUMNS:
+        reporter.pass_("기존 단일 '리뷰수' 컬럼이 통합_결과에서 제거됨")
+    else:
+        reporter.fail("기존 단일 '리뷰수' 컬럼이 여전히 남아있음")
 
 
 def check_other_columns_unchanged(reporter: ValidationReporter) -> None:
@@ -145,13 +154,13 @@ def check_exported_merged_headers(reporter: ValidationReporter) -> None:
 
         merged_headers = _read_headers(path, "통합_결과")
         checks = {
-            "통합_결과 헤더 11개(기존8+신규3)": merged_headers == EXPECTED_MERGED,
+            "통합_결과 헤더 13개(5M-R1 확정 스키마)": merged_headers == EXPECTED_MERGED,
             "place_id는 통합_결과 컬럼에 미노출": "place_id" not in merged_headers,
             "원본_모바일 헤더 무변경": _read_headers(path, "원본_모바일") == EXPECTED_MOBILE,
             "원본_PC 헤더 무변경": _read_headers(path, "원본_PC") == EXPECTED_PC,
         }
         if all(checks.values()):
-            reporter.pass_("저장 파일 3시트 헤더: 통합_결과만 append 확장, place_id 미노출, 원본 시트 불변")
+            reporter.pass_("저장 파일 3시트 헤더: 통합_결과는 13컬럼, place_id 미노출, 원본 시트 불변")
         else:
             failed = [name for name, ok in checks.items() if not ok]
             reporter.fail(f"저장 헤더 검증 실패 항목: {failed} (통합_결과={merged_headers})")
@@ -168,11 +177,37 @@ def check_new_engine_row_values(reporter: ValidationReporter) -> None:
             and row.get("대표전화") == "0507-1387-4967"
             and row.get("플레이스 URL") == "https://pcmap.place.naver.com/restaurant/1171815551/home"
             and row.get("인스타") == "https://www.instagram.com/oberkampf.kr"
+            and row.get("방문자리뷰수") == 2400
+            and row.get("블로그리뷰수") == 69
+            and row.get("총리뷰수") == 2469
         )
         if ok:
-            reporter.pass_("PC full 엔진 row가 통합_결과 11개 컬럼에 정확히 매핑(대표전화/URL/인스타 포함)")
+            reporter.pass_("PC full 엔진 row가 통합_결과 13컬럼에 정확히 매핑(대표전화/URL/인스타/리뷰 분리 포함)")
         else:
             reporter.fail(f"새 엔진 row 매핑 결과가 예상과 다름: {row}")
+
+
+def check_review_columns_numeric_cells(reporter: ValidationReporter) -> None:
+    # 방문자/블로그/총리뷰수는 Excel 수식이 아닌 검증된 정수 셀로 저장돼야 하고,
+    # 미확인 값은 공란(빈 셀)이어야 한다(부분 합계로 채우지 않음).
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "numeric_test.xlsx"
+        export_places_to_excel([_new_engine_row(), _legacy_row()], [], [], str(path))
+        rows = _read_rows(path, "통합_결과")
+        new_engine_row = rows[0] if rows else {}
+        legacy_row = rows[1] if len(rows) > 1 else {}
+        ok = (
+            isinstance(new_engine_row.get("방문자리뷰수"), int)
+            and isinstance(new_engine_row.get("블로그리뷰수"), int)
+            and isinstance(new_engine_row.get("총리뷰수"), int)
+            and new_engine_row.get("총리뷰수") == 2469
+            and (legacy_row.get("방문자리뷰수") is None or str(legacy_row.get("방문자리뷰수")).strip() == "")
+            and (legacy_row.get("총리뷰수") is None or str(legacy_row.get("총리뷰수")).strip() == "")
+        )
+        if ok:
+            reporter.pass_("방문자/블로그/총리뷰수가 숫자 셀로 저장되고, 미확인 값은 공란 유지")
+        else:
+            reporter.fail(f"리뷰수 숫자 셀/공란 처리 결과가 예상과 다름: new={new_engine_row}, legacy={legacy_row}")
 
 
 def check_legacy_row_blank_sns(reporter: ValidationReporter) -> None:
@@ -215,6 +250,7 @@ def main() -> int:
     check_other_columns_unchanged(reporter)
     check_exported_merged_headers(reporter)
     check_new_engine_row_values(reporter)
+    check_review_columns_numeric_cells(reporter)
     check_legacy_row_blank_sns(reporter)
     check_signature_unchanged(reporter)
 

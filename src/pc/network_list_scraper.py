@@ -21,6 +21,7 @@
 # 중복 구현하지 않기 위함이다.
 import hashlib
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from src.parser import detect_new_open_pc, extract_address_from_pc_text, extract_review_count_pc
 from src.pc.safety import is_captcha_or_security_message
@@ -67,6 +68,9 @@ _ITEM_NAME_KEYS = ("name", "businessName", "title")
 _KNOWN_LIST_PATHS = (
     ("result", "place", "list"),
     ("result", "business", "list"),
+    ("data", "restaurants", "businesses", "items"),
+    ("data", "businesses", "items"),
+    ("data", "place", "list"),
 )
 
 
@@ -113,14 +117,25 @@ def _extract_list_items(data) -> list:
     입력: response.json()으로 이미 파싱된 dict 또는 list.
     출력: 업체 항목(dict)들의 list. 찾지 못하면 빈 list(예외를 던지지 않음).
 
-    1) 먼저 _KNOWN_LIST_PATHS(예: result.place.list)를 우선 시도한다.
-    2) 실패하면 트리 전체를 재귀 스캔해(_find_item_lists) 휴리스틱으로 후보를
-       찾고, 후보가 여러 개면 가장 긴 리스트를 채택한다(업체 리스트일 확률이
-       가장 높다고 가정).
-    이 함수는 JSON 구조가 사전 예고 없이 바뀔 수 있다는 전제 하에 작성되었으므로,
-    알 수 없는 구조가 들어와도 예외 없이 빈 리스트를 반환한다.
+    1) 먼저 _KNOWN_LIST_PATHS(예: result.place.list, data.restaurants.businesses.items)를 우선 시도한다.
+    2) data가 list(GraphQL batched response 등)인 경우 배열 원소를 순회 파싱한다.
+    3) 실패하면 트리 전체를 재귀 스캔해(_find_item_lists) 휴리스틱으로 후보를
+       찾고, 후보가 여러 개면 가장 긴 리스트를 채택한다.
     """
     if not isinstance(data, (dict, list)):
+        return []
+
+    if isinstance(data, list):
+        if data and all(_looks_like_place_item(item) for item in data):
+            return data
+        batched_items = []
+        for entry in data:
+            if isinstance(entry, (dict, list)):
+                sub_items = _extract_list_items(entry)
+                if sub_items:
+                    batched_items.extend(sub_items)
+        if batched_items:
+            return batched_items
         return []
 
     for path in _KNOWN_LIST_PATHS:
@@ -149,16 +164,10 @@ def _extract_list_items(data) -> list:
 _FIELD_KEY_CANDIDATES = {
     "업체명": ("name", "businessName", "title"),
     "업종": ("category", "categoryName"),
-    "주소": ("roadAddress", "address"),
-    "대표전화": ("tel", "virtualTel"),
-    "홈페이지": ("homePage",),
+    "주소": ("roadAddress", "address", "commonAddress"),
+    "홈페이지": ("homePage", "website", "homepage"),
 }
 
-# PoC-1.1 확장 포인트: 지금은 "확인 가능한 첫 값"만 사용하는 단일 컬럼(리뷰수)이지만,
-# 방문자 리뷰/블로그 리뷰를 Excel에서 분리해야 할 필요가 생기면(제품 요구 확정 시)
-# 이 튜플을 나눠 별도 컬럼 매핑을 추가한다. 지금은 과도한 합산/가공 없이 방어적으로
-# 첫 번째 확인 가능한 값만 사용한다.
-_REVIEW_COUNT_KEY_CANDIDATES = ("visitorReviewCount", "reviewCount", "blogReviewCount")
 _ID_KEY_CANDIDATES = _ITEM_ID_KEYS
 _PLACE_URL_KEY_CANDIDATES = ("placeUrl", "url", "detailUrl", "businessUrl")
 
@@ -212,41 +221,347 @@ def _extract_category(item: dict) -> str:
     return ""
 
 
-def _classify_external_links(raw_value) -> tuple:
-    """homePage류 필드 값(문자열 또는 문자열 리스트)을 도메인 기준으로 분류한다.
+# 2026-07-25 field parity 보정: 전국 시·도 축약명 -> 정식 명칭 정규화 표
+# (요청서 §5 예시 그대로). 이미 정식 명칭인 키도 등록해 idempotent하게
+# 유지되도록 한다(그대로 유지 - 축약 재변환/이중 변환 없음).
+_SIDO_CANONICAL_MAP = {
+    "서울": "서울특별시", "서울특별시": "서울특별시",
+    "부산": "부산광역시", "부산광역시": "부산광역시",
+    "대구": "대구광역시", "대구광역시": "대구광역시",
+    "인천": "인천광역시", "인천광역시": "인천광역시",
+    "광주": "광주광역시", "광주광역시": "광주광역시",
+    "대전": "대전광역시", "대전광역시": "대전광역시",
+    "울산": "울산광역시", "울산광역시": "울산광역시",
+    "세종": "세종특별자치시", "세종시": "세종특별자치시", "세종특별자치시": "세종특별자치시",
+    "경기": "경기도", "경기도": "경기도",
+    "강원": "강원특별자치도", "강원도": "강원특별자치도", "강원특별자치도": "강원특별자치도",
+    "충북": "충청북도", "충청북도": "충청북도",
+    "충남": "충청남도", "충청남도": "충청남도",
+    "전북": "전북특별자치도", "전라북도": "전북특별자치도", "전북특별자치도": "전북특별자치도",
+    "전남": "전라남도", "전라남도": "전라남도",
+    "경북": "경상북도", "경상북도": "경상북도",
+    "경남": "경상남도", "경상남도": "경상남도",
+    "제주": "제주특별자치도", "제주도": "제주특별자치도", "제주특별자치도": "제주특별자치도",
+}
 
-    네이버 응답은 대표 외부 링크를 종류와 무관하게 "홈페이지" 필드 하나에 담는
-    경우가 있다(detail_scraper._extract_entry_sns가 entryIframe에서 확인한 것과
-    동일한 관례). 이 함수는 URL의 도메인을 보고 인스타/블로그/그 외(홈페이지)로
-    분류한다:
-      - "instagram.com" 포함 -> 인스타
-      - "blog.naver.com" 포함 또는 "blog."로 시작/포함(그 외 블로그 계열) -> 블로그
-      - 그 외 유효한 URL -> 홈페이지
-    값이 list로 여러 개 들어오면 각각 분류하고, 같은 분류에 이미 값이 있으면
-    먼저 발견한 값을 유지한다(덮어쓰지 않음). 값이 없거나 예상과 다른 타입이면
-    예외 없이 (빈 문자열, 빈 문자열, 빈 문자열)을 반환한다.
 
-    반환: (homepage, insta, blog) 튜플.
+def _normalize_sido_token(token: str) -> str:
+    """시·도 축약명을 정식 명칭으로 변환한다. 표에 없는 토큰(시·군·구/읍·면·동
+    등)은 원문 그대로 반환한다(임의 변형 없음)."""
+    return _SIDO_CANONICAL_MAP.get(token, token)
+
+
+def _token_matches_common_address(detail_token: str, common_token: str, index: int) -> bool:
+    """detail(도로명/지번주소)의 앞부분이 commonAddress와 같은 행정구역을
+    가리키는지 토큰 단위로 비교한다. index==0(시·도)만 축약/정식 표기 차이를
+    허용하고(_normalize_sido_token으로 양쪽 정규화 후 비교), 그 외(시·군·구/
+    읍·면·동)는 원문 그대로 비교한다 - 시·군·구·동 이름은 축약형이 따로
+    없어 정규화 없이 정확히 같을 때만 중복으로 간주한다(다른 행정구역을
+    잘못 잘라내지 않기 위함)."""
+    if index == 0:
+        return _normalize_sido_token(detail_token) == _normalize_sido_token(common_token)
+    return detail_token == common_token
+
+
+def format_common_address(common_address, road_address, address: str = "") -> str:
+    """업체 entity 자신의 주소 필드만으로 두 모드 공통 주소 문자열을
+    조립한다(요청서 §5) - 검색어(job/query)는 어떤 인자로도 받지 않으므로
+    구조적으로 "검색어 동을 모든 업체에 강제 주입"할 수 없다.
+
+    우선순위: commonAddress(시·도/시·군·구/읍·면·동) + roadAddress(도로명+
+    상세, 없으면 address의 지번주소) 결합. commonAddress의 시·도 토큰만
+    정식 명칭으로 정규화하고(_normalize_sido_token), detail의 시작 토큰이
+    commonAddress와 같은 행정구역을 가리키면(정식/축약 표기 무관) 그 구간만
+    잘라 중복을 제거한다(건물명/층/호수/쉼표 등 나머지 토큰은 그대로 보존).
+    commonAddress가 없으면 detail만(시·도로 보이는 첫 토큰만 정규화 시도)
+    반환하고, 전부 없으면 빈 문자열을 반환한다(예외 없음)."""
+    common_address = str(common_address or "").strip()
+    detail = str(road_address or "").strip() or str(address or "").strip()
+
+    if not common_address:
+        if not detail:
+            return ""
+        tokens = detail.split()
+        if tokens:
+            tokens[0] = _normalize_sido_token(tokens[0])
+        return re.sub(r"\s+", " ", " ".join(tokens)).strip()
+
+    common_tokens = common_address.split()
+    normalized_common_tokens = list(common_tokens)
+    if normalized_common_tokens:
+        normalized_common_tokens[0] = _normalize_sido_token(normalized_common_tokens[0])
+    normalized_common = " ".join(normalized_common_tokens)
+
+    if not detail:
+        return re.sub(r"\s+", " ", normalized_common).strip()
+
+    detail_tokens = detail.split()
+    overlap = 0
+    for i in range(min(len(common_tokens), len(detail_tokens))):
+        if _token_matches_common_address(detail_tokens[i], common_tokens[i], i):
+            overlap = i + 1
+        else:
+            break
+    remaining_detail = " ".join(detail_tokens[overlap:])
+
+    combined = f"{normalized_common} {remaining_detail}".strip() if remaining_detail else normalized_common
+    return re.sub(r"\s+", " ", combined).strip()
+
+
+# ============================================================================
+# 5M-R1 field policy (2026-07-23): 방문자/블로그 리뷰 분리, 개인 휴대전화 차단,
+# 외부 URL 유형별 분리, 새로오픈 tri-state. 실제 GraphQL/Apollo 5M 증거
+# (scratchpad/page300_5m_r1_graphql_field_provenance_audit)에서 확인된 키
+# (visitorReviewsTotal/cafeBlogReviewsTotal/phone/virtualPhone/homepages/
+# newOpening)를 우선 사용하며, 미확인 값은 절대 0/false로 임의 확정하지 않는다.
+# ============================================================================
+
+
+def _normalize_review_count(value):
+    """리뷰수 원시 값을 정수로 정규화한다. bool/음수/비숫자/None/빈 문자열은
+    모두 "미확인"(빈 문자열)으로 취급한다 - 실패를 0으로 바꾸지 않는다."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return value if value >= 0 else ""
+    if isinstance(value, float):
+        if value.is_integer() and value >= 0:
+            return int(value)
+        return ""
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text or not text.isdigit():
+            return ""
+        return int(text)
+    return ""
+
+
+def _compute_total_review_count(visitor, blog):
+    """방문자/블로그 리뷰수가 둘 다 확인된 정수일 때만 합산한다(0도 유효한
+    확인값). 어느 한쪽이라도 미확인("")이면 총리뷰수는 공란이다 - 부분 합계를
+    총리뷰수로 표시하지 않는다."""
+    if isinstance(visitor, bool) or isinstance(blog, bool):
+        return ""
+    if isinstance(visitor, int) and isinstance(blog, int):
+        return visitor + blog
+    return ""
+
+
+# 2026-07-25 field parity 보정: 목록(PlaceListBusinessesItem) entity와
+# 상세(PlaceDetailBase) entity가 리뷰수를 서로 다른 키 이름으로 담고 있음이
+# 실측 확인됐다(scratchpad/page300_5m_r1_graphql_field_provenance_audit/
+# final_report.md 10번 "React Fiber list item visitorReviewCount",
+# review_semantics_audit.md 5개 표본 전부 visitorReviewCount 실측 - 기존
+# visitorReviewsTotal/cafeBlogReviewsTotal는 상세 entity 전용 키였다). 목록
+# 전용 키를 1순위로, 기존 상세 전용 키를 2순위 fallback으로 둬 두 출처
+# 모두 이 하나의 함수로 처리한다.
+_VISITOR_REVIEW_KEYS = ("visitorReviewCount", "visitorReviewsTotal")
+_BLOG_REVIEW_KEYS = ("blogCafeReviewCount", "cafeBlogReviewsTotal")
+
+
+def _first_review_count_value(item: dict, keys):
+    """keys 순서대로 item에 '키가 실제로 존재하는' 첫 값을 원본 그대로
+    반환한다(값이 0이어도 유효한 확인값이므로 dict.get 기본값 대신 in으로
+    존재 자체를 확인한다). 어느 키도 없으면 None(미확인)을 반환한다."""
+    for key in keys:
+        if key in item:
+            return item[key]
+    return None
+
+
+# 개인 휴대전화 prefix(공백/괄호/하이픈 제거 후 판정). 국제표기(+82-10...)는
+# 국가코드가 선행 0을 대체하므로 "82" + 10/11/16/17/18/19로 별도 판정한다.
+_PERSONAL_MOBILE_PREFIXES = ("010", "011", "016", "017", "018", "019")
+_PERSONAL_MOBILE_INTL_PREFIXES = ("10", "11", "16", "17", "18", "19")
+
+
+def _is_personal_mobile_phone(value) -> bool:
+    """010/011/016~019(국내) 또는 +82-10 등(국제, 82 다음이 10/11/16~19)
+    개인 휴대전화 형식인지 판정한다. 050/0507 안심번호, 02/031 지역번호,
+    070 인터넷전화, 1588 등 대표번호는 이 판정에 해당하지 않는다."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if not digits:
+        return False
+    if digits[:3] in _PERSONAL_MOBILE_PREFIXES:
+        return True
+    if digits[:2] == "82" and digits[2:4] in _PERSONAL_MOBILE_INTL_PREFIXES:
+        return True
+    return False
+
+
+# 5M 증거로 확인된 전화 후보 키 우선순위: 공식 phone -> tel -> virtualPhone(0507)
+# -> virtualTel(미확인 후보, 하위호환용) -> 공란. 각 후보는 개인 휴대전화
+# 필터를 통과해야 채택된다(요청서 §7/§8).
+_OFFICIAL_PHONE_KEY_PRIORITY = ("phone", "tel", "virtualPhone", "virtualTel")
+
+
+def _resolve_official_phone(item: dict) -> tuple:
+    """item에서 대표전화를 우선순위대로 선택하고, 개인 휴대전화는 걸러낸다.
+
+    반환: (phone, filtered_count). phone은 채택된 값(없으면 ""), filtered_count는
+    이번 호출에서 개인 휴대전화로 판정되어 폐기된 후보 개수(원문은 어디에도
+    보존하지 않고 건수만 반환한다 - 로그/진단에는 PERSONAL_MOBILE_FILTERED와
+    건수만 노출해야 한다는 정책과 일치).
+    """
+    filtered_count = 0
+    for key in _OFFICIAL_PHONE_KEY_PRIORITY:
+        raw = item.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if _is_personal_mobile_phone(text):
+            filtered_count += 1
+            continue
+        return text, filtered_count
+    return "", filtered_count
+
+
+def _resolve_new_open_tristate(item: dict) -> str:
+    """newOpening(boolean, 5M 증거 확인 키) 기반 tri-state 판정.
+    True -> "O", False -> "X", None 또는 키 없음 -> "" (미확인/공란).
+    """
+    if "newOpening" not in item:
+        return ""
+    value = item.get("newOpening")
+    if value is True:
+        return "O"
+    if value is False:
+        return "X"
+    return ""
+
+
+# 홈페이지로 분류하지 않을 네이버 내부/광고 URL(예약/주문/스마트스토어/지도/
+# 플레이스/광고 리다이렉트). exact hostname 또는 그 서브도메인만 제외한다.
+_EXCLUDED_HOMEPAGE_HOSTS = (
+    "map.naver.com",
+    "pcmap.place.naver.com",
+    "m.place.naver.com",
+    "place.naver.com",
+    "booking.naver.com",
+    "order.naver.com",
+    "smartstore.naver.com",
+    "adcr.naver.com",
+    # 2026-07-23 5O 감사(S5 표본)에서 카카오톡채널 URL이 홈페이지로 오분류된
+    # 사례가 실측 확인되어 제외 목록에 추가.
+    "pf.kakao.com",
+)
+_INSTAGRAM_HOSTS = ("instagram.com", "www.instagram.com", "m.instagram.com")
+_BLOG_HOSTS = ("blog.naver.com",)
+_URL_TYPE_LABEL_MAP = {"인스타그램": "insta", "블로그": "blog", "홈페이지": "homepage"}
+_TRACKING_QUERY_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid"}
+
+
+def _normalize_external_url(raw) -> str:
+    """URL을 정규화한다: tel:/mailto:/javascript: 거부, scheme 없는 명백한
+    도메인만 https:// 보정, hostname 소문자화, 추적 파라미터 제거, fragment
+    제거, 알려진 네이버 내부/예약/주문/광고 hostname 거부. 유효하지 않으면
+    빈 문자열을 반환한다(예외 없음)."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if low.startswith(("tel:", "mailto:", "javascript:")):
+        return ""
+    if not low.startswith(("http://", "https://")):
+        if " " in text or "." not in text:
+            return ""
+        text = "https://" + text
+
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    hostname = parsed.hostname.lower()
+    if any(hostname == host or hostname.endswith("." + host) for host in _EXCLUDED_HOMEPAGE_HOSTS):
+        return ""
+
+    kept_query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in _TRACKING_QUERY_PARAMS]
+    path = parsed.path.rstrip("/") or parsed.path
+    return urlunsplit((parsed.scheme, hostname, path, urlencode(kept_query), ""))
+
+
+def _classify_single_url(url, type_label=None) -> tuple:
+    """URL 하나를 (category, normalized_url)로 분류한다. category는
+    "insta"/"blog"/"homepage" 중 하나이며, 무효 URL이면 (None, None)을
+    반환한다. type_label(응답이 이미 제공하는 한글 라벨)을 1차 기준으로,
+    hostname을 보조 기준으로 사용한다."""
+    normalized = _normalize_external_url(url)
+    if not normalized:
+        return None, None
+    if type_label:
+        mapped = _URL_TYPE_LABEL_MAP.get(str(type_label).strip())
+        if mapped:
+            return mapped, normalized
+    hostname = (urlsplit(normalized).hostname or "").lower()
+    if hostname in _INSTAGRAM_HOSTS:
+        return "insta", normalized
+    if hostname in _BLOG_HOSTS:
+        return "blog", normalized
+    return "homepage", normalized
+
+
+def _iter_url_candidates(value, depth: int = 0):
+    """homepages{repr, etc[]} 객체, 문자열, 문자열 리스트, {url}/{link}/
+    {type,url} 객체, 중첩 리스트에서 (url, type_label) 후보를 depth<=2까지만
+    순회한다(무제한 재귀 금지)."""
+    if depth > 2 or value is None:
+        return
+    if isinstance(value, str):
+        if value:
+            yield value, None
+    elif isinstance(value, dict):
+        if "repr" in value or "etc" in value:
+            if value.get("repr") is not None:
+                yield from _iter_url_candidates(value["repr"], depth + 1)
+            for entry in value.get("etc") or []:
+                yield from _iter_url_candidates(entry, depth + 1)
+            return
+        url = value.get("url") or value.get("link") or value.get("landingUrl")
+        type_label = value.get("type") or value.get("typeI18n")
+        if url:
+            yield url, type_label
+    elif isinstance(value, (list, tuple)):
+        for entry in value:
+            yield from _iter_url_candidates(entry, depth + 1)
+
+
+def _extract_external_urls(item: dict) -> tuple:
+    """item에서 홈페이지/인스타/블로그를 추출·분류한다. homepages(5M 증거
+    확인 구조), naverBlog, 기존 homePage류 후보 필드를 모두 수집해 type_label
+    우선 -> hostname 보조 순으로 분류하고, 동일 정규화 URL은 중복 제거한다.
+    같은 분류에 이미 값이 있으면 먼저 찾은 값을 유지한다(덮어쓰지 않음).
     """
     homepage = ""
     insta = ""
     blog = ""
+    seen_urls: set = set()
 
-    if isinstance(raw_value, str):
-        candidates = [raw_value] if raw_value else []
-    elif isinstance(raw_value, (list, tuple)):
-        candidates = [v for v in raw_value if isinstance(v, str) and v]
-    else:
-        candidates = []
+    sources = []
+    if "homepages" in item and item["homepages"] is not None:
+        sources.append(item["homepages"])
+    if "naverBlog" in item and item["naverBlog"] is not None:
+        sources.append(item["naverBlog"])
+    # snsList: 5M 증거에는 실존하지 않음(homepages.etc[]로 통합 확인됨)이나,
+    # 응답 구조 변경 대비 방어적으로 키가 있으면 동일하게 처리한다.
+    if "snsList" in item and item["snsList"] is not None:
+        sources.append(item["snsList"])
+    legacy_raw = _first_raw_value(item, _FIELD_KEY_CANDIDATES["홈페이지"])
+    if legacy_raw is not None:
+        sources.append(legacy_raw)
 
-    for url in candidates:
-        low = url.lower()
-        if "instagram.com" in low:
-            insta = insta or url
-        elif "blog.naver.com" in low or low.startswith("https://blog.") or ".blog." in low:
-            blog = blog or url
-        elif not homepage:
-            homepage = url
+    for source in sources:
+        for url, type_label in _iter_url_candidates(source):
+            category, normalized = _classify_single_url(url, type_label)
+            if not category or not normalized or normalized in seen_urls:
+                continue
+            seen_urls.add(normalized)
+            if category == "insta" and not insta:
+                insta = normalized
+            elif category == "blog" and not blog:
+                blog = normalized
+            elif category == "homepage" and not homepage:
+                homepage = normalized
 
     return homepage, insta, blog
 
@@ -282,42 +597,51 @@ def _map_item_to_row(
     source_dong: str | None = None,
     source_query: str | None = None,
 ) -> dict:
-    """네트워크 응답의 업체 item 하나를 기존 Excel 11컬럼 row(dict)로 매핑한다.
+    """네트워크 응답의 업체 item 하나를 exporter.MERGED_COLUMNS(13컬럼)
+    row(dict)로 매핑한다(5M-R1: 리뷰 방문자/블로그 분리, 개인 휴대전화 차단,
+    URL 유형별 분리, 새로오픈 tri-state - scratchpad/page300_5m_r1_graphql_
+    field_provenance_audit에서 확인된 실제 키 사용).
 
     입력: item(dict, 응답에서 추출된 업체 하나), collected_at(수집일 문자열),
     source_page(선택, PoC-2: 어느 page 응답에서 나왔는지), source_dong(선택,
     PoC-4: 어느 동 검색어에서 나왔는지), source_query(선택, PoC-4: 실제 사용된
     전체 검색어 문자열) - 전부 디버그/집계용으로만 남기고 싶을 때 전달한다.
-    출력: exporter.MERGED_COLUMNS(11컬럼)와 동일한 키를 가진 dict + 내부 필드
-    place_id(+전달된 source_* 필드들). 이 내부 필드들은 dedup/디버그용일 뿐이며,
-    exporter가 MERGED_COLUMNS로만 투영하므로 Excel에는 노출되지 않는다
-    (detail_scraper 경로와 동일한 관례). 셋 다 미전달 시 기존 PoC-1/PoC-2
+    출력: exporter.MERGED_COLUMNS와 동일한 키를 가진 dict + 내부 필드
+    place_id(+전달된 source_* 필드들 + _personal_mobile_filtered_count).
+    이 내부 필드들은 dedup/진단용일 뿐이며, exporter가 MERGED_COLUMNS로만
+    투영하므로 Excel에는 노출되지 않는다. 셋 다 미전달 시 기존 PoC-1/PoC-2
     호출과 완전히 하위 호환된다(row에 해당 키 자체가 생기지 않음).
 
-    새로오픈여부는 리스트 응답만으로는 신뢰할 수 있는 값을 확인하지 못해 PoC
-    단계에서는 항상 빈칸이다(추후 응답 구조 추가 확인 후 채울 후보). 홈페이지/
-    인스타/블로그는 homePage류 필드 값을 도메인 기준으로 분류해 채운다
-    (_classify_external_links, PoC-1.1) - 응답에 값이 없으면 그대로 전부 빈칸.
+    리스트 응답에는 방문자/블로그 리뷰·전화·홈페이지·새로오픈 필드가 없는
+    경우가 대부분임이 5M 증거로 확인됐다 - 이 경우 아래 헬퍼들은 모두
+    안전하게 공란/미확인을 반환한다(추측으로 채우지 않는다).
     """
     if not isinstance(item, dict):
         item = {}
 
-    homepage_raw = _first_raw_value(item, _FIELD_KEY_CANDIDATES["홈페이지"])
-    homepage, insta, blog = _classify_external_links(homepage_raw)
+    homepage, insta, blog = _extract_external_urls(item)
+    visitor_reviews = _normalize_review_count(_first_review_count_value(item, _VISITOR_REVIEW_KEYS))
+    blog_reviews = _normalize_review_count(_first_review_count_value(item, _BLOG_REVIEW_KEYS))
+    total_reviews = _compute_total_review_count(visitor_reviews, blog_reviews)
+    phone, personal_mobile_filtered_count = _resolve_official_phone(item)
 
     row = {
         "업체명": _first_present(item, _FIELD_KEY_CANDIDATES["업체명"]),
         "업종": _extract_category(item),
-        "새로오픈여부": "",  # PoC 단계: 신뢰할 수 있는 필드 미확인
-        "리뷰수": _first_present(item, _REVIEW_COUNT_KEY_CANDIDATES),
-        "주소": _first_present(item, _FIELD_KEY_CANDIDATES["주소"]),
-        "대표전화": _first_present(item, _FIELD_KEY_CANDIDATES["대표전화"]),
+        "새로오픈여부": _resolve_new_open_tristate(item),
+        "방문자리뷰수": visitor_reviews,
+        "블로그리뷰수": blog_reviews,
+        "총리뷰수": total_reviews,
+        "주소": format_common_address(item.get("commonAddress"), item.get("roadAddress"), item.get("address")),
+        "대표전화": phone,
         "플레이스 URL": _build_place_url(item),
         "수집일": collected_at,
         "홈페이지": homepage,
         "인스타": insta,
         "블로그": blog,
         "place_id": _first_present(item, _ID_KEY_CANDIDATES),
+        "roadAddress": _first_present(item, ("roadAddress",)),
+        "_personal_mobile_filtered_count": personal_mobile_filtered_count,
     }
     if source_page is not None:
         row["source_page"] = source_page
@@ -828,12 +1152,116 @@ def build_place_url_from_id(place_id) -> str:
     return f"https://pcmap.place.naver.com/place/{text}/home"
 
 
+# ============================================================================
+# 5O(2026-07-23): Apollo State 정규화 엔티티 adapter. 상세 페이지 방문 시
+# window.__APOLLO_STATE__에 채워지는 `PlaceDetailBase:{id}`(base)와 ROOT_QUERY의
+# `placeDetail({"input":{...}})`(parent)를 exact place_id/`__ref` 기준으로만
+# 결합해 기존 `_map_item_to_row()`가 소비할 수 있는 flat dict로 변환한다.
+# 5O 감사(scratchpad/page300_5o_real_apollo_parser_integration_audit)의
+# joined_entity_replay_results.json이 이 결합 방식으로 5/5 raw 표본 정확히
+# 일치함을 확인했다. 리뷰 합산/URL 분류/전화 필터는 여기서 만들지 않고 그대로
+# _map_item_to_row에 위임한다(중복 구현 금지).
+# ============================================================================
+
+_APOLLO_BASE_KEY_PREFIX = "PlaceDetailBase:"
+_APOLLO_ROOT_QUERY_KEY = "ROOT_QUERY"
+_APOLLO_PARENT_KEY_TOKEN = "placeDetail("
+_APOLLO_BASE_FIELDS = (
+    "id", "name", "category", "roadAddress", "address", "commonAddress", "phone", "virtualPhone",
+    "visitorReviewsTotal", "cafeBlogReviewsTotal", "naverBlog",
+)
+_APOLLO_PARENT_FIELDS = ("homepages", "newOpening", "phoneInfo")
+
+
+def _select_apollo_parent(apollo_state: dict, base_key: str, normalized_id: str):
+    """ROOT_QUERY에서 base_key를 exact 참조하는 parent PlaceDetail entity를
+    선택한다. 후보 key는 "placeDetail(" 토큰과 quoted place_id를 모두 포함해야
+    하며, 값이 `{"__ref": "..."}` 형태면 apollo_state에서 딱 1단계만 해석한다
+    (무제한 traversal/순환 참조 방지 - 그 이상 재귀하지 않음). exact
+    `base.__ref == base_key`인 후보가 정확히 1개일 때만 채택하고, 0개나
+    충돌(2개 이상)이면 None을 반환해 parent를 사용하지 않는다(임의 선택 금지,
+    stale entity가 섞여 있어도 exact 조건으로 자동 배제됨)."""
+    root_query = apollo_state.get(_APOLLO_ROOT_QUERY_KEY)
+    if not isinstance(root_query, dict):
+        return None
+
+    quoted_id = f'"{normalized_id}"'
+    exact_matches = []
+    for key, value in root_query.items():
+        if not isinstance(key, str) or _APOLLO_PARENT_KEY_TOKEN not in key or quoted_id not in key:
+            continue
+
+        candidate = value
+        if isinstance(candidate, dict) and isinstance(candidate.get("__ref"), str) and "__ref" in candidate:
+            resolved = apollo_state.get(candidate["__ref"])
+            candidate = resolved if isinstance(resolved, dict) else None
+
+        if not isinstance(candidate, dict):
+            continue
+        base_ref_obj = candidate.get("base")
+        if not isinstance(base_ref_obj, dict) or base_ref_obj.get("__ref") != base_key:
+            continue
+        exact_matches.append(candidate)
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    return None
+
+
+def extract_normalized_apollo_detail(apollo_state, place_id) -> dict:
+    """Apollo State 정규화 캐시에서 place_id에 해당하는 PlaceDetailBase(base)와
+    exact 일치하는 parent PlaceDetail을 결합해 flat dict를 반환한다.
+
+    입력 검증(요청서 §4): apollo_state가 dict가 아니면 {}, place_id가 숫자
+    형식이 아니면 {}, base entity가 없거나 dict가 아니면 {}, base entity의
+    id가 존재하는데 요청 place_id와 다르면 {}(다른 업체 데이터 차단). Parent가
+    없어도 base만 있으면 base 필드만 반환한다.
+
+    반환값은 새 dict이며 원본 apollo_state/entity를 mutate하지 않는다(필요한
+    필드만 복사). Apollo State 전체나 무관한 entity를 반환하지 않는다."""
+    if not isinstance(apollo_state, dict):
+        return {}
+
+    normalized_id = _normalize_text(place_id)
+    if not _DIGIT_ONLY_PATTERN.match(normalized_id):
+        return {}
+
+    base_key = f"{_APOLLO_BASE_KEY_PREFIX}{normalized_id}"
+    base_entity = apollo_state.get(base_key)
+    if not isinstance(base_entity, dict):
+        return {}
+
+    base_id = base_entity.get("id")
+    if base_id not in (None, "") and _normalize_text(base_id) != normalized_id:
+        return {}
+
+    result: dict = {}
+    for field in _APOLLO_BASE_FIELDS:
+        if field in base_entity:
+            result[field] = base_entity[field]
+    result["id"] = normalized_id
+
+    parent = _select_apollo_parent(apollo_state, base_key, normalized_id)
+    if isinstance(parent, dict):
+        for field in _APOLLO_PARENT_FIELDS:
+            if field in parent:
+                result[field] = parent[field]
+
+    return result
+
+
 def merge_detail_into_row(row: dict, detail_result: dict) -> dict:
     """이미 확정된 최종 row에 상세 페이지 결과(detail_result)를 사후 병합한다.
     place_id 또는 normalized place URL이 정확히 일치할 때만 병합하고, 업체명만
     으로는 병합하지 않는다(요청서 §4 - 업체명만 같은 다른 지점 오염 방지).
     detail_result가 없거나 성공하지 못했으면 row를 그대로 반환한다(row 삭제
-    금지 - 실패해도 기존 값 보존)."""
+    금지 - 실패해도 기존 값 보존).
+
+    5O(2026-07-23): 방문자/블로그 리뷰수와 새로오픈여부 병합을 추가한다(기존에는
+    두 필드를 전혀 다루지 않던 gap). 리뷰수는 detail_result가 확인한 값만
+    개별 반영하고(한쪽만 확인돼도 그것만 갱신), 총리뷰수는 항상
+    _compute_total_review_count로 재계산한다(중복 합산 로직 없음). 새로오픈은
+    row가 이미 값을 가지고 있으면(목록에서 확정된 "O" 등) 덮어쓰지 않는다."""
     if not detail_result or not detail_result.get("detail_success"):
         return row
     detail_place_id = _normalize_text(detail_result.get("place_id"))
@@ -846,8 +1274,9 @@ def merge_detail_into_row(row: dict, detail_result: dict) -> dict:
         return row
 
     merged = dict(row)
-    if detail_result.get("대표전화"):
-        merged["대표전화"] = detail_result["대표전화"]
+    detail_phone = detail_result.get("대표전화")
+    if detail_phone and not _is_personal_mobile_phone(detail_phone):
+        merged["대표전화"] = detail_phone
     if detail_result.get("주소"):
         merged["주소"] = detail_result["주소"]
     if detail_result.get("플레이스 URL"):
@@ -858,23 +1287,44 @@ def merge_detail_into_row(row: dict, detail_result: dict) -> dict:
         merged["인스타"] = detail_result["인스타"]
     if detail_result.get("블로그"):
         merged["블로그"] = detail_result["블로그"]
+
+    detail_visitor = detail_result.get("방문자리뷰수")
+    detail_blog = detail_result.get("블로그리뷰수")
+    visitor_confirmed = isinstance(detail_visitor, int) and not isinstance(detail_visitor, bool)
+    blog_confirmed = isinstance(detail_blog, int) and not isinstance(detail_blog, bool)
+    if visitor_confirmed or blog_confirmed:
+        if visitor_confirmed:
+            merged["방문자리뷰수"] = detail_visitor
+        if blog_confirmed:
+            merged["블로그리뷰수"] = detail_blog
+        merged["총리뷰수"] = _compute_total_review_count(merged.get("방문자리뷰수"), merged.get("블로그리뷰수"))
+
+    if detail_result.get("새로오픈여부") and not merged.get("새로오픈여부"):
+        merged["새로오픈여부"] = detail_result["새로오픈여부"]
+
     return merged
 
 
 def merge_dom_row_fields(
     dom_row: dict, network_result: dict, apollo_result: dict, collected_at: str, detail_result: dict = None
 ) -> dict:
-    """필드 우선순위(요청서 §3, PAGE300-DETAIL-1로 갱신): 업체명은 항상 DOM 값.
-    업종은 DOM -> Network/Apollo -> 상세정보. 새로오픈여부는 DOM raw_text 판정
-    (기존 parser.detect_new_open_pc 재사용). 리뷰수는 Network 구조화값 ->
-    DOM raw_text(parser.extract_review_count_pc). 주소는 Network/Apollo(기존
+    """필드 우선순위(요청서 §3, PAGE300-DETAIL-1/5M-R1로 갱신): 업체명은 항상
+    DOM 값. 업종은 DOM -> Network/Apollo -> 상세정보. 새로오픈여부는 DOM
+    raw_text 판정(목록 뱃지, 기존 parser.detect_new_open_pc 재사용) ->
+    Network 구조화값(newOpening tri-state) -> 상세정보. 방문자/블로그
+    리뷰수는 Network/Apollo 구조화값만 사용한다(DOM raw_text 정규식은 방문자/
+    블로그를 구분할 수 없는 값이라 사용하지 않음 - 오귀속 방지). 총리뷰수는
+    최종 방문자/블로그 값으로 매번 재계산한다. 주소는 Network/Apollo(기존
     유지) -> 상세정보 -> DOM raw_text(parser.extract_address_from_pc_text).
-    대표전화/홈페이지/인스타/블로그는 상세정보 우선(Network/Apollo에는 이
-    필드가 없음이 실측 확인됨). 플레이스 URL은 상세정보로 확인된 실제 URL ->
-    DOM anchor href -> place_id로 구성한 범용 URL(build_place_url_from_id) ->
-    빈값. detail_result는 이번 호출 시점에 없을 수 있다(None, 기본값) - 이
-    함수 자체는 상세 페이지를 방문하지 않으며, 상세 병합은 detail_result가
-    이미 확보된 경우에만 이 우선순위에 반영된다(추가 상세 병합은
+    대표전화는 상세정보 -> Network(이미 개인 휴대전화 필터를 거친 값) 순이며,
+    이 함수에서 개인 휴대전화 안전망을 한 번 더 적용한다(상세정보 경로는
+    DOM entryIframe 스크레이핑이라 아직 필터를 거치지 않았으므로). 홈페이지/
+    인스타/블로그는 상세정보 우선(Network/Apollo에는 이 필드가 없음이 실측
+    확인됨). 플레이스 URL은 상세정보로 확인된 실제 URL -> DOM anchor href ->
+    place_id로 구성한 범용 URL(build_place_url_from_id) -> 빈값.
+    detail_result는 이번 호출 시점에 없을 수 있다(None, 기본값) - 이 함수
+    자체는 상세 페이지를 방문하지 않으며, 상세 병합은 detail_result가 이미
+    확보된 경우에만 이 우선순위에 반영된다(추가 상세 병합은
     merge_detail_into_row로 사후에도 가능)."""
     network_row = (network_result or {}).get("row") or {}
     apollo_row = (apollo_result or {}).get("row") or {}
@@ -888,19 +1338,36 @@ def merge_dom_row_fields(
                 return normalized
         return ""
 
+    def _pick_numeric(*value_sources):
+        for value in value_sources:
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return ""
+
+    def _finalize_phone(value):
+        text = _normalize_text(value)
+        if not text or _is_personal_mobile_phone(text):
+            return ""
+        return text
+
     place_url = _pick(
         detail_row.get("플레이스 URL") if detail_row.get("detail_success") else "",
         dom_row.get("place_url"),
         build_place_url_from_id(dom_row.get("place_id")),
     )
 
+    visitor_reviews = _pick_numeric(network_row.get("방문자리뷰수"), apollo_row.get("visitorReviewsTotal"))
+    blog_reviews = _pick_numeric(network_row.get("블로그리뷰수"), apollo_row.get("cafeBlogReviewsTotal"))
+
     row = {
         "업체명": dom_row.get("normalized_name") or "",
         "업종": _pick(dom_row.get("category"), network_row.get("업종"), apollo_row.get("category"), detail_row.get("업종")),
-        "새로오픈여부": _pick(raw_fallback["new_open_guess"], detail_row.get("새로오픈여부")),
-        "리뷰수": _pick(network_row.get("리뷰수"), apollo_row.get("review_count"), raw_fallback["review_count_guess"]),
+        "새로오픈여부": _pick(raw_fallback["new_open_guess"], network_row.get("새로오픈여부"), detail_row.get("새로오픈여부")),
+        "방문자리뷰수": visitor_reviews,
+        "블로그리뷰수": blog_reviews,
+        "총리뷰수": _compute_total_review_count(visitor_reviews, blog_reviews),
         "주소": _pick(network_row.get("주소"), apollo_row.get("address"), detail_row.get("주소"), dom_row.get("address_text"), raw_fallback["address_guess"]),
-        "대표전화": _pick(detail_row.get("대표전화"), network_row.get("대표전화")),
+        "대표전화": _finalize_phone(_pick(detail_row.get("대표전화"), network_row.get("대표전화"))),
         "플레이스 URL": place_url,
         "수집일": collected_at,
         "홈페이지": _pick(detail_row.get("홈페이지"), network_row.get("홈페이지")),
@@ -1008,3 +1475,112 @@ def trim_membership_rows_to_target(rows: list, target: int) -> list:
     if not target or target <= 0:
         return list(rows)
     return list(rows[:target])
+
+
+class GlobalPlaceAccumulator:
+    """수집 세션(쿼리 1회) 동안 발생한 Network response entity들을
+    place_id 키 기준으로 전역 누적/보강하는 클래스.
+    """
+
+    def __init__(self, collected_at: str = ""):
+        self.collected_at = collected_at
+        self.accumulated: dict[str, dict] = {}
+        self.observation_count: int = 0
+        self.duplicate_count: int = 0
+        # PERSONAL_MOBILE_FILTERED: 원문 번호는 저장하지 않고 건수만 누적한다.
+        self.personal_mobile_filtered_count: int = 0
+
+    def add_raw_item(self, item: dict, source_page: int | None = None, source_query: str | None = None) -> bool:
+        """네트워크 response에서 추출된 raw dict item 하나를 누적한다.
+        place_id가 없으면 accumulator에 추가하지 않는다. 업체명 단독 병합 금지.
+        """
+        if not isinstance(item, dict):
+            return False
+        self.observation_count += 1
+        row = _map_item_to_row(item, self.collected_at, source_page=source_page, source_query=source_query)
+        return self.add_mapped_row(row)
+
+    def add_mapped_row(self, row: dict) -> bool:
+        """이미 매핑된 row(dict)를 place_id 키로 누적한다."""
+        if not isinstance(row, dict):
+            return False
+        self.personal_mobile_filtered_count += int(row.get("_personal_mobile_filtered_count") or 0)
+        place_id = _normalize_text(row.get("place_id"))
+        if not place_id or not _DIGIT_ONLY_PATTERN.match(place_id):
+            return False
+
+        if place_id not in self.accumulated:
+            self.accumulated[place_id] = dict(row)
+            return True
+
+        self.duplicate_count += 1
+        existing = self.accumulated[place_id]
+
+        # 도로명주소 보강 우선권 처리
+        new_road = _normalize_text(row.get("roadAddress"))
+        if new_road:
+            existing["roadAddress"] = new_road
+            existing["주소"] = new_road
+
+        # 비파괴적(non-destructive) 필드 보강: 기존 유효 값은 유지하고 비어있는 필드만 채움
+        # (int 0도 "값 있음"으로 정확히 처리됨 - 0 not in (None, "", [])).
+        for key, val in row.items():
+            if val not in (None, "", []):
+                if existing.get(key) in (None, "", []):
+                    existing[key] = val
+
+        # 총리뷰수는 병합된 최종 방문자/블로그 리뷰수 기준으로 매번 재계산한다
+        # (요청서 §11 - 스테일 값으로 남기지 않는다).
+        existing["총리뷰수"] = _compute_total_review_count(existing.get("방문자리뷰수"), existing.get("블로그리뷰수"))
+        return False
+
+    def get_row(self, place_id: str) -> dict | None:
+        norm_id = _normalize_text(place_id)
+        return self.accumulated.get(norm_id)
+
+    def get_all_rows(self) -> list[dict]:
+        return list(self.accumulated.values())
+
+    def merge_into_dom_rows(self, dom_rows: list[dict]) -> list[dict]:
+        """고유 DOM rows 리스트에 누적된 place_id entities를 exact matching으로 최종 병합한다.
+        DOM row 수와 순서를 100% 보존하며, place_id가 매칭될 경우 비어있는 필드 및 도로명주소를 보강한다.
+        """
+        if not dom_rows:
+            return []
+
+        merged_result = []
+        for dom_row in dom_rows:
+            place_id = _normalize_text(dom_row.get("place_id"))
+            net_row = self.accumulated.get(place_id) if place_id else None
+            if not net_row:
+                merged_result.append(dom_row)
+                continue
+
+            updated = dict(dom_row)
+
+            # 1. 주소 보강 (Network에서 수신된 도로명/지번주소가 있으면 비파괴 보강)
+            net_addr = _normalize_text(net_row.get("주소"))
+            dom_addr = _normalize_text(updated.get("주소"))
+            if net_addr:
+                if not dom_addr or net_addr != dom_addr:
+                    updated["주소"] = net_addr
+
+            # 2. 기타 주요 필드 보강
+            for field in ("대표전화", "업종", "홈페이지", "인스타", "블로그", "플레이스 URL", "새로오픈여부"):
+                net_val = _normalize_text(net_row.get(field))
+                if net_val and not _normalize_text(updated.get(field)):
+                    updated[field] = net_val
+
+            # 2b. 방문자/블로그 리뷰수는 정수 타입을 보존해야 하므로 별도 처리한다
+            # (int 0을 문자열화해 덮어쓰지 않기 위해 위 루프와 분리).
+            for field in ("방문자리뷰수", "블로그리뷰수"):
+                net_val = net_row.get(field)
+                has_net_val = isinstance(net_val, int) and not isinstance(net_val, bool)
+                existing_val = updated.get(field)
+                has_existing_val = isinstance(existing_val, int) and not isinstance(existing_val, bool)
+                if has_net_val and not has_existing_val:
+                    updated[field] = net_val
+            updated["총리뷰수"] = _compute_total_review_count(updated.get("방문자리뷰수"), updated.get("블로그리뷰수"))
+
+            merged_result.append(updated)
+        return merged_result

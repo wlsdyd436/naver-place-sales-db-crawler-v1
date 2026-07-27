@@ -98,12 +98,14 @@ def _base_result(**overrides) -> dict:
 
 def _fake_row(i: int) -> dict:
     # 실제 network_browser_collector.collect_network_query가 만드는 row와 동일한
-    # 형태(제품 11컬럼 + 내부 place_id/source_* 메타)를 흉내낸다.
+    # 형태(제품 13컬럼 + 내부 place_id/source_* 메타)를 흉내낸다.
     return {
         "업체명": f"업체{i}",
         "업종": "카페",
         "새로오픈여부": "",
-        "리뷰수": str(i),
+        "방문자리뷰수": i,
+        "블로그리뷰수": "",
+        "총리뷰수": "",
         "주소": f"서울 강동구 천호동 {i}",
         "대표전화": "02-0000-0000",
         "플레이스 URL": f"https://pcmap.place.naver.com/place/{i}/home",
@@ -170,11 +172,11 @@ def check_header_matches_merged_columns(reporter: ValidationReporter) -> None:
 
         wb = openpyxl.load_workbook(output_path)
         headers = [cell.value for cell in wb["통합_결과"][1]]
-        ok = headers == MERGED_COLUMNS and len(headers) == 11
+        ok = headers == MERGED_COLUMNS and len(headers) == 13
         if ok:
-            reporter.pass_("11컬럼: 통합_결과 헤더가 MERGED_COLUMNS와 정확히 일치하고 열 수 11개")
+            reporter.pass_("13컬럼: 통합_결과 헤더가 MERGED_COLUMNS와 정확히 일치하고 열 수 13개")
         else:
-            reporter.fail(f"11컬럼 결과가 예상과 다름: headers={headers}")
+            reporter.fail(f"13컬럼 결과가 예상과 다름: headers={headers}")
 
 
 def check_internal_meta_fields_not_in_excel(reporter: ValidationReporter) -> None:
@@ -230,6 +232,76 @@ def check_target_trim_row_count_consistency(reporter: ValidationReporter) -> Non
             reporter.fail(f"target trim 정합성 결과가 예상과 다름: data_row_count={data_row_count}, returned={returned}")
 
 
+def check_basic_mode_never_calls_home_enrichment_fn(reporter: ValidationReporter) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_path = str(Path(tmp_dir) / "out.xlsx")
+        app = _make_app()
+        rows = [_fake_row(0)]
+        result = _base_result(stop_reason="target_reached", final_count=1, rows=rows, before_trim_count=1)
+        fake_orchestrator = _make_fake_orchestrator(result)
+
+        home_calls: list = []
+
+        def fake_home_enrichment_fn(rows, **kwargs):
+            home_calls.append(rows)
+            return {"rows": rows, "stop_reason": None, "security_blocked": False,
+                    "home_success_count": 0, "failure_count": 0, "not_attempted_count": 0}
+
+        app._run_network_pipeline(
+            [{"query": "q1"}], 30, 300, output_path,
+            collection_mode="basic",
+            collector_factory=_fake_collector_factory, orchestrator=fake_orchestrator,
+            excel_exporter=export_places_to_excel, home_enrichment_fn=fake_home_enrichment_fn,
+        )
+        if home_calls == []:
+            reporter.pass_("기본 모드: home_enrichment_fn이 전혀 호출되지 않음")
+        else:
+            reporter.fail(f"기본 모드인데 home_enrichment_fn이 호출됨: {home_calls}")
+
+
+def check_home_sns_mode_calls_home_enrichment_fn_once(reporter: ValidationReporter) -> None:
+    """PAGE300-6A-FIX1: home_enrichment_fn은 더 이상 cookies를 인자로 받지
+    않는다(Native Edge CDP persistent profile 재연결 방식으로 바뀌어 쿠키
+    복사 자체가 불필요해졌으므로) - collector_factory는 기존 FakeNetworkCollector
+    (capture_session_cookies 없음)를 그대로 재사용해도 무방하다."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_path = str(Path(tmp_dir) / "out.xlsx")
+        app = _make_app()
+        rows = [_fake_row(0)]
+        result = _base_result(stop_reason="target_reached", final_count=1, rows=rows, before_trim_count=1)
+        fake_orchestrator = _make_fake_orchestrator(result)
+
+        home_calls: list = []
+        enriched_row = dict(rows[0], 홈페이지="https://enriched.test")
+
+        def fake_home_enrichment_fn(rows_arg, **kwargs):
+            home_calls.append(list(rows_arg))
+            return {"rows": [enriched_row], "stop_reason": None, "security_blocked": False,
+                    "home_success_count": 1, "failure_count": 0, "not_attempted_count": 0}
+
+        returned = app._run_network_pipeline(
+            [{"query": "q1"}], 30, 300, output_path,
+            collection_mode="home_sns",
+            collector_factory=_fake_collector_factory, orchestrator=fake_orchestrator,
+            excel_exporter=export_places_to_excel, home_enrichment_fn=fake_home_enrichment_fn,
+        )
+
+        wb = openpyxl.load_workbook(output_path)
+        header = [cell.value for cell in wb["통합_결과"][1]]
+        homepage_col = header.index("홈페이지") + 1
+        saved_homepage = wb["통합_결과"].cell(row=2, column=homepage_col).value
+
+        ok = (
+            len(home_calls) == 1
+            and returned["home_success_count"] == 1
+            and saved_homepage == "https://enriched.test"
+        )
+        if ok:
+            reporter.pass_("홈페이지·SNS 모드: home_enrichment_fn이 정확히 1회 호출되고 Excel에 보강된 rows가 반영됨")
+        else:
+            reporter.fail(f"홈페이지·SNS 모드 결과가 예상과 다름: home_calls={home_calls}, returned={returned}, saved_homepage={saved_homepage}")
+
+
 def check_zero_rows_no_file_created(reporter: ValidationReporter) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_path = str(Path(tmp_dir) / "out.xlsx")
@@ -255,6 +327,8 @@ def main() -> int:
     check_internal_meta_fields_not_in_excel(reporter)
     check_empty_original_sheets(reporter)
     check_target_trim_row_count_consistency(reporter)
+    check_basic_mode_never_calls_home_enrichment_fn(reporter)
+    check_home_sns_mode_calls_home_enrichment_fn_once(reporter)
     check_zero_rows_no_file_created(reporter)
 
     reporter.summary()
