@@ -11,6 +11,8 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.exporter import MERGED_COLUMNS
 from src.pc.network_list_scraper import (
+    _classify_single_url,
+    _extract_external_urls,
     _extract_list_items,
     _map_item_to_row,
     build_candidate_record,
@@ -894,6 +896,244 @@ def check_should_stop_for_target_non_positive_target_is_false(reporter: Validati
         reporter.fail("target<=0 처리 결과가 예상과 다름")
 
 
+# ---------------------------------------------------------------------------
+# PAGE300-6E-V3: 대표 3링크 + 추가 링크 보존, hostname 교정, dedup, 제외 URL,
+# 주소 행정동 중복 제거 검증
+# ---------------------------------------------------------------------------
+
+
+def check_butteron_instagram_type_mismatch_fixture(reporter: ValidationReporter) -> None:
+    """실제 결함(A): type="홈페이지"인데 hostname이 instagram.com이면 hostname이
+    우선해 인스타로 분류되어야 하고, igshid 추적 파라미터는 제거되어야 한다."""
+    item = {
+        "id": "5001",
+        "name": "버터온",
+        "homepages": {
+            "repr": {"url": "https://instagram.com/butteron_?igshid=abc123", "type": "홈페이지"},
+            "etc": [],
+        },
+    }
+    row = _map_item_to_row(item, "2026-07-27")
+    ok = (
+        row["홈페이지"] == ""
+        and row["인스타"] == "https://instagram.com/butteron_"
+        and row["블로그"] == ""
+        and row["추가 링크"] == ""
+    )
+    if ok:
+        reporter.pass_("버터온 fixture: type=홈페이지+instagram.com hostname이 인스타로 정확히 교정되고 igshid 제거됨")
+    else:
+        reporter.fail(f"버터온 fixture 결과가 예상과 다름: 홈페이지={row['홈페이지']!r}, 인스타={row['인스타']!r}, 추가 링크={row['추가 링크']!r}")
+
+
+def check_kakao_channel_hostname_corrected_and_sent_to_extra_links(reporter: ValidationReporter) -> None:
+    """type="홈페이지"인데 hostname이 pf.kakao.com이면 카카오채널로 분류되고,
+    카카오채널은 대표 홈페이지로 승격되지 않고 추가 링크에만 저장된다."""
+    item = {"id": "5002", "name": "카카오채널 업체", "homepages": {"repr": {"url": "https://pf.kakao.com/_example", "type": "홈페이지"}, "etc": []}}
+    row = _map_item_to_row(item, "2026-07-27")
+    ok = (
+        row["홈페이지"] == ""
+        and row["추가 링크"] == "[카카오채널] https://pf.kakao.com/_example"
+    )
+    if ok:
+        reporter.pass_("type=홈페이지+pf.kakao.com hostname이 카카오채널로 교정되고 홈페이지 열로 승격되지 않음")
+    else:
+        reporter.fail(f"카카오채널 교정 결과가 예상과 다름: 홈페이지={row['홈페이지']!r}, 추가 링크={row['추가 링크']!r}")
+
+
+def check_smartstore_classified_and_preserved_in_extra_links(reporter: ValidationReporter) -> None:
+    """스마트스토어는 완전히 제외하지 않고 공개 판매 채널로 분류해 추가 링크에 보존한다."""
+    _, _, _, extra = _extract_external_urls({"homepages": {"repr": {"url": "https://smartstore.naver.com/example"}, "etc": []}})
+    if extra == "[스마트스토어] https://smartstore.naver.com/example":
+        reporter.pass_("스마트스토어 URL이 제외되지 않고 [스마트스토어] 라벨로 추가 링크에 보존됨")
+    else:
+        reporter.fail(f"스마트스토어 분류 결과가 예상과 다름: {extra!r}")
+
+
+def check_multi_url_five_candidates_no_loss(reporter: ValidationReporter) -> None:
+    """B(구조): repr 1개 + etc 4개(총 5개 외부 URL)를 끝까지 순회해 누락 0건,
+    대표 홈페이지/인스타/블로그 각 1개, 나머지 2개가 추가 링크에 줄바꿈으로 저장됨."""
+    item = {
+        "id": "5003",
+        "name": "다중 링크 업체",
+        "homepages": {
+            "repr": {"url": "https://cafe-k.example.com", "type": "홈페이지"},
+            "etc": [
+                {"url": "https://www.instagram.com/cafe_k", "type": "인스타그램"},
+                {"url": "https://blog.naver.com/cafe_k", "type": "블로그"},
+                {"url": "https://pf.kakao.com/_cafek", "type": "홈페이지"},
+                {"url": "https://youtube.com/@cafe_k", "type": "홈페이지"},
+            ],
+        },
+    }
+    row = _map_item_to_row(item, "2026-07-27")
+    extra_lines = row["추가 링크"].split("\n") if row["추가 링크"] else []
+    ok = (
+        row["홈페이지"] == "https://cafe-k.example.com"
+        and row["인스타"] == "https://www.instagram.com/cafe_k"
+        and row["블로그"] == "https://blog.naver.com/cafe_k"
+        and len(extra_lines) == 2
+        and "[카카오채널] https://pf.kakao.com/_cafek" in extra_lines
+        and "[유튜브] https://youtube.com/@cafe_k" in extra_lines
+    )
+    if ok:
+        reporter.pass_("repr 1개 + etc 4개(외부 URL 5개) 전체 순회 성공 - 누락 0건, 대표 3개 + 추가 링크 2개")
+    else:
+        reporter.fail(f"다중 URL 5개 fixture 결과가 예상과 다름: {row}")
+
+
+def check_representative_vs_extra_split_with_duplicated_categories(reporter: ValidationReporter) -> None:
+    """C: 홈페이지 2개 + 인스타 2개 + 블로그 2개 + 카카오채널 1개(총 7개) 입력 시
+    대표는 각 카테고리 첫 번째만, 나머지 4개는 추가 링크로 분리된다."""
+    item = {
+        "id": "5004",
+        "name": "대표추가분리 업체",
+        "homepages": {
+            "repr": None,
+            "etc": [
+                {"url": "https://home1.example.com", "type": "홈페이지"},
+                {"url": "https://home2.example.com", "type": "홈페이지"},
+                {"url": "https://instagram.com/insta1", "type": "인스타그램"},
+                {"url": "https://instagram.com/insta2", "type": "인스타그램"},
+                {"url": "https://blog.naver.com/blog1", "type": "블로그"},
+                {"url": "https://blog.naver.com/blog2", "type": "블로그"},
+                {"url": "https://pf.kakao.com/_channel", "type": "홈페이지"},
+            ],
+        },
+    }
+    row = _map_item_to_row(item, "2026-07-27")
+    extra_lines = row["추가 링크"].split("\n") if row["추가 링크"] else []
+    ok = (
+        row["홈페이지"] == "https://home1.example.com"
+        and row["인스타"] == "https://instagram.com/insta1"
+        and row["블로그"] == "https://blog.naver.com/blog1"
+        and len(extra_lines) == 4
+        and "[홈페이지] https://home2.example.com" in extra_lines
+        and "[인스타] https://instagram.com/insta2" in extra_lines
+        and "[블로그] https://blog.naver.com/blog2" in extra_lines
+        and "[카카오채널] https://pf.kakao.com/_channel" in extra_lines
+    )
+    if ok:
+        reporter.pass_("홈페이지/인스타/블로그 각 2개+카카오채널 1개 -> 대표 3개 + 추가 링크 4개로 정확히 분리")
+    else:
+        reporter.fail(f"대표/추가 분리 결과가 예상과 다름: {row}")
+
+
+def check_dedup_www_and_tracking_params_and_fragment(reporter: ValidationReporter) -> None:
+    """D: repr/etc 동일 URL, www 유무, 추적 파라미터(utm/fbclid) 차이, fragment
+    차이는 모두 같은 URL로 취급해 중복 제거되고, 서로 다른 path는 보존된다."""
+    item = {
+        "id": "5005",
+        "name": "중복 제거 업체",
+        "homepages": {
+            "repr": {"url": "https://example.com/shop?utm_source=naver#section1", "type": "홈페이지"},
+            "etc": [
+                {"url": "https://www.example.com/shop?fbclid=xyz", "type": "홈페이지"},  # www + tracking = 동일 URL(중복)
+                {"url": "https://example.com/shop", "type": "홈페이지"},  # fragment만 다름 = 동일 URL(중복)
+                {"url": "https://example.com", "type": "홈페이지"},  # 다른 path = 보존
+            ],
+        },
+    }
+    row = _map_item_to_row(item, "2026-07-27")
+    ok = (
+        row["홈페이지"] == "https://example.com/shop"
+        and row["추가 링크"] == "[홈페이지] https://example.com"
+    )
+    if ok:
+        reporter.pass_("www/추적 파라미터/fragment 차이는 중복 제거되고, 서로 다른 path(example.com vs /shop)는 보존됨")
+    else:
+        reporter.fail(f"dedup 결과가 예상과 다름: 홈페이지={row['홈페이지']!r}, 추가 링크={row['추가 링크']!r}")
+
+
+def check_multiple_responses_repeated_merge_no_extra_growth(reporter: ValidationReporter) -> None:
+    """동일 item을 여러 번(반복 response) _map_item_to_row로 다시 매핑해도
+    개별 매핑 결과 자체는 항상 동일하다(idempotent 매핑 - accumulator 수준의
+    누적 idempotent 검증은 test_pc_network_accumulator.py에서 별도 확인)."""
+    item = {
+        "id": "5006",
+        "name": "반복 매핑 업체",
+        "homepages": {"repr": {"url": "https://example2.com", "type": "홈페이지"}, "etc": [{"url": "https://youtube.com/@x", "type": "홈페이지"}]},
+    }
+    row_a = _map_item_to_row(item, "2026-07-27")
+    row_b = _map_item_to_row(item, "2026-07-27")
+    if row_a["홈페이지"] == row_b["홈페이지"] and row_a["추가 링크"] == row_b["추가 링크"] == "[유튜브] https://youtube.com/@x":
+        reporter.pass_("동일 item 반복 매핑 결과가 idempotent함(추가 링크 중복 누적 없음)")
+    else:
+        reporter.fail(f"반복 매핑 idempotent 검증 실패: a={row_a}, b={row_b}")
+
+
+def check_excluded_urls_never_become_channels(reporter: ValidationReporter) -> None:
+    """E: 네이버 내부/지도/route/예약/주문/talktalk/이미지/잘못된 scheme URL은
+    대표 링크는 물론 추가 링크에도 전혀 나타나지 않는다."""
+    excluded_urls = [
+        "https://pcmap.place.naver.com/place/12345/home",
+        "https://m.place.naver.com/place/12345/home",
+        "https://place.naver.com/place/12345",
+        "https://map.naver.com/p/directions/1/2",
+        "https://booking.naver.com/booking/13/bizes/999",
+        "https://order.naver.com/orders/1",
+        "https://talk.naver.com/ct/w4example",
+        "https://adcr.naver.com/adcr?x=1",
+        "https://cafe.example.com/photo.jpg",
+        "javascript:void(0)",
+    ]
+    item = {
+        "id": "5007",
+        "name": "제외 URL 업체",
+        "homepages": {"repr": None, "etc": [{"url": u, "type": None} for u in excluded_urls]},
+    }
+    row = _map_item_to_row(item, "2026-07-27")
+    ok = row["홈페이지"] == "" and row["인스타"] == "" and row["블로그"] == "" and row["추가 링크"] == ""
+    if ok:
+        reporter.pass_("플레이스/지도/route/예약/주문/talktalk/광고/이미지/잘못된 scheme URL은 대표·추가 링크 어디에도 나타나지 않음")
+    else:
+        reporter.fail(f"제외 URL 처리 결과가 예상과 다름: {row}")
+
+
+def check_classify_single_url_hostname_overrides_unknown_type_label(reporter: ValidationReporter) -> None:
+    """hostname이 알려진 채널과 일치하지 않고 type_label도 매핑되지 않는
+    미확인 값이면 "etc"(기타)로 분류된다."""
+    category, normalized = _classify_single_url("https://unknown-channel.example.com/x", "트위터")
+    if category == "etc" and normalized == "https://unknown-channel.example.com/x":
+        reporter.pass_("hostname 미확인 + 알 수 없는 type_label -> 기타(etc)로 분류됨")
+    else:
+        reporter.fail(f"기타 분류 결과가 예상과 다름: category={category!r}, normalized={normalized!r}")
+
+
+def check_format_common_address_removes_duplicate_dong_paren_suffix(reporter: ValidationReporter) -> None:
+    """§14 실제 3건: commonAddress와 동일한 행정동이 detail 끝에 괄호로
+    중복되면 제거하고, 건물명이 함께 있으면 건물명만 보존한다."""
+    r1 = format_common_address("서울 강동구 천호동", "올림픽로 651 (천호동)")
+    r2 = format_common_address("서울 강동구 천호동", "천호대로 1015-14 (천호동) 이마트별관")
+    r3 = format_common_address("서울 강동구 천호동", "천호대로 1089 (천호동, 강동 헤르셔)")
+    ok = (
+        r1 == "서울특별시 강동구 천호동 올림픽로 651"
+        and r2 == "서울특별시 강동구 천호동 천호대로 1015-14 이마트별관"
+        and r3 == "서울특별시 강동구 천호동 천호대로 1089 (강동 헤르셔)"
+    )
+    if ok:
+        reporter.pass_("실제 3건 주소 모두 중복 행정동 괄호 제거/건물명 보존이 정확히 동작함")
+    else:
+        reporter.fail(f"주소 행정동 중복 제거 결과가 예상과 다름: r1={r1!r}, r2={r2!r}, r3={r3!r}")
+
+
+def check_format_common_address_preserves_building_style_dong_tokens(reporter: ValidationReporter) -> None:
+    """"102동"/"판매시설동"/"상가동"처럼 건물 의미의 동은 행정동과 달라
+    괄호 dedup 대상이 아니므로 그대로 보존된다."""
+    r1 = format_common_address("서울 강동구 천호동", "천호대로 1000 102동 301호")
+    r2 = format_common_address("서울 강동구 천호동", "천호대로 1000 (판매시설동)")
+    r3 = format_common_address("서울 강동구 천호동", "천호대로 1000 (상가동, 헤르셔)")
+    ok = (
+        "102동" in r1
+        and "(판매시설동)" in r2
+        and "(상가동, 헤르셔)" in r3
+    )
+    if ok:
+        reporter.pass_("102동/판매시설동/상가동처럼 건물 의미 동 토큰은 중복 제거 대상에서 제외되고 보존됨")
+    else:
+        reporter.fail(f"건물 의미 동 보존 결과가 예상과 다름: r1={r1!r}, r2={r2!r}, r3={r3!r}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -942,6 +1182,17 @@ def main() -> int:
     check_classify_query_efficiency_boundary_values(reporter)
     check_should_stop_for_target_reaches_and_below(reporter)
     check_should_stop_for_target_non_positive_target_is_false(reporter)
+    check_butteron_instagram_type_mismatch_fixture(reporter)
+    check_kakao_channel_hostname_corrected_and_sent_to_extra_links(reporter)
+    check_smartstore_classified_and_preserved_in_extra_links(reporter)
+    check_multi_url_five_candidates_no_loss(reporter)
+    check_representative_vs_extra_split_with_duplicated_categories(reporter)
+    check_dedup_www_and_tracking_params_and_fragment(reporter)
+    check_multiple_responses_repeated_merge_no_extra_growth(reporter)
+    check_excluded_urls_never_become_channels(reporter)
+    check_classify_single_url_hostname_overrides_unknown_type_label(reporter)
+    check_format_common_address_removes_duplicate_dong_paren_suffix(reporter)
+    check_format_common_address_preserves_building_style_dong_tokens(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

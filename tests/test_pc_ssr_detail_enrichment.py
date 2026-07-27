@@ -656,7 +656,7 @@ def main() -> int:
         "detail_ssr_duration_seconds",
     }
     if not (diagnostic_keys & set(MERGED_COLUMNS)):
-        reporter.pass_("27. detail_ssr_* 진단 키는 MERGED_COLUMNS(Excel 13컬럼)에 전혀 포함되지 않음")
+        reporter.pass_("27. detail_ssr_* 진단 키는 MERGED_COLUMNS(Excel 14컬럼)에 전혀 포함되지 않음")
     else:
         reporter.fail(f"27. 진단 키가 Excel 컬럼에 노출됨: {diagnostic_keys & set(MERGED_COLUMNS)}")
 
@@ -674,10 +674,10 @@ def main() -> int:
         import openpyxl
         wb = openpyxl.load_workbook(out_path)
         headers = [c.value for c in wb["통합_결과"][1]]
-        if headers == MERGED_COLUMNS and len(headers) == 13:
-            reporter.pass_("29. 기존 export_places_to_excel로 SSR 보강 row가 13컬럼 그대로 저장됨")
+        if headers == MERGED_COLUMNS and len(headers) == 14:
+            reporter.pass_("29. 기존 export_places_to_excel로 SSR 보강 row가 14컬럼 그대로 저장됨")
         else:
-            reporter.fail(f"29. exporter 13컬럼 이상: {headers}")
+            reporter.fail(f"29. exporter 14컬럼 이상: {headers}")
 
     # 30. 부분 결과 export(차단으로 일부만 보강된 rows도 손실 없이 저장)
     with tempfile.TemporaryDirectory() as tmp_dir:

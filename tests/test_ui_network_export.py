@@ -172,11 +172,11 @@ def check_header_matches_merged_columns(reporter: ValidationReporter) -> None:
 
         wb = openpyxl.load_workbook(output_path)
         headers = [cell.value for cell in wb["통합_결과"][1]]
-        ok = headers == MERGED_COLUMNS and len(headers) == 13
+        ok = headers == MERGED_COLUMNS and len(headers) == 14
         if ok:
-            reporter.pass_("13컬럼: 통합_결과 헤더가 MERGED_COLUMNS와 정확히 일치하고 열 수 13개")
+            reporter.pass_("14컬럼: 통합_결과 헤더가 MERGED_COLUMNS와 정확히 일치하고 열 수 14개")
         else:
-            reporter.fail(f"13컬럼 결과가 예상과 다름: headers={headers}")
+            reporter.fail(f"14컬럼 결과가 예상과 다름: headers={headers}")
 
 
 def check_internal_meta_fields_not_in_excel(reporter: ValidationReporter) -> None:

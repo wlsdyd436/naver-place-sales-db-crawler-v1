@@ -2121,6 +2121,7 @@ def _fetch_place_detail_ssr(page, row: dict, *, should_continue=None) -> dict:
         "홈페이지": "",
         "인스타": "",
         "블로그": "",
+        "추가 링크": "",
     }
     place_url = build_place_url_from_id(place_id)
     if not place_url:
@@ -2257,6 +2258,7 @@ def _fetch_place_detail_ssr(page, row: dict, *, should_continue=None) -> dict:
     result["홈페이지"] = apollo_row.get("홈페이지", "")
     result["인스타"] = apollo_row.get("인스타", "")
     result["블로그"] = apollo_row.get("블로그", "")
+    result["추가 링크"] = apollo_row.get("추가 링크", "")
     result["detail_ssr_duration_seconds"] = round(time.time() - t0, 3)
     return result
 
@@ -2294,6 +2296,7 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_c
         "홈페이지": "",
         "인스타": "",
         "블로그": "",
+        "추가 링크": "",
     }
     if not place_url:
         result["detail_stop_reason"] = "no_place_url"
@@ -2403,7 +2406,7 @@ def _fetch_place_detail(page, row: dict, *, retry: int = _DETAIL_RETRY, should_c
                         result["주소"] = apollo_row["주소"]
                     if not result["업종"] and apollo_row.get("업종"):
                         result["업종"] = apollo_row["업종"]
-                    for field in ("홈페이지", "인스타", "블로그"):
+                    for field in ("홈페이지", "인스타", "블로그", "추가 링크"):
                         if not result[field] and apollo_row.get(field):
                             result[field] = apollo_row[field]
                     if not result["새로오픈여부"] and apollo_row.get("새로오픈여부"):

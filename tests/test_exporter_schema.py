@@ -34,6 +34,7 @@ EXPECTED_MERGED = [
     "홈페이지",
     "인스타",
     "블로그",
+    "추가 링크",
 ]
 EXPECTED_MOBILE = ["업체명", "업종", "주소", "대표전화", "플레이스 URL", "수집일"]
 EXPECTED_PC = ["업체명", "업종", "새로오픈여부", "리뷰수", "주소", "수집일"]
@@ -125,9 +126,9 @@ def _read_rows(path, sheet_name):
 
 def check_merged_columns_constant(reporter: ValidationReporter) -> None:
     if MERGED_COLUMNS == EXPECTED_MERGED:
-        reporter.pass_("MERGED_COLUMNS = 5M-R1 확정 13컬럼(방문자/블로그/총리뷰수 분리, 단일 리뷰수 제거)")
+        reporter.pass_("MERGED_COLUMNS = PAGE300-6E-V3 확정 14컬럼(방문자/블로그/총리뷰수 분리 + 추가 링크 포함)")
     else:
-        reporter.fail(f"MERGED_COLUMNS이 예상 13컬럼과 다름: {MERGED_COLUMNS}")
+        reporter.fail(f"MERGED_COLUMNS이 예상 14컬럼과 다름: {MERGED_COLUMNS}")
 
     if "리뷰수" not in MERGED_COLUMNS:
         reporter.pass_("기존 단일 '리뷰수' 컬럼이 통합_결과에서 제거됨")
@@ -154,13 +155,13 @@ def check_exported_merged_headers(reporter: ValidationReporter) -> None:
 
         merged_headers = _read_headers(path, "통합_결과")
         checks = {
-            "통합_결과 헤더 13개(5M-R1 확정 스키마)": merged_headers == EXPECTED_MERGED,
+            "통합_결과 헤더 14개(PAGE300-6E-V3 확정 스키마)": merged_headers == EXPECTED_MERGED,
             "place_id는 통합_결과 컬럼에 미노출": "place_id" not in merged_headers,
             "원본_모바일 헤더 무변경": _read_headers(path, "원본_모바일") == EXPECTED_MOBILE,
             "원본_PC 헤더 무변경": _read_headers(path, "원본_PC") == EXPECTED_PC,
         }
         if all(checks.values()):
-            reporter.pass_("저장 파일 3시트 헤더: 통합_결과는 13컬럼, place_id 미노출, 원본 시트 불변")
+            reporter.pass_("저장 파일 3시트 헤더: 통합_결과는 14컬럼, place_id 미노출, 원본 시트 불변")
         else:
             failed = [name for name, ok in checks.items() if not ok]
             reporter.fail(f"저장 헤더 검증 실패 항목: {failed} (통합_결과={merged_headers})")
@@ -232,6 +233,56 @@ def check_legacy_row_blank_sns(reporter: ValidationReporter) -> None:
             reporter.fail(f"레거시 행 빈칸 처리 결과가 예상과 다름: {row}")
 
 
+def check_fourteen_columns_extra_links_last(reporter: ValidationReporter) -> None:
+    """PAGE300-6E-V3: 통합_결과는 정확히 14컬럼이고 "추가 링크"가 마지막이어야 한다."""
+    if len(MERGED_COLUMNS) == 14 and MERGED_COLUMNS[-1] == "추가 링크" and MERGED_COLUMNS[:13] == EXPECTED_MERGED[:13]:
+        reporter.pass_("MERGED_COLUMNS이 정확히 14컬럼이고 '추가 링크'가 블로그 다음 마지막 컬럼")
+    else:
+        reporter.fail(f"14컬럼/추가 링크 마지막 배치 검증 실패: {MERGED_COLUMNS}")
+
+
+def check_legacy_thirteen_column_row_backward_compatible(reporter: ValidationReporter) -> None:
+    """"추가 링크" 키 자체가 없는 기존 13컬럼 입력 row도 예외 없이 공란으로 export되어야 한다."""
+    legacy_row_without_extra = _legacy_row()
+    if "추가 링크" in legacy_row_without_extra:
+        reporter.fail("픽스처 오류: _legacy_row에 추가 링크 키가 이미 존재함")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy13_test.xlsx"
+        export_places_to_excel([legacy_row_without_extra], [], [], str(path))
+        rows = _read_rows(path, "통합_결과")
+        row = rows[0] if rows else {}
+        value = row.get("추가 링크")
+        if value is None or str(value).strip() == "":
+            reporter.pass_("추가 링크 키가 없는 기존 13컬럼 row도 예외 없이 공란으로 export됨(하위 호환)")
+        else:
+            reporter.fail(f"13컬럼 하위 호환 export 결과가 예상과 다름: {value!r}")
+
+
+def check_extra_links_multi_line_value_and_wrap_text(reporter: ValidationReporter) -> None:
+    """여러 URL이 줄바꿈으로 저장된 "추가 링크" 값이 셀에 그대로 보존되고
+    wrap_text + 상단 정렬이 적용되는지 확인한다."""
+    row = _new_engine_row()
+    row["추가 링크"] = "[카카오채널] https://pf.kakao.com/_example\n[유튜브] https://youtube.com/@example"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "extra_links_test.xlsx"
+        export_places_to_excel([row], [], [], str(path))
+        workbook = load_workbook(path, data_only=True)
+        worksheet = workbook["통합_결과"]
+        header = [cell.value for cell in worksheet[1]]
+        col_index = header.index("추가 링크") + 1
+        data_cell = worksheet.cell(row=2, column=col_index)
+        ok = (
+            data_cell.value == "[카카오채널] https://pf.kakao.com/_example\n[유튜브] https://youtube.com/@example"
+            and data_cell.alignment.wrap_text is True
+            and data_cell.alignment.vertical == "top"
+        )
+        if ok:
+            reporter.pass_("여러 URL 줄바꿈 값이 셀에 그대로 보존되고 wrap_text+상단 정렬 적용됨")
+        else:
+            reporter.fail(f"추가 링크 셀 값/서식 검증 실패: value={data_cell.value!r}, alignment={data_cell.alignment}")
+
+
 def check_signature_unchanged(reporter: ValidationReporter) -> None:
     # export_places_to_excel 시그니처(위치 인자 4개)와 반환 경로 계약 유지 확인.
     with tempfile.TemporaryDirectory() as tmp:
@@ -252,6 +303,9 @@ def main() -> int:
     check_new_engine_row_values(reporter)
     check_review_columns_numeric_cells(reporter)
     check_legacy_row_blank_sns(reporter)
+    check_fourteen_columns_extra_links_last(reporter)
+    check_legacy_thirteen_column_row_backward_compatible(reporter)
+    check_extra_links_multi_line_value_and_wrap_text(reporter)
     check_signature_unchanged(reporter)
 
     reporter.summary()

@@ -3,12 +3,17 @@
 from pathlib import Path
 
 import pandas as pd
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 
 
 # 2026-07-23 5M-R1: 단일 "리뷰수" 컬럼을 방문자/블로그/총리뷰수 3개로 분리하고
 # 13개 컬럼 순서를 확정했다(사용자 확정 스키마). 원본_모바일/원본_PC 시트
 # (MOBILE_COLUMNS/PC_COLUMNS)는 legacy 엔진 전용이라 이번 변경 대상이 아니다.
+# PAGE300-6E-V3(2026-07-27): 대표 3링크(홈페이지/인스타/블로그) 외 모든 공개
+# 채널(카카오채널/유튜브/페이스북/스마트스토어/기타 및 2번째 이후 홈페이지·
+# 인스타·블로그)을 보존하기 위해 "추가 링크" 14번째 컬럼을 블로그 다음(마지막)에
+# 추가한다. 기존 13컬럼 입력 row는 이 키가 없어도 _rows_with_columns의
+# row.get(column, "")로 공란 처리되어 하위 호환된다.
 MERGED_COLUMNS = [
     "업체명",
     "업종",
@@ -23,6 +28,7 @@ MERGED_COLUMNS = [
     "홈페이지",
     "인스타",
     "블로그",
+    "추가 링크",
 ]
 
 MOBILE_COLUMNS = [
@@ -60,10 +66,20 @@ def _apply_basic_format(worksheet) -> None:
 
     for column_cells in worksheet.columns:
         header = str(column_cells[0].value or "")
+        # PAGE300-6E-V3: "추가 링크"는 줄바꿈으로 구분된 여러 URL을 담으므로
+        # wrap_text + 상단 정렬을 적용하고, 열 너비는 전체 글자수가 아니라
+        # 가장 긴 한 줄 기준으로 계산한다(그렇지 않으면 링크가 많은 셀 때문에
+        # 열이 비정상적으로 넓어짐 - 기존 열 너비 정책 범위 안에서만 조정).
+        is_extra_links_column = header == "추가 링크"
         max_length = len(header)
         for cell in column_cells[1:]:
             value = "" if cell.value is None else str(cell.value)
-            max_length = max(max_length, len(value))
+            if is_extra_links_column:
+                if value:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                max_length = max(max_length, max((len(line) for line in value.split("\n")), default=0))
+            else:
+                max_length = max(max_length, len(value))
         adjusted_width = min(max(max_length + 2, 10), 60)
         worksheet.column_dimensions[column_cells[0].column_letter].width = (
             adjusted_width

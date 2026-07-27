@@ -207,14 +207,14 @@ def test_field_policy_suite():
     # ------------------------------------------------------------------
 
     # 22. homepages 문자열 배열(legacy homePage 스타일)
-    home22, insta22, blog22 = _extract_external_urls({"homePage": ["https://example.com", "https://www.instagram.com/example"]})
+    home22, insta22, blog22, _ = _extract_external_urls({"homePage": ["https://example.com", "https://www.instagram.com/example"]})
     if home22 == "https://example.com" and insta22 == "https://www.instagram.com/example":
         reporter.pass_("22. 문자열 리스트 형태 URL 분류 성공")
     else:
         reporter.fail(f"22. 문자열 리스트 URL 분류 실패: {(home22, insta22, blog22)}")
 
     # 23. homepages 객체(repr/etc) 형태
-    home23, insta23, blog23 = _extract_external_urls({
+    home23, insta23, blog23, _ = _extract_external_urls({
         "homepages": {
             "repr": {"url": "https://blog.naver.com/cafein5959", "type": "블로그"},
             "etc": [{"landingUrl": "https://example-cafe.com", "type": "홈페이지"}],
@@ -226,49 +226,49 @@ def test_field_policy_suite():
         reporter.fail(f"23. homepages 객체 분류 실패: {(home23, insta23, blog23)}")
 
     # 24. snsList 인스타 분류(방어적 지원, 5M 증거에는 미확인 키)
-    _, insta24, _ = _extract_external_urls({"snsList": [{"url": "https://www.instagram.com/w.b.o.cake", "type": "인스타그램"}]})
+    _, insta24, _, _ = _extract_external_urls({"snsList": [{"url": "https://www.instagram.com/w.b.o.cake", "type": "인스타그램"}]})
     if insta24 == "https://www.instagram.com/w.b.o.cake":
         reporter.pass_("24. snsList 인스타 분류 성공")
     else:
         reporter.fail(f"24. snsList 분류 실패: {insta24!r}")
 
     # 25. blog.naver.com 블로그 분류
-    _, _, blog25 = _extract_external_urls({"homePage": "https://blog.naver.com/somecafe"})
+    _, _, blog25, _ = _extract_external_urls({"homePage": "https://blog.naver.com/somecafe"})
     if blog25 == "https://blog.naver.com/somecafe":
         reporter.pass_("25. blog.naver.com 블로그 분류 성공")
     else:
         reporter.fail(f"25. 블로그 분류 실패: {blog25!r}")
 
     # 26. 공식 홈페이지 분류
-    home26, _, _ = _extract_external_urls({"homePage": "https://my-official-cafe.example"})
+    home26, _, _, _ = _extract_external_urls({"homePage": "https://my-official-cafe.example"})
     if home26 == "https://my-official-cafe.example":
         reporter.pass_("26. 공식 홈페이지 분류 성공")
     else:
         reporter.fail(f"26. 홈페이지 분류 실패: {home26!r}")
 
     # 27. 네이버 예약 링크 홈페이지 제외
-    home27, _, _ = _extract_external_urls({"homePage": "https://booking.naver.com/booking/some-shop"})
+    home27, _, _, _ = _extract_external_urls({"homePage": "https://booking.naver.com/booking/some-shop"})
     if home27 == "":
         reporter.pass_("27. 네이버 예약 링크 홈페이지 제외 성공")
     else:
         reporter.fail(f"27. 예약 링크가 홈페이지로 채택됨: {home27!r}")
 
     # 28. 네이버 주문 링크 홈페이지 제외
-    home28, _, _ = _extract_external_urls({"homePage": "https://order.naver.com/orders/some-shop"})
+    home28, _, _, _ = _extract_external_urls({"homePage": "https://order.naver.com/orders/some-shop"})
     if home28 == "":
         reporter.pass_("28. 네이버 주문 링크 홈페이지 제외 성공")
     else:
         reporter.fail(f"28. 주문 링크가 홈페이지로 채택됨: {home28!r}")
 
     # 29. 동일 URL 중복 제거
-    home29, _, _ = _extract_external_urls({"homePage": ["https://dup-cafe.example", "https://dup-cafe.example/"]})
+    home29, _, _, _ = _extract_external_urls({"homePage": ["https://dup-cafe.example", "https://dup-cafe.example/"]})
     if home29 == "https://dup-cafe.example":
         reporter.pass_("29. 동일 URL(trailing slash 차이) 중복 제거 성공")
     else:
         reporter.fail(f"29. 중복 제거 실패: {home29!r}")
 
     # 30. 잘못된 scheme 거부
-    home30, insta30, blog30 = _extract_external_urls({"homePage": "javascript:alert(1)"})
+    home30, insta30, blog30, _ = _extract_external_urls({"homePage": "javascript:alert(1)"})
     if home30 == "" and insta30 == "" and blog30 == "":
         reporter.pass_("30. 잘못된 scheme(javascript:) 거부 성공")
     else:

@@ -89,6 +89,7 @@ async def _fetch_place_home_async(request_context, row: dict) -> dict:
         "홈페이지": "",
         "인스타": "",
         "블로그": "",
+        "추가 링크": "",
     }
     place_url = build_place_url_from_id(place_id)
     if not place_url:
@@ -158,24 +159,25 @@ async def _fetch_place_home_async(request_context, row: dict) -> dict:
     result["홈페이지"] = apollo_row.get("홈페이지", "")
     result["인스타"] = apollo_row.get("인스타", "")
     result["블로그"] = apollo_row.get("블로그", "")
+    result["추가 링크"] = apollo_row.get("추가 링크", "")
     return result
 
 
 def merge_home_result_into_row(row: dict, home_result) -> dict:
-    """홈페이지·SNS 모드 전용 병합 - 허용 목록(홈페이지/인스타/블로그/공란
-    대표전화)만 채운다(요청서 §6 core parity 정책). 업체명/업종/새로오픈여부/
-    방문자·블로그·총리뷰수/주소/플레이스 URL/수집일은 절대 덮어쓰지 않는다 -
-    목록(ApolloFirstListCollector) 단계에서 이미 확정된 값이 두 모드 공통
-    진실의 원천이며, SSR 상세 응답이 그 핵심 필드에 대해 다른 값을 갖고
-    있어도 여기서는 참조조차 하지 않는다. `merge_detail_into_row`(legacy
-    DomMembershipCollector.enrich_detail_ssr 전용, network_list_scraper.py)를
+    """홈페이지·SNS 모드 전용 병합 - 허용 목록(홈페이지/인스타/블로그/추가
+    링크/공란 대표전화)만 채운다(요청서 §6 core parity 정책). 업체명/업종/
+    새로오픈여부/방문자·블로그·총리뷰수/주소/플레이스 URL/수집일은 절대
+    덮어쓰지 않는다 - 목록(ApolloFirstListCollector) 단계에서 이미 확정된
+    값이 두 모드 공통 진실의 원천이며, SSR 상세 응답이 그 핵심 필드에 대해
+    다른 값을 갖고 있어도 여기서는 참조조차 하지 않는다. `merge_detail_into_row`
+    (legacy DomMembershipCollector.enrich_detail_ssr 전용, network_list_scraper.py)를
     재사용하지 않는다 - 그 함수는 핵심 필드를 무조건 덮어쓰는 다른 정책을
     쓰므로 여기 재사용하면 안 된다(2026-07-25 field parity 보정으로 분리).
     home_result가 없거나 실패면 row를 그대로 반환한다(row 삭제 금지)."""
     if home_result is None or not home_result.get("detail_success"):
         return row
     merged = dict(row)
-    for field in ("홈페이지", "인스타", "블로그"):
+    for field in ("홈페이지", "인스타", "블로그", "추가 링크"):
         value = home_result.get(field)
         if value:
             merged[field] = value

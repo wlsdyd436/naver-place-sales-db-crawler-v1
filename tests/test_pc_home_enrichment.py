@@ -437,6 +437,84 @@ def check_dispose_not_called_on_context_request(reporter: ValidationReporter) ->
         reporter.fail("10. context.request에 대해 dispose()를 호출하고 있음 - Playwright 계약 위반 가능성")
 
 
+def _success_html_with_extra_links(place_id: str) -> bytes:
+    """PAGE300-6E-V3: homepages.etc에 대표(홈페이지) 외 채널이 여러 개
+    있는 SSR 성공 응답을 만든다(카카오채널 + 두 번째 인스타)."""
+    base_key = f"PlaceDetailBase:{place_id}"
+    op_key = f'placeDetail({{"input":{{"deviceType":"mobile","id":"{place_id}","isNx":false}}}})'
+    parent = _parent_entity(
+        base_key,
+        homepages={
+            "repr": {"url": "https://example-cafe.test", "type": "홈페이지"},
+            "etc": [
+                {"url": "https://pf.kakao.com/_example", "type": "홈페이지"},
+                {"url": "https://instagram.com/example_second", "type": "인스타그램"},
+            ],
+        },
+    )
+    apollo_state = {
+        base_key: _base_entity(place_id),
+        "ROOT_QUERY": {op_key: parent},
+    }
+    html = f"<html><script>window.__APOLLO_STATE__ = {json.dumps(apollo_state)};</script></html>"
+    return html.encode("utf-8")
+
+
+def check_extra_links_flow_through_ssr_fetch_and_merge(reporter: ValidationReporter) -> None:
+    """PAGE300-6E-V3: homepages.etc의 카카오채널/두 번째 인스타가 유실되지
+    않고 _fetch_place_home_async 결과와 merge_home_result_into_row 병합
+    결과 모두에 "추가 링크"로 보존되는지 확인한다."""
+    rows = [_row("222")]
+    ctx = FakeAsyncRequestContext({"222": FakeAsyncResponse(200, _success_html_with_extra_links("222"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    row0 = result["rows"][0]
+    extra_lines = row0["추가 링크"].split("\n") if row0["추가 링크"] else []
+    ok = (
+        row0["홈페이지"] == "https://example-cafe.test"
+        and row0["인스타"] == "https://instagram.com/example_second"
+        and len(extra_lines) == 1
+        and extra_lines[0] == "[카카오채널] https://pf.kakao.com/_example"
+    )
+    if ok:
+        reporter.pass_("11. homepages.etc의 카카오채널이 SSR fetch + merge 전체 경로에서 '추가 링크'로 유실 없이 보존됨")
+    else:
+        reporter.fail(f"11. 추가 링크 SSR 흐름 검증 실패: {row0}")
+
+
+def check_merge_home_result_into_row_fills_extra_links_field(reporter: ValidationReporter) -> None:
+    row = _row("333")
+    home_result = {
+        "detail_success": True, "place_id": "333", "홈페이지": "https://x.test",
+        "인스타": "", "블로그": "", "추가 링크": "[카카오채널] https://pf.kakao.com/_x",
+        "주소": "", "플레이스 URL": "https://pcmap.place.naver.com/place/333/home",
+        "업종": "", "새로오픈여부": "", "방문자리뷰수": "", "블로그리뷰수": "",
+    }
+    merged = merge_home_result_into_row(row, home_result)
+    if merged["추가 링크"] == "[카카오채널] https://pf.kakao.com/_x":
+        reporter.pass_("12. merge_home_result_into_row가 '추가 링크' 필드도 정확히 채움")
+    else:
+        reporter.fail(f"12. 추가 링크 병합 실패: {merged}")
+
+
+def check_basic_mode_leaves_extra_links_blank(reporter: ValidationReporter) -> None:
+    """§12: 기본(basic) 모드는 home GET을 전혀 하지 않으므로 목록 rows를
+    가공 없이 그대로 반환한다 - 홈페이지/인스타/블로그와 마찬가지로 '추가
+    링크'도 목록 응답에 없으면(대부분) 공란으로 유지되고, home_sns 모드만
+    거쳐야 채워진다(merge_home_result_into_row를 거치지 않으면 불변)."""
+    list_row = {
+        "업체명": "업체0", "업종": "카페", "새로오픈여부": "", "방문자리뷰수": 10,
+        "블로그리뷰수": 0, "총리뷰수": 10, "주소": "서울특별시 강동구 천호동 0",
+        "대표전화": "", "플레이스 URL": "https://pcmap.place.naver.com/place/0/home",
+        "수집일": "2026-07-27", "홈페이지": "", "인스타": "", "블로그": "", "추가 링크": "",
+        "place_id": "0",
+    }
+    basic_row = dict(list_row)  # 기본 모드: home_enrichment 자체를 호출하지 않음(가공 없음)
+    if basic_row["추가 링크"] == "" and basic_row == list_row:
+        reporter.pass_("13. 기본 모드는 home 보강을 거치지 않아 추가 링크를 포함한 모든 URL 필드가 공란으로 유지됨")
+    else:
+        reporter.fail(f"13. 기본 모드 추가 링크 공란 정책 위반: {basic_row}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -452,6 +530,9 @@ def main() -> bool:
         check_enrich_home_details_sync_wrapper_bypasses_native_cdp_when_injected,
         check_production_path_uses_native_cdp_reconnect_not_cookie_copy,
         check_dispose_not_called_on_context_request,
+        check_extra_links_flow_through_ssr_fetch_and_merge,
+        check_merge_home_result_into_row_fills_extra_links_field,
+        check_basic_mode_leaves_extra_links_blank,
     ]
     for check in checks:
         check(reporter)

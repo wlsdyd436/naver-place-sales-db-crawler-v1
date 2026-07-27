@@ -288,6 +288,51 @@ def test_accumulator_suite():
     else:
         reporter.fail(f"24. 총리뷰수 재계산 실패: mid_blank={mid_total_blank}, final={row_9202}")
 
+    # 25. PAGE300-6E-V3 F: 여러 response에 나뉘어 들어온 URL의 합집합 병합
+    # (response A의 인스타 a, response B의 다른 인스타 b) - 대표 인스타는
+    # 먼저 온 a를 유지하고, b는 버려지지 않고 추가 링크로 보존된다.
+    acc_url = GlobalPlaceAccumulator(collected_at="2026-07-27")
+    acc_url.add_raw_item({"id": "9301", "name": "URL 합집합 업체", "homepages": {"repr": {"url": "https://instagram.com/a", "type": "홈페이지"}, "etc": []}})
+    acc_url.add_raw_item({"id": "9301", "name": "URL 합집합 업체", "homepages": {"repr": {"url": "https://instagram.com/b", "type": "홈페이지"}, "etc": []}})
+    row_9301 = acc_url.get_row("9301")
+    if row_9301 and row_9301.get("인스타") == "https://instagram.com/a" and row_9301.get("추가 링크") == "[인스타] https://instagram.com/b":
+        reporter.pass_("25. 여러 response의 인스타 URL이 합집합 병합됨(대표 유지 + 나머지는 추가 링크)")
+    else:
+        reporter.fail(f"25. URL 합집합 병합 실패: {row_9301}")
+
+    # 26. 동일 response를 다시 병합해도(idempotent) 추가 링크 줄 수가 늘지 않음
+    acc_url.add_raw_item({"id": "9301", "name": "URL 합집합 업체", "homepages": {"repr": {"url": "https://instagram.com/b", "type": "홈페이지"}, "etc": []}})
+    row_9301_again = acc_url.get_row("9301")
+    if row_9301_again.get("추가 링크") == "[인스타] https://instagram.com/b":
+        reporter.pass_("26. 동일 URL 재병합해도 추가 링크가 idempotent하게 유지됨(중복 누적 없음)")
+    else:
+        reporter.fail(f"26. idempotent 재병합 실패: {row_9301_again}")
+
+    # 27. 다른 place_id는 절대 서로 섞이지 않는다(place_id exact 기준)
+    acc_url.add_raw_item({"id": "9302", "name": "다른 업체", "homepages": {"repr": {"url": "https://instagram.com/other", "type": "홈페이지"}, "etc": []}})
+    row_9302 = acc_url.get_row("9302")
+    if row_9302.get("인스타") == "https://instagram.com/other" and row_9302.get("추가 링크") == "" and row_9301_again.get("인스타") == "https://instagram.com/a":
+        reporter.pass_("27. 서로 다른 place_id의 URL이 섞이지 않고 독립적으로 유지됨")
+    else:
+        reporter.fail(f"27. place_id 간 URL 혼입 발생: 9301={row_9301_again}, 9302={row_9302}")
+
+    # 28. 원본 response의 "추가 링크" 문자열(카테고리 라벨 포함) 자체도 합집합 병합됨
+    acc_extra = GlobalPlaceAccumulator(collected_at="2026-07-27")
+    acc_extra.add_raw_item({
+        "id": "9401", "name": "추가 링크 병합 업체",
+        "homepages": {"repr": {"url": "https://home.example.com", "type": "홈페이지"}, "etc": [{"url": "https://youtube.com/@x", "type": "홈페이지"}]},
+    })
+    acc_extra.add_raw_item({
+        "id": "9401", "name": "추가 링크 병합 업체",
+        "homepages": {"repr": {"url": "https://home.example.com", "type": "홈페이지"}, "etc": [{"url": "https://pf.kakao.com/_x", "type": "홈페이지"}]},
+    })
+    row_9401 = acc_extra.get_row("9401")
+    extra_lines_9401 = row_9401.get("추가 링크").split("\n") if row_9401.get("추가 링크") else []
+    if len(extra_lines_9401) == 2 and "[유튜브] https://youtube.com/@x" in extra_lines_9401 and "[카카오채널] https://pf.kakao.com/_x" in extra_lines_9401:
+        reporter.pass_("28. 서로 다른 response의 '추가 링크' 원본 문자열도 idempotent하게 합집합 병합됨")
+    else:
+        reporter.fail(f"28. 추가 링크 원본 문자열 합집합 병합 실패: {row_9401}")
+
     print("\n====================")
     print(f"PASS: {reporter.passes}")
     print(f"FAIL: {reporter.fails}")

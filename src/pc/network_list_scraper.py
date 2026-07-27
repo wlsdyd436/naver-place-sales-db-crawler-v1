@@ -263,6 +263,30 @@ def _token_matches_common_address(detail_token: str, common_token: str, index: i
     return detail_token == common_token
 
 
+_PAREN_GROUP_PATTERN = re.compile(r"\(([^()]*)\)")
+
+
+def _strip_duplicate_dong_parens(text: str, dong: str) -> str:
+    """detail 문자열 안의 "(행정동)"/"(행정동, 건물명)" 괄호 그룹 중, 괄호 첫
+    항목이 commonAddress의 마지막 토큰(행정동)과 정확히 같은 것만 제거한다
+    (요청서 §14) - "(102동)"/"(판매시설동)"/"(상가동)"처럼 괄호 첫 항목이
+    행정동과 다르면 그대로 보존하고, "(행정동, 건물명)"이면 건물명만 남긴다
+    (쉼표 뒤 공백 유무 무관 - 정규식이 아닌 문자열 전체 기준으로 괄호 그룹을
+    찾으므로 "(천호동, 강동 헤르셔)"처럼 내부에 공백이 있어도 안전하다).
+    dong이 비어 있으면 아무 것도 바꾸지 않는다."""
+    if not dong or "(" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        parts = [p.strip() for p in match.group(1).split(",")]
+        if parts and parts[0] == dong:
+            remaining = [p for p in parts[1:] if p]
+            return "(" + ", ".join(remaining) + ")" if remaining else ""
+        return match.group(0)
+
+    return _PAREN_GROUP_PATTERN.sub(_replace, text)
+
+
 def format_common_address(common_address, road_address, address: str = "") -> str:
     """업체 entity 자신의 주소 필드만으로 두 모드 공통 주소 문자열을
     조립한다(요청서 §5) - 검색어(job/query)는 어떤 인자로도 받지 않으므로
@@ -302,7 +326,8 @@ def format_common_address(common_address, road_address, address: str = "") -> st
             overlap = i + 1
         else:
             break
-    remaining_detail = " ".join(detail_tokens[overlap:])
+    remaining_detail_raw = " ".join(detail_tokens[overlap:])
+    remaining_detail = _strip_duplicate_dong_parens(remaining_detail_raw, common_tokens[-1] if common_tokens else "")
 
     combined = f"{normalized_common} {remaining_detail}".strip() if remaining_detail else normalized_common
     return re.sub(r"\s+", " ", combined).strip()
@@ -432,32 +457,57 @@ def _resolve_new_open_tristate(item: dict) -> str:
     return ""
 
 
-# 홈페이지로 분류하지 않을 네이버 내부/광고 URL(예약/주문/스마트스토어/지도/
-# 플레이스/광고 리다이렉트). exact hostname 또는 그 서브도메인만 제외한다.
+# 외부 홍보 채널로 절대 취급하지 않을 네이버 내부/기능성/광고 URL(플레이스
+# 자체/지도·route/예약/주문/광고 리다이렉트/talktalk). exact hostname 또는 그
+# 서브도메인만 제외한다. 카카오채널/스마트스토어는 여기서 제외하지 않는다 -
+# 공개 판매·홍보 채널이므로 "추가 링크"에는 남겨야 한다(요청서 §8/§9).
 _EXCLUDED_HOMEPAGE_HOSTS = (
     "map.naver.com",
+    "m.map.naver.com",
     "pcmap.place.naver.com",
     "m.place.naver.com",
     "place.naver.com",
     "booking.naver.com",
     "order.naver.com",
-    "smartstore.naver.com",
     "adcr.naver.com",
-    # 2026-07-23 5O 감사(S5 표본)에서 카카오톡채널 URL이 홈페이지로 오분류된
-    # 사례가 실측 확인되어 제외 목록에 추가.
-    "pf.kakao.com",
+    "talk.naver.com",
 )
-_INSTAGRAM_HOSTS = ("instagram.com", "www.instagram.com", "m.instagram.com")
-_BLOG_HOSTS = ("blog.naver.com",)
-_URL_TYPE_LABEL_MAP = {"인스타그램": "insta", "블로그": "blog", "홈페이지": "homepage"}
-_TRACKING_QUERY_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid"}
+# 확장 채널 hostname -> category. hostname이 명확하면 type_label과 충돌해도
+# hostname이 우선한다(요청서 §7 "명확한 hostname과 type이 충돌하면 hostname
+# 우선" - 버터온 사례: type="홈페이지" + instagram.com hostname -> insta).
+_HOST_CATEGORY_MAP = {
+    "instagram.com": "insta", "www.instagram.com": "insta", "m.instagram.com": "insta",
+    "blog.naver.com": "blog",
+    "pf.kakao.com": "kakao",
+    "youtube.com": "youtube", "www.youtube.com": "youtube", "m.youtube.com": "youtube", "youtu.be": "youtube",
+    "facebook.com": "facebook", "www.facebook.com": "facebook", "m.facebook.com": "facebook", "fb.com": "facebook",
+    "smartstore.naver.com": "smartstore", "brand.naver.com": "smartstore",
+}
+_URL_TYPE_LABEL_MAP = {
+    "인스타그램": "insta", "인스타": "insta",
+    "블로그": "blog",
+    "홈페이지": "homepage",
+    "카카오톡채널": "kakao", "카카오채널": "kakao",
+    "유튜브": "youtube",
+    "페이스북": "facebook",
+    "스마트스토어": "smartstore", "브랜드스토어": "smartstore",
+}
+_CHANNEL_LABELS = {
+    "homepage": "홈페이지", "insta": "인스타", "blog": "블로그", "kakao": "카카오채널",
+    "youtube": "유튜브", "facebook": "페이스북", "smartstore": "스마트스토어", "etc": "기타",
+}
+_TRACKING_QUERY_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "igshid", "igsh",
+}
+_EXCLUDED_URL_PATH_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
 
 
 def _normalize_external_url(raw) -> str:
     """URL을 정규화한다: tel:/mailto:/javascript: 거부, scheme 없는 명백한
     도메인만 https:// 보정, hostname 소문자화, 추적 파라미터 제거, fragment
-    제거, 알려진 네이버 내부/예약/주문/광고 hostname 거부. 유효하지 않으면
-    빈 문자열을 반환한다(예외 없음)."""
+    제거, 알려진 네이버 내부/예약/주문/광고/지도/talktalk hostname과 이미지
+    URL 거부. 유효하지 않으면 빈 문자열을 반환한다(예외 없음)."""
     text = str(raw or "").strip()
     if not text:
         return ""
@@ -475,29 +525,48 @@ def _normalize_external_url(raw) -> str:
     hostname = parsed.hostname.lower()
     if any(hostname == host or hostname.endswith("." + host) for host in _EXCLUDED_HOMEPAGE_HOSTS):
         return ""
+    if hostname == "pstatic.net" or hostname.endswith(".pstatic.net"):
+        return ""
+    path_lower = parsed.path.lower()
+    if any(path_lower.endswith(suffix) for suffix in _EXCLUDED_URL_PATH_SUFFIXES):
+        return ""
 
     kept_query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in _TRACKING_QUERY_PARAMS]
     path = parsed.path.rstrip("/") or parsed.path
     return urlunsplit((parsed.scheme, hostname, path, urlencode(kept_query), ""))
 
 
+def _dedup_key_for_external_url(normalized_url: str) -> str:
+    """dedup 판정 전용 key - www 유무 차이를 같은 URL로 취급하기 위해 hostname의
+    선행 'www.'만 제거한다(표시용 normalized_url 자체는 원본 형태를 그대로
+    보존 - 기존 테스트가 기대하는 'www.instagram.com/...' 표기를 바꾸지 않는다)."""
+    parsed = urlsplit(normalized_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return urlunsplit((parsed.scheme, hostname, parsed.path, parsed.query, ""))
+
+
 def _classify_single_url(url, type_label=None) -> tuple:
     """URL 하나를 (category, normalized_url)로 분류한다. category는
-    "insta"/"blog"/"homepage" 중 하나이며, 무효 URL이면 (None, None)을
-    반환한다. type_label(응답이 이미 제공하는 한글 라벨)을 1차 기준으로,
-    hostname을 보조 기준으로 사용한다."""
+    "insta"/"blog"/"homepage"/"kakao"/"youtube"/"facebook"/"smartstore"/
+    "etc" 중 하나이며, 무효 URL이면 (None, None)을 반환한다. hostname이
+    알려진 채널과 명확히 일치하면 type_label과 무관하게 hostname이 우선한다
+    (요청서 §7). hostname으로 판단할 수 없으면 type_label(응답이 제공하는
+    한글 라벨)을 사용하고, 라벨이 있으나 알려지지 않은 값이면 "etc", 라벨도
+    없으면 공개 홈페이지로 간주해 "homepage"를 반환한다."""
     normalized = _normalize_external_url(url)
     if not normalized:
         return None, None
+    hostname = (urlsplit(normalized).hostname or "").lower()
+    host_category = _HOST_CATEGORY_MAP.get(hostname)
+    if host_category:
+        return host_category, normalized
     if type_label:
         mapped = _URL_TYPE_LABEL_MAP.get(str(type_label).strip())
         if mapped:
             return mapped, normalized
-    hostname = (urlsplit(normalized).hostname or "").lower()
-    if hostname in _INSTAGRAM_HOSTS:
-        return "insta", normalized
-    if hostname in _BLOG_HOSTS:
-        return "blog", normalized
+        return "etc", normalized
     return "homepage", normalized
 
 
@@ -526,16 +595,30 @@ def _iter_url_candidates(value, depth: int = 0):
             yield from _iter_url_candidates(entry, depth + 1)
 
 
+def _format_extra_links(entries: list) -> str:
+    """(category, normalized_url) 목록을 "[라벨] URL" 줄바꿈 문자열로
+    직렬화한다(요청서 §10) - 원본 순서 유지, 빈 줄 없음, 앞뒤 줄바꿈 없음."""
+    lines = [f"[{_CHANNEL_LABELS.get(category, '기타')}] {url}" for category, url in entries]
+    return "\n".join(lines)
+
+
 def _extract_external_urls(item: dict) -> tuple:
-    """item에서 홈페이지/인스타/블로그를 추출·분류한다. homepages(5M 증거
-    확인 구조), naverBlog, 기존 homePage류 후보 필드를 모두 수집해 type_label
-    우선 -> hostname 보조 순으로 분류하고, 동일 정규화 URL은 중복 제거한다.
-    같은 분류에 이미 값이 있으면 먼저 찾은 값을 유지한다(덮어쓰지 않음).
+    """item에서 대표 홈페이지/인스타/블로그와 나머지 전체 공개 채널(추가
+    링크)을 추출·분류한다. homepages{repr, etc[]}(5M 증거 확인 구조) 전체를
+    끝까지 순회하고(repr 처리 후 종료하지 않음, etc의 첫 URL만 보고 멈추지
+    않음), naverBlog/snsList/기존 homePage류 후보 필드도 모두 수집한다.
+    hostname 우선 -> type_label 보조 순으로 분류하고(요청서 §7), 동일
+    정규화 URL은 www 유무와 무관하게 중복 제거한다(요청서 §6). 대표
+    홈페이지/인스타/블로그로 이미 채워진 카테고리는 그 이후 같은 카테고리
+    URL부터 "추가 링크"로 보낸다 - 카카오채널/유튜브/페이스북/스마트스토어/
+    기타는 대표 컬럼으로 승격하지 않고 항상 추가 링크로만 보낸다(요청서 §9
+    "카카오채널을 홈페이지 열로 승격하지 마세요").
     """
     homepage = ""
     insta = ""
     blog = ""
-    seen_urls: set = set()
+    seen_keys: set = set()
+    extra_entries: list = []
 
     sources = []
     if "homepages" in item and item["homepages"] is not None:
@@ -553,17 +636,22 @@ def _extract_external_urls(item: dict) -> tuple:
     for source in sources:
         for url, type_label in _iter_url_candidates(source):
             category, normalized = _classify_single_url(url, type_label)
-            if not category or not normalized or normalized in seen_urls:
+            if not category or not normalized:
                 continue
-            seen_urls.add(normalized)
+            dedup_key = _dedup_key_for_external_url(normalized)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
             if category == "insta" and not insta:
                 insta = normalized
             elif category == "blog" and not blog:
                 blog = normalized
             elif category == "homepage" and not homepage:
                 homepage = normalized
+            else:
+                extra_entries.append((category, normalized))
 
-    return homepage, insta, blog
+    return homepage, insta, blog, _format_extra_links(extra_entries)
 
 
 def _build_place_url(item: dict) -> str:
@@ -597,10 +685,11 @@ def _map_item_to_row(
     source_dong: str | None = None,
     source_query: str | None = None,
 ) -> dict:
-    """네트워크 응답의 업체 item 하나를 exporter.MERGED_COLUMNS(13컬럼)
+    """네트워크 응답의 업체 item 하나를 exporter.MERGED_COLUMNS(14컬럼)
     row(dict)로 매핑한다(5M-R1: 리뷰 방문자/블로그 분리, 개인 휴대전화 차단,
     URL 유형별 분리, 새로오픈 tri-state - scratchpad/page300_5m_r1_graphql_
-    field_provenance_audit에서 확인된 실제 키 사용).
+    field_provenance_audit에서 확인된 실제 키 사용. PAGE300-6E-V3: 대표
+    3링크(홈페이지/인스타/블로그) 외 모든 공개 채널은 "추가 링크"로 보존).
 
     입력: item(dict, 응답에서 추출된 업체 하나), collected_at(수집일 문자열),
     source_page(선택, PoC-2: 어느 page 응답에서 나왔는지), source_dong(선택,
@@ -619,7 +708,7 @@ def _map_item_to_row(
     if not isinstance(item, dict):
         item = {}
 
-    homepage, insta, blog = _extract_external_urls(item)
+    homepage, insta, blog, extra_links = _extract_external_urls(item)
     visitor_reviews = _normalize_review_count(_first_review_count_value(item, _VISITOR_REVIEW_KEYS))
     blog_reviews = _normalize_review_count(_first_review_count_value(item, _BLOG_REVIEW_KEYS))
     total_reviews = _compute_total_review_count(visitor_reviews, blog_reviews)
@@ -639,6 +728,7 @@ def _map_item_to_row(
         "홈페이지": homepage,
         "인스타": insta,
         "블로그": blog,
+        "추가 링크": extra_links,
         "place_id": _first_present(item, _ID_KEY_CANDIDATES),
         "roadAddress": _first_present(item, ("roadAddress",)),
         "_personal_mobile_filtered_count": personal_mobile_filtered_count,
@@ -1287,6 +1377,8 @@ def merge_detail_into_row(row: dict, detail_result: dict) -> dict:
         merged["인스타"] = detail_result["인스타"]
     if detail_result.get("블로그"):
         merged["블로그"] = detail_result["블로그"]
+    if detail_result.get("추가 링크"):
+        merged["추가 링크"] = _merge_extra_links(merged.get("추가 링크") or "", detail_result["추가 링크"])
 
     detail_visitor = detail_result.get("방문자리뷰수")
     detail_blog = detail_result.get("블로그리뷰수")
@@ -1373,6 +1465,7 @@ def merge_dom_row_fields(
         "홈페이지": _pick(detail_row.get("홈페이지"), network_row.get("홈페이지")),
         "인스타": _pick(detail_row.get("인스타"), network_row.get("인스타")),
         "블로그": _pick(detail_row.get("블로그"), network_row.get("블로그")),
+        "추가 링크": _merge_extra_links(detail_row.get("추가 링크") or "", network_row.get("추가 링크") or ""),
         "place_id": dom_row.get("place_id") or network_row.get("place_id") or apollo_row.get("place_id") or "",
         "source_page": dom_row.get("page_number"),
         "dom_index": dom_row.get("dom_index"),
@@ -1477,6 +1570,43 @@ def trim_membership_rows_to_target(rows: list, target: int) -> list:
     return list(rows[:target])
 
 
+_REPR_COLUMN_TO_CATEGORY = {"홈페이지": "homepage", "인스타": "insta", "블로그": "blog"}
+
+
+def _extra_link_line(category: str, url: str) -> str:
+    return f"[{_CHANNEL_LABELS.get(category, '기타')}] {url}"
+
+
+def _parse_extra_link_urls(text) -> list:
+    """"[라벨] URL" 줄바꿈 문자열을 (원본 line, url) 목록으로 되돌린다(재조립/dedup용).
+    라벨이 없는 원문 URL 한 줄짜리 값도 방어적으로 처리한다."""
+    entries = []
+    for line in str(text or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^\[[^\]]+\]\s+(\S+)$", line)
+        url = match.group(1) if match else line
+        entries.append((line, url))
+    return entries
+
+
+def _merge_extra_links(*texts) -> str:
+    """여러 "추가 링크" 문자열을 원본 순서를 유지하며 URL 기준(www 유무 무관)
+    idempotent하게 합집합 병합한다(요청서 §11 - 동일 URL 중복 없음, 반복
+    병합해도 개수가 늘지 않음)."""
+    seen: set = set()
+    result: list = []
+    for text in texts:
+        for line, url in _parse_extra_link_urls(text):
+            key = _dedup_key_for_external_url(url) if url.lower().startswith(("http://", "https://")) else url
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(line)
+    return "\n".join(result)
+
+
 class GlobalPlaceAccumulator:
     """수집 세션(쿼리 1회) 동안 발생한 Network response entity들을
     place_id 키 기준으로 전역 누적/보강하는 클래스.
@@ -1523,11 +1653,30 @@ class GlobalPlaceAccumulator:
             existing["주소"] = new_road
 
         # 비파괴적(non-destructive) 필드 보강: 기존 유효 값은 유지하고 비어있는 필드만 채움
-        # (int 0도 "값 있음"으로 정확히 처리됨 - 0 not in (None, "", [])).
+        # (int 0도 "값 있음"으로 정확히 처리됨 - 0 not in (None, "", [])). 홈페이지/
+        # 인스타/블로그는 기존 대표값이 있는데 새 response가 "다른" URL을 들고 오면
+        # 덮어쓰지도, 버리지도 않고 "추가 링크"로 합집합 보강한다(요청서 §11 -
+        # "여러 response에서 링크가 나뉘어 유입돼도 place_id exact 기준으로 합집합
+        # 병합"). "추가 링크" 자체는 마지막에 한 번에 idempotent 합집합 병합한다.
+        extra_additions: list = []
         for key, val in row.items():
-            if val not in (None, "", []):
-                if existing.get(key) in (None, "", []):
+            if key == "추가 링크":
+                continue
+            if val in (None, "", []):
+                continue
+            if key in _REPR_COLUMN_TO_CATEGORY:
+                existing_val = existing.get(key)
+                if existing_val in (None, "", []):
                     existing[key] = val
+                elif _dedup_key_for_external_url(val) != _dedup_key_for_external_url(existing_val):
+                    extra_additions.append(_extra_link_line(_REPR_COLUMN_TO_CATEGORY[key], val))
+                continue
+            if existing.get(key) in (None, "", []):
+                existing[key] = val
+
+        existing["추가 링크"] = _merge_extra_links(
+            existing.get("추가 링크") or "", row.get("추가 링크") or "", "\n".join(extra_additions)
+        )
 
         # 총리뷰수는 병합된 최종 방문자/블로그 리뷰수 기준으로 매번 재계산한다
         # (요청서 §11 - 스테일 값으로 남기지 않는다).
@@ -1570,6 +1719,12 @@ class GlobalPlaceAccumulator:
                 net_val = _normalize_text(net_row.get(field))
                 if net_val and not _normalize_text(updated.get(field)):
                     updated[field] = net_val
+
+            # 2b. "추가 링크"는 줄바꿈 목록이므로 _normalize_text(공백 전체 축약)를
+            # 쓰지 않고 idempotent 합집합 병합으로 보강한다(요청서 §11).
+            merged_extra = _merge_extra_links(updated.get("추가 링크") or "", net_row.get("추가 링크") or "")
+            if merged_extra:
+                updated["추가 링크"] = merged_extra
 
             # 2b. 방문자/블로그 리뷰수는 정수 타입을 보존해야 하므로 별도 처리한다
             # (int 0을 문자열화해 덮어쓰지 않기 위해 위 루프와 분리).
