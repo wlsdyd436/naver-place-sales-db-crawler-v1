@@ -23,12 +23,21 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from playwright.async_api import TimeoutError as PlaywrightAsyncTimeoutError
+
 import src.pc.home_enrichment as home_enrichment
 from src.pc.home_enrichment import (
     _enrich_home_batch_async,
     enrich_home_details,
     merge_home_result_into_row,
 )
+
+# PAGE300-6G-R1: 운영 안정화 대기(3초)를 테스트에서는 0으로 낮춘다 - 이
+# 모듈 상수는 _enrich_home_batch_async 안에서 매 호출 시 전역으로 참조되므로
+# 여기서 재할당하면 이 프로세스 안에서 즉시 반영된다(운영 기본값 자체는
+# home_enrichment.py 소스에서 바뀌지 않음 - 이 프로세스에서만 유효한 테스트
+# 전용 오버라이드).
+home_enrichment._HOME_RETRY_STABILIZATION_SECONDS = 0
 
 
 class ValidationReporter:
@@ -123,21 +132,40 @@ class FakeAsyncRequestContext:
     `context.request`이지만, 이 fake는 그 계약만 만족하면 되므로 실제
     브라우저/CDP 연결 없이 순수 로직만 검증할 수 있다. delay_seconds는
     place_id별 인위적인 await 지연을 줘 동시성 상한(Semaphore(2))을 관측
-    가능하게 만든다."""
+    가능하게 만든다.
 
-    def __init__(self, response_by_place_id: dict, *, delay_by_place_id=None, on_response_for=None):
+    outcomes_by_place_id(선택, PAGE300-6G-R1 재시도 검증용): place_id별로
+    호출 순서대로 소비되는 응답/예외 리스트 - 1차 시도와 재시도가 다른
+    결과를 내도록(예: 1차 apollo_missing → 재시도 success) 만들 때 쓴다.
+    리스트의 항목이 BaseException 인스턴스면 그 예외를 그대로 raise한다.
+    같은 place_id로 두 번째 이상 호출되면(=재시도 호출) 별도의 재시도
+    전용 동시성 카운터도 관측한다."""
+
+    def __init__(
+        self, response_by_place_id: dict, *, delay_by_place_id=None, on_response_for=None,
+        outcomes_by_place_id=None,
+    ):
         self.response_by_place_id = response_by_place_id
         self.delay_by_place_id = delay_by_place_id or {}
         self.on_response_for = on_response_for or {}
+        self.outcomes_by_place_id = outcomes_by_place_id or {}
         self.get_calls: list = []
         self._current_concurrency = 0
         self.max_observed_concurrency = 0
+        self._current_retry_concurrency = 0
+        self.max_observed_retry_concurrency = 0
 
     async def get(self, url, headers=None, timeout=None):
         place_id = _place_id_from_url(url)
+        is_retry_call = self.get_calls.count(place_id) >= 1
         self.get_calls.append(place_id)
         self._current_concurrency += 1
         self.max_observed_concurrency = max(self.max_observed_concurrency, self._current_concurrency)
+        if is_retry_call:
+            self._current_retry_concurrency += 1
+            self.max_observed_retry_concurrency = max(
+                self.max_observed_retry_concurrency, self._current_retry_concurrency
+            )
         try:
             delay = self.delay_by_place_id.get(place_id, 0)
             if delay:
@@ -145,9 +173,18 @@ class FakeAsyncRequestContext:
             callback = self.on_response_for.get(place_id)
             if callback is not None:
                 callback()
+            if place_id in self.outcomes_by_place_id:
+                outcomes = self.outcomes_by_place_id[place_id]
+                call_index = self.get_calls.count(place_id) - 1
+                outcome = outcomes[min(call_index, len(outcomes) - 1)]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
             return self.response_by_place_id[place_id]
         finally:
             self._current_concurrency -= 1
+            if is_retry_call:
+                self._current_retry_concurrency -= 1
 
 
 def _run(coro):
@@ -515,6 +552,225 @@ def check_basic_mode_leaves_extra_links_blank(reporter: ValidationReporter) -> N
         reporter.fail(f"13. 기본 모드 추가 링크 공란 정책 위반: {basic_row}")
 
 
+# ============================================================================
+# PAGE300-6G-R1: 홈페이지 보강 실패 진단 + 1회 재시도 검증(요청서 §13 A~H)
+# ============================================================================
+
+
+def _apollo_html(place_id: str, *, base_overrides=None, parent_overrides=None) -> bytes:
+    base_key = f"PlaceDetailBase:{place_id}"
+    op_key = f'placeDetail({{"input":{{"deviceType":"mobile","id":"{place_id}","isNx":false}}}})'
+    base = _base_entity(place_id, **(base_overrides or {}))
+    parent = _parent_entity(base_key, **(parent_overrides or {}))
+    apollo_state = {base_key: base, "ROOT_QUERY": {op_key: parent}}
+    html = f"<html><script>window.__APOLLO_STATE__ = {json.dumps(apollo_state)};</script></html>"
+    return html.encode("utf-8")
+
+
+def check_zero_external_links_is_success_not_retried(reporter: ValidationReporter) -> None:
+    """A(§13): 업체가 실제로 홈페이지·SNS를 등록하지 않아도(homepages 없음)
+    HTTP/Apollo/Base/Parent/Adapter가 전부 정상이면 성공이며, 실패 집계에
+    들어가지 않고 재시도도 하지 않는다."""
+    rows = [_row("911")]
+    html = _apollo_html("911", parent_overrides={"homepages": None})
+    ctx = FakeAsyncRequestContext({"911": FakeAsyncResponse(200, html)})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    row0 = result["rows"][0]
+    ok = (
+        result["home_success_count"] == 1
+        and result["failure_count"] == 0
+        and result["not_attempted_count"] == 0
+        and len(result["final_failures"]) == 0
+        and ctx.get_calls.count("911") == 1
+        and row0["홈페이지"] == "" and row0["인스타"] == "" and row0["블로그"] == ""
+    )
+    if ok:
+        reporter.pass_("A. 홈페이지·SNS 미등록(외부 링크 0개)은 성공으로 처리되고 재시도 큐에 들어가지 않음")
+    else:
+        reporter.fail(f"A. 링크 0개 성공 처리 검증 실패: result={result}")
+
+
+def check_transient_failure_retried_and_succeeds(reporter: ValidationReporter) -> None:
+    """B(§13): 1차 apollo_missing → 재시도 성공. 총 요청 2회, retry_pass
+    성공 집계 1, final_failures는 빈 리스트."""
+    rows = [_row("922")]
+    outcomes = {"922": [FakeAsyncResponse(200, b"<html>no apollo state here</html>"), FakeAsyncResponse(200, _apollo_html("922"))]}
+    ctx = FakeAsyncRequestContext({}, outcomes_by_place_id=outcomes)
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        ctx.get_calls.count("922") == 2
+        and result["home_success_count"] == 1
+        and result["failure_count"] == 0
+        and result["first_pass"]["failed"] == 1
+        and result["retry_pass"]["success"] == 1
+        and len(result["final_failures"]) == 0
+        and result["rows"][0]["홈페이지"] == "https://example-cafe.test"
+    )
+    if ok:
+        reporter.pass_("B. 1차 apollo_missing 후 재시도 성공(총 요청 2회, 최종 실패 0건)")
+    else:
+        reporter.fail(f"B. 일시적 실패 재시도 성공 검증 실패: result={result}")
+
+
+def check_final_failure_after_retry_still_fails(reporter: ValidationReporter) -> None:
+    """C(§13): 1차/재시도 모두 timeout → 최종 실패로 기록되고 업체명/
+    place_id/원인이 남으며, row 자체는 삭제되지 않는다(목록 원본 유지)."""
+    rows = [_row("933")]
+    outcomes = {"933": [PlaywrightAsyncTimeoutError("t1"), PlaywrightAsyncTimeoutError("t2")]}
+    ctx = FakeAsyncRequestContext({}, outcomes_by_place_id=outcomes)
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    failures = result["final_failures"]
+    ok = (
+        ctx.get_calls.count("933") == 2
+        and result["home_success_count"] == 0
+        and result["failure_count"] == 1
+        and len(failures) == 1
+        and failures[0]["place_id"] == "933"
+        and failures[0]["name"] == "업체933"
+        and failures[0]["status"] == "timeout"
+        and failures[0]["attempt"] == 2
+        and len(result["rows"]) == 1
+        and result["rows"][0]["place_id"] == "933"
+    )
+    if ok:
+        reporter.pass_("C. 1차·재시도 모두 timeout이면 최종 실패로 기록되고 row는 그대로 보존됨")
+    else:
+        reporter.fail(f"C. 최종 실패 기록 검증 실패: failures={failures}, result={result}")
+
+
+def check_blocked_first_pass_skips_retry_entirely(reporter: ValidationReporter) -> None:
+    """D(§13): 1차에서 HTTP 403(차단) 감지 시 재시도 큐 자체를 만들지
+    않는다(재시도 요청 0회) - 기존 즉시 중단 동작(§4)과 결합."""
+    place_ids = [str(700 + i) for i in range(5)]
+    rows = [_row(pid) for pid in place_ids]
+    responses = {pid: FakeAsyncResponse(200, _apollo_html(pid)) for pid in place_ids}
+    responses[place_ids[0]] = FakeAsyncResponse(403, b"")
+    ctx = FakeAsyncRequestContext(responses, delay_by_place_id={place_ids[1]: 0.05})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["security_blocked"] is True
+        and result["stop_reason"] == "security_blocked"
+        and result["retry_pass"]["attempted"] == 0
+    )
+    if ok:
+        reporter.pass_("D. 1차 HTTP 403 차단 시 재시도 요청 0회(즉시 안전 중단)")
+    else:
+        reporter.fail(f"D. 차단 시 재시도 차단 검증 실패: result={result}")
+
+
+def check_place_id_mismatch_not_merged_and_not_retried(reporter: ValidationReporter) -> None:
+    """E(§13): place_id_mismatch는 재시도 대상이 아니며(값을 신뢰할 수 없는
+    응답이라 재요청해도 의미가 없음), row에 병합되지 않고 최종 실패로만
+    기록된다."""
+    rows = [_row("944")]
+    html = _apollo_html("944", base_overrides={"id": "999999"})
+    ctx = FakeAsyncRequestContext({"944": FakeAsyncResponse(200, html)})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    failures = result["final_failures"]
+    ok = (
+        ctx.get_calls.count("944") == 1
+        and result["rows"][0]["홈페이지"] == ""
+        and len(failures) == 1
+        and failures[0]["status"] == "place_id_mismatch"
+    )
+    if ok:
+        reporter.pass_("E. place_id_mismatch는 재시도되지 않고 병합도 되지 않음(최종 실패로만 기록)")
+    else:
+        reporter.fail(f"E. place_id mismatch 비병합 검증 실패: failures={failures}, result={result}")
+
+
+def check_retry_pass_concurrency_capped_at_one(reporter: ValidationReporter) -> None:
+    """F(§13): 1차 순회는 기존과 동일하게 동시성 2, 재시도 순회는 동시성
+    1을 넘지 않는다(재시도 전용 호출만 별도로 관측). 대량 실패 안전장치
+    (§8, 대상 수의 10% 초과 실패 시 재시도 차단)에 걸리지 않도록 1차
+    실패 업체를 대상 수 대비 10% 이하로 구성한다(25건 중 3건만 1차 실패 -
+    ceil(25*0.1)=3이므로 안전장치 미해당)."""
+    retry_ids = [str(800 + i) for i in range(3)]
+    success_ids = [str(820 + i) for i in range(22)]
+    rows = [_row(pid) for pid in retry_ids] + [_row(pid) for pid in success_ids]
+    outcomes = {
+        pid: [FakeAsyncResponse(200, b"<html>no apollo</html>"), FakeAsyncResponse(200, _apollo_html(pid))]
+        for pid in retry_ids
+    }
+    responses = {pid: FakeAsyncResponse(200, _apollo_html(pid)) for pid in success_ids}
+    ctx = FakeAsyncRequestContext(
+        responses, outcomes_by_place_id=outcomes, delay_by_place_id={pid: 0.02 for pid in retry_ids}
+    )
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        ctx.max_observed_concurrency <= 2
+        and ctx.max_observed_retry_concurrency <= 1
+        and result["retry_pass"]["success"] == 3
+        and result["home_success_count"] == 25
+        and all(ctx.get_calls.count(pid) == 2 for pid in retry_ids)
+    )
+    if ok:
+        reporter.pass_(
+            f"F. 1차 동시성 상한 2({ctx.max_observed_concurrency}), 재시도 동시성 상한 1({ctx.max_observed_retry_concurrency}) 준수"
+        )
+    else:
+        reporter.fail(f"F. 재시도 동시성 상한 검증 실패: result={result}, max_retry_concurrency={ctx.max_observed_retry_concurrency}")
+
+
+def check_user_stop_before_retry_pass_skips_retry(reporter: ValidationReporter) -> None:
+    """G(§13): 1차 종료 직후 should_continue가 False로 바뀌면 재시도
+    요청을 전혀 보내지 않는다(안정화 대기 전 재확인, §7)."""
+    rows = [_row("955")]
+    stop_flag = {"stop": False}
+
+    def _stop_after_first():
+        stop_flag["stop"] = True
+
+    ctx = FakeAsyncRequestContext(
+        {"955": FakeAsyncResponse(200, b"<html>no apollo</html>")},
+        on_response_for={"955": _stop_after_first},
+    )
+    result = _run(
+        _enrich_home_batch_async(
+            rows, should_continue=lambda: not stop_flag["stop"], request_context_factory=_factory_for(ctx),
+        )
+    )
+    ok = (
+        ctx.get_calls.count("955") == 1
+        and result["retry_pass"]["attempted"] == 0
+        and result["stop_reason"] == "user_stopped"
+    )
+    if ok:
+        reporter.pass_("G. 1차 종료 직후 사용자 중지 시 재시도 요청 0회")
+    else:
+        reporter.fail(f"G. 재시도 전 사용자 중지 검증 실패: result={result}")
+
+
+def check_diagnostics_report_structure_and_no_sensitive_data(reporter: ValidationReporter) -> None:
+    """H(§13): diagnostics_report에 place_id/이름/상태 등 공개·구조 정보만
+    있고 쿠키/Authorization/토큰/HTML 원문이 전혀 없으며, 한글 업체명이
+    깨지지 않는다."""
+    rows = [_row("966")]
+    rows[0]["업체명"] = "한글업체명테스트"
+    ctx = FakeAsyncRequestContext({"966": FakeAsyncResponse(200, _apollo_html("966"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    report = result["diagnostics_report"]
+    serialized = json.dumps(report, ensure_ascii=False)
+    forbidden_terms = [
+        "cookie", "Cookie", "COOKIE", "Authorization", "authorization",
+        "token", "Token", "<html", "__APOLLO_STATE__",
+    ]
+    ok = (
+        report.get("target_count") == 1
+        and report.get("mode") == "home_sns"
+        and len(report.get("attempts", [])) == 1
+        and report["attempts"][0]["name"] == "한글업체명테스트"
+        and report["attempts"][0]["final"] is True
+        and "한글업체명테스트" in serialized
+        and all(term not in serialized for term in forbidden_terms)
+        and report.get("final", {}).get("success") == 1
+    )
+    if ok:
+        reporter.pass_("H. diagnostics_report에 민감정보 없음 + 한글 업체명 보존 + 구조 필드 정상")
+    else:
+        reporter.fail(f"H. 진단 JSON 구조/민감정보 검증 실패: report={report}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -533,6 +789,14 @@ def main() -> bool:
         check_extra_links_flow_through_ssr_fetch_and_merge,
         check_merge_home_result_into_row_fills_extra_links_field,
         check_basic_mode_leaves_extra_links_blank,
+        check_zero_external_links_is_success_not_retried,
+        check_transient_failure_retried_and_succeeds,
+        check_final_failure_after_retry_still_fails,
+        check_blocked_first_pass_skips_retry_entirely,
+        check_place_id_mismatch_not_merged_and_not_retried,
+        check_retry_pass_concurrency_capped_at_one,
+        check_user_stop_before_retry_pass_skips_retry,
+        check_diagnostics_report_structure_and_no_sensitive_data,
     ]
     for check in checks:
         check(reporter)

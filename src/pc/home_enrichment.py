@@ -24,7 +24,11 @@
 # 보장하므로, 이 모듈이 같은 profile_dir로 새 프로세스를 시작해도 두 프로세스가
 # 동시에 같은 profile을 쓰는 충돌은 발생하지 않는다.
 import asyncio
+import math
 import subprocess
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.async_api import TimeoutError as PlaywrightAsyncTimeoutError
@@ -54,6 +58,25 @@ from src.pc.network_list_scraper import (
 )
 
 _HOME_ENRICHMENT_CONCURRENCY = 2
+_HOME_RETRY_CONCURRENCY = 1
+_HOME_RETRY_STABILIZATION_SECONDS = 3
+_HOME_MAX_FAILURE_RATIO_FOR_RETRY = 0.1
+
+# PAGE300-6G-R1(홈페이지 보강 진단/재시도): 일시적(transient) 실패로 간주해
+# 재시도하는 상태 집합 - HTTP 403/405/429/CAPTCHA/place_id_mismatch/
+# no_place_url/user_stopped는 여기 없으므로 재시도되지 않는다(요청서 §7).
+_HOME_RETRYABLE_STATUSES = frozenset(
+    {
+        "timeout",
+        "request_error",
+        "http_5xx",
+        "empty_html",
+        "apollo_missing",
+        "base_missing",
+        "parent_missing",
+        "adapter_empty",
+    }
+)
 
 
 def _not_attempted_result(place_id: str) -> dict:
@@ -61,20 +84,15 @@ def _not_attempted_result(place_id: str) -> dict:
 
 
 def _error_result(place_id: str) -> dict:
-    return {"place_id": place_id, "detail_success": False, "home_status": "error"}
+    return {"place_id": place_id, "detail_success": False, "home_status": "unexpected_error"}
 
 
-async def _fetch_place_home_async(request_context, row: dict) -> dict:
-    """`_fetch_place_detail_ssr`(sync, network_browser_collector.py)의 async
-    대응. I/O만 async로 바뀌고 판정 로직(_classify_ssr_block_signal,
-    _parse_apollo_state_from_html, extract_normalized_apollo_detail,
-    _map_item_to_row, build_place_url_from_id)은 전부 순수 함수라 그대로
-    재사용한다(재구현 없음). request_context는 실제 Native Edge
-    BrowserContext의 `context.request`(production) 또는 테스트 fake다 -
-    이 함수는 어느 쪽이든 `.get(url, headers=..., timeout=...)` 계약만
-    있으면 동작한다. 예외를 던지지 않고 항상 dict를 반환한다."""
-    place_id = str(row.get("place_id") or "").strip()
-    result = {
+def _blank_home_fetch_result(place_id: str) -> dict:
+    """`_fetch_place_home_async` 반환 dict의 공통 뼈대 - 병합용 필드와
+    진단용 필드(home_* 접두사, `_fetch_place_detail_ssr`의 detail_ssr_*
+    명명 규약과 동일한 의미)를 항상 포함한다. 쿠키/헤더 전체/HTML
+    원문/토큰은 어디에도 담지 않는다(공개 정보와 구조 진단만)."""
+    return {
         "place_id": place_id,
         "detail_success": False,
         "home_status": "",
@@ -90,22 +108,57 @@ async def _fetch_place_home_async(request_context, row: dict) -> dict:
         "인스타": "",
         "블로그": "",
         "추가 링크": "",
+        "home_http_status": None,
+        "home_response_size": 0,
+        "home_apollo_found": False,
+        "home_base_found": False,
+        "home_parent_found": False,
+        "home_response_place_id": "",
+        "home_place_id_exact": False,
+        "home_adapter_success": False,
+        "home_elapsed_seconds": 0.0,
+        "home_error_type": "",
     }
+
+
+async def _fetch_place_home_async(request_context, row: dict) -> dict:
+    """`_fetch_place_detail_ssr`(sync, network_browser_collector.py)의 async
+    대응. I/O만 async로 바뀌고 판정 로직(_classify_ssr_block_signal,
+    _parse_apollo_state_from_html, extract_normalized_apollo_detail,
+    _map_item_to_row, build_place_url_from_id)은 전부 순수 함수라 그대로
+    재사용한다(재구현 없음). request_context는 실제 Native Edge
+    BrowserContext의 `context.request`(production) 또는 테스트 fake다 -
+    이 함수는 어느 쪽이든 `.get(url, headers=..., timeout=...)` 계약만
+    있으면 동작한다. 예외를 던지지 않고 항상 dict를 반환한다.
+
+    home_status는 항상 링크 존재 여부와 무관하게 apollo/base/place_id_exact/
+    adapter 성공 시에만 "success"다 - 업체가 실제로 홈페이지·SNS를 등록하지
+    않아 홈페이지/인스타/블로그/추가 링크가 전부 공란이어도 그 자체는
+    실패가 아니다(요청서 §4)."""
+    place_id = str(row.get("place_id") or "").strip()
+    result = _blank_home_fetch_result(place_id)
     place_url = build_place_url_from_id(place_id)
     if not place_url:
         result["home_status"] = "no_place_url"
+        result["home_error_type"] = "MissingPlaceId"
         return result
 
+    t0 = time.monotonic()
     try:
         resp = await request_context.get(place_url, headers=_SSR_REQUEST_HEADERS, timeout=_SSR_REQUEST_TIMEOUT_MS)
     except PlaywrightAsyncTimeoutError:
         result["home_status"] = "timeout"
+        result["home_error_type"] = "Timeout"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
-    except Exception:
+    except Exception as exc:
         result["home_status"] = "request_error"
+        result["home_error_type"] = type(exc).__name__
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
 
     status_code = resp.status
+    result["home_http_status"] = status_code
     try:
         content_type = resp.headers.get("content-type", "") if resp.headers else ""
     except Exception:
@@ -114,35 +167,73 @@ async def _fetch_place_home_async(request_context, row: dict) -> dict:
         html_text = await resp.text()
     except Exception:
         html_text = ""
+    result["home_response_size"] = len(html_text)
 
     block_signal = _classify_ssr_block_signal(status_code, html_text[:4000])
     if block_signal["blocked"]:
-        result["home_status"] = "blocked"
-        result["block_type"] = block_signal["block_type"]
+        block_type = block_signal["block_type"]
+        result["home_status"] = "captcha_detected" if block_type == "CAPTCHA_CHALLENGE" else "security_blocked"
+        result["home_error_type"] = block_type
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
 
     if status_code != 200 or "text/html" not in content_type:
-        result["home_status"] = "unexpected_response"
+        if 500 <= status_code < 600:
+            result["home_status"] = "http_5xx"
+        else:
+            result["home_status"] = "http_4xx"
+        result["home_error_type"] = f"UnexpectedHttpStatus{status_code}"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
+        return result
+
+    if not html_text.strip():
+        result["home_status"] = "empty_html"
+        result["home_error_type"] = "EmptyResponseBody"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
 
     apollo_state = _parse_apollo_state_from_html(html_text)
+    result["home_apollo_found"] = apollo_state is not None
     if apollo_state is None:
         result["home_status"] = "apollo_missing"
+        result["home_error_type"] = "ApolloStateNotFound"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
 
     base_key = f"PlaceDetailBase:{place_id}"
     base_entity = apollo_state.get(base_key)
-    if not isinstance(base_entity, dict):
+    base_found = isinstance(base_entity, dict)
+    result["home_base_found"] = base_found
+    if not base_found:
         result["home_status"] = "base_missing"
+        result["home_error_type"] = "BaseNotFound"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
     base_id = str(base_entity.get("id") or "").strip()
+    result["home_response_place_id"] = base_id
     if base_id and base_id != place_id:
         result["home_status"] = "place_id_mismatch"
+        result["home_error_type"] = "PlaceIdMismatch"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
+    result["home_place_id_exact"] = True
 
     apollo_detail = extract_normalized_apollo_detail(apollo_state, place_id)
     if not apollo_detail:
         result["home_status"] = "adapter_empty"
+        result["home_error_type"] = "AdapterEmpty"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
+        return result
+    result["home_adapter_success"] = True
+
+    parent_found = any(
+        apollo_detail.get(field) is not None for field in ("homepages", "newOpening", "phoneInfo")
+    )
+    result["home_parent_found"] = parent_found
+    if not parent_found:
+        result["home_status"] = "parent_missing"
+        result["home_error_type"] = "ParentNotFound"
+        result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
         return result
 
     apollo_row = _map_item_to_row(apollo_detail, "")
@@ -160,6 +251,7 @@ async def _fetch_place_home_async(request_context, row: dict) -> dict:
     result["인스타"] = apollo_row.get("인스타", "")
     result["블로그"] = apollo_row.get("블로그", "")
     result["추가 링크"] = apollo_row.get("추가 링크", "")
+    result["home_elapsed_seconds"] = round(time.monotonic() - t0, 3)
     return result
 
 
@@ -231,14 +323,30 @@ async def _connect_native_edge_context(backend_config: BrowserBackendConfig):
         raise
 
 
+def _external_url_count(result: dict) -> int:
+    if not result.get("detail_success"):
+        return 0
+    count = sum(1 for field in ("홈페이지", "인스타", "블로그") if result.get(field))
+    extra = result.get("추가 링크") or ""
+    if extra:
+        count += len([line for line in extra.split("\n") if line.strip()])
+    return count
+
+
 async def _enrich_home_batch_async(
     rows, *, should_continue=None, on_progress=None, backend_config=None, request_context_factory=None
 ) -> dict:
-    """asyncio.Semaphore(2)로 동시성을 제한하고, 차단(blocked) 또는 사용자
-    중지 시 신규 scheduling을 즉시 중단한다 - 이미 세마포어를 통과해
-    실행 중이던 요청(최대 2개)만 완료까지 진행하고, 아직 세마포어를 기다리던
-    나머지는 시도하지 않고 not_attempted로 남는다. place_id당 정확히 1회만
-    요청한다(dict 캐시).
+    """asyncio.Semaphore(2)로 1차 순회를 수행하고(동시성/차단/사용자중지/
+    dedup 정책은 기존과 동일), 1차 실패 중 일시적(transient) 상태만
+    (_HOME_RETRYABLE_STATUSES) 골라 안정화 대기(3초) 후 동시성 1로 최대 1회
+    재시도한다(요청서 §7/§8, PAGE300-6G-R1). 차단/사용자중지/1차 실패율이
+    대상 수의 10%를 초과하면 재시도 큐 자체를 만들지 않는다(§8 대량 실패
+    안전장치 - 비율은 항상 실제 대상 수 기준으로 동적 계산, 하드코딩 금지).
+
+    place_id마다 모든 시도(1차 + 재시도)의 진단 기록(§5 스키마)을
+    `attempts`에 남기고, 최종까지 실패한 업체는 `final_failures`에
+    업체명/place_id/원인/HTTP/시도횟수/응답시간을 남긴다. 쿠키/헤더
+    전체/HTML 원문/토큰은 어디에도 저장하지 않는다.
 
     request_context_factory(선택, 테스트 전용 DI)는 인자 없이 호출되어
     request_context(.get() 계약만 있으면 됨)를 awaitable로 반환해야 한다 -
@@ -246,6 +354,7 @@ async def _enrich_home_batch_async(
     순수 fake만으로 검증할 수 있게 하기 위함). 주어지지 않으면(production
     기본 경로) `_connect_native_edge_context`로 같은 persistent profile의
     실제 BrowserContext에 연결해 그 `.request`를 사용한다."""
+    started_at = datetime.now(timezone.utc)
     unique_place_ids: list = []
     seen_ids: set = set()
     row_by_place_id: dict = {}
@@ -259,38 +368,93 @@ async def _enrich_home_batch_async(
 
     total = len(unique_place_ids)
     cache: dict = {}
+    attempts: list = []
+    last_attempt_number: dict = {}
     stop_new_requests = asyncio.Event()
-    semaphore = asyncio.Semaphore(_HOME_ENRICHMENT_CONCURRENCY)
-    counters = {"success": 0, "failure": 0, "completed": 0}
+    sequence = {"n": 0}
 
     def _should_stop() -> bool:
         return stop_new_requests.is_set() or (should_continue is not None and not should_continue())
 
-    async def _run_one(request_context, place_id: str) -> None:
-        if _should_stop():
-            result = _not_attempted_result(place_id)
-        else:
+    def _report_progress() -> None:
+        if on_progress is None:
+            return
+        completed = sum(1 for result in cache.values() if result.get("home_status") != "not_attempted")
+        success = sum(1 for result in cache.values() if result.get("detail_success"))
+        failure = completed - success
+        try:
+            on_progress(completed, total, success, failure)
+        except Exception:
+            pass
+
+    def _record_attempt(place_id: str, attempt: int, result: dict) -> None:
+        sequence["n"] += 1
+        last_attempt_number[place_id] = attempt
+        row = row_by_place_id.get(place_id, {})
+        status = result.get("home_status", "")
+        retryable = (not result.get("detail_success")) and status in _HOME_RETRYABLE_STATUSES
+        attempts.append(
+            {
+                "sequence": sequence["n"],
+                "place_id": place_id,
+                "name": row.get("업체명", ""),
+                "attempt": attempt,
+                "elapsed_ms": round(result.get("home_elapsed_seconds", 0.0) * 1000),
+                "http_status": result.get("home_http_status"),
+                "response_size": result.get("home_response_size", 0),
+                "apollo_found": result.get("home_apollo_found", False),
+                "base_found": result.get("home_base_found", False),
+                "parent_found": result.get("home_parent_found", False),
+                "reference_exact": result.get("home_adapter_success", False),
+                "response_place_id": result.get("home_response_place_id", ""),
+                "place_id_exact": result.get("home_place_id_exact", False),
+                "adapter_success": result.get("home_adapter_success", False),
+                "external_url_count": _external_url_count(result),
+                "status": status,
+                "error_type": result.get("home_error_type", ""),
+                "retryable": retryable,
+                "blocked": status in ("security_blocked", "captcha_detected"),
+                "final": False,  # 마지막에 place_id별 최종 시도만 True로 보정한다
+            }
+        )
+
+    async def _run_pass(place_ids: list, concurrency: int, attempt: int, request_context, *, is_retry: bool) -> dict:
+        semaphore = asyncio.Semaphore(concurrency)
+        pass_counters = {"attempted": 0, "success": 0, "failed": 0}
+
+        async def _run_one(place_id: str) -> None:
+            if _should_stop():
+                if not is_retry:
+                    cache[place_id] = _not_attempted_result(place_id)
+                    _report_progress()
+                return  # retry pass: 1차 결과를 그대로 보존(덮어쓰지 않음)
             async with semaphore:
                 if _should_stop():
-                    result = _not_attempted_result(place_id)
+                    if not is_retry:
+                        cache[place_id] = _not_attempted_result(place_id)
+                        _report_progress()
+                    return
+                try:
+                    result = await _fetch_place_home_async(request_context, row_by_place_id[place_id])
+                except Exception as exc:
+                    result = _error_result(place_id)
+                    result["home_error_type"] = type(exc).__name__
+                status = result.get("home_status")
+                pass_counters["attempted"] += 1
+                if result.get("detail_success"):
+                    pass_counters["success"] += 1
                 else:
-                    try:
-                        result = await _fetch_place_home_async(request_context, row_by_place_id[place_id])
-                    except Exception:
-                        result = _error_result(place_id)
-                    if result.get("home_status") == "blocked":
-                        stop_new_requests.set()
-        cache[place_id] = result
-        counters["completed"] += 1
-        if result.get("detail_success"):
-            counters["success"] += 1
-        elif result.get("home_status") != "not_attempted":
-            counters["failure"] += 1
-        if on_progress is not None:
-            try:
-                on_progress(counters["completed"], total, counters["success"], counters["failure"])
-            except Exception:
-                pass
+                    pass_counters["failed"] += 1
+                if status in ("security_blocked", "captcha_detected"):
+                    stop_new_requests.set()
+                cache[place_id] = result
+                _record_attempt(place_id, attempt, result)
+                _report_progress()
+
+        tasks = [asyncio.create_task(_run_one(place_id)) for place_id in place_ids]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return pass_counters
 
     # request_context_factory가 주어지면(테스트 전용 DI) 실제 Native Edge
     # CDP 프로세스를 전혀 시작하지 않는다 - collector_factory 등 이 저장소의
@@ -305,10 +469,37 @@ async def _enrich_home_batch_async(
         )
         request_context = context.request
 
+    retry_pass_counters = {"attempted": 0, "success": 0, "failed": 0, "skipped": 0}
     try:
-        tasks = [asyncio.create_task(_run_one(request_context, place_id)) for place_id in unique_place_ids]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        first_pass_counters = await _run_pass(
+            unique_place_ids, _HOME_ENRICHMENT_CONCURRENCY, 1, request_context, is_retry=False
+        )
+
+        retry_candidates = [
+            place_id
+            for place_id in unique_place_ids
+            if not cache.get(place_id, {}).get("detail_success")
+            and cache.get(place_id, {}).get("home_status") in _HOME_RETRYABLE_STATUSES
+        ]
+        failure_ratio_exceeded = total > 0 and first_pass_counters["failed"] > math.ceil(
+            total * _HOME_MAX_FAILURE_RATIO_FOR_RETRY
+        )
+        safety_gate_triggered = _should_stop() or failure_ratio_exceeded
+
+        if retry_candidates and not safety_gate_triggered:
+            await asyncio.sleep(_HOME_RETRY_STABILIZATION_SECONDS)
+            if _should_stop():
+                retry_pass_counters["skipped"] = len(retry_candidates)
+            else:
+                ran = await _run_pass(
+                    retry_candidates, _HOME_RETRY_CONCURRENCY, 2, request_context, is_retry=True
+                )
+                retry_pass_counters["attempted"] = ran["attempted"]
+                retry_pass_counters["success"] = ran["success"]
+                retry_pass_counters["failed"] = ran["failed"]
+                retry_pass_counters["skipped"] = len(retry_candidates) - ran["attempted"]
+        else:
+            retry_pass_counters["skipped"] = len(retry_candidates)
     finally:
         if playwright_cm is not None:
             # context.request는 BrowserContext 소유 객체이므로 별도 dispose()를
@@ -326,6 +517,11 @@ async def _enrich_home_batch_async(
             _terminate_owned_process(process)
             _release_profile_lock(lock_path)
 
+    # place_id별 마지막 시도만 final=True로 보정한다(재시도 큐가 나중에
+    # 안전장치로 skip되어도 1차 시도 기록이 final로 정확히 남는다).
+    for record in attempts:
+        record["final"] = record["attempt"] == last_attempt_number.get(record["place_id"])
+
     if stop_new_requests.is_set():
         stop_reason = "security_blocked"
     elif should_continue is not None and not should_continue():
@@ -333,7 +529,53 @@ async def _enrich_home_batch_async(
     else:
         stop_reason = None
 
+    final_success_count = sum(1 for result in cache.values() if result.get("detail_success"))
     not_attempted_count = sum(1 for result in cache.values() if result.get("home_status") == "not_attempted")
+    final_failure_count = len(cache) - final_success_count - not_attempted_count
+
+    final_failures = []
+    failure_reason_counts: dict = {}
+    for place_id in unique_place_ids:
+        result = cache.get(place_id)
+        if result is None or result.get("detail_success") or result.get("home_status") == "not_attempted":
+            continue
+        status = result.get("home_status", "")
+        failure_reason_counts[status] = failure_reason_counts.get(status, 0) + 1
+        row = row_by_place_id.get(place_id, {})
+        final_failures.append(
+            {
+                "place_id": place_id,
+                "name": row.get("업체명", ""),
+                "status": status,
+                "http_status": result.get("home_http_status"),
+                "attempt": last_attempt_number.get(place_id, 1),
+                "elapsed_ms": round(result.get("home_elapsed_seconds", 0.0) * 1000),
+            }
+        )
+
+    finished_at = datetime.now(timezone.utc)
+    diagnostics_report = {
+        "run_id": uuid.uuid4().hex,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "mode": "home_sns",
+        "target_count": total,
+        "first_pass": {
+            "attempted": first_pass_counters["attempted"],
+            "success": first_pass_counters["success"],
+            "failed": first_pass_counters["failed"],
+        },
+        "retry_pass": retry_pass_counters,
+        "final": {
+            "success": final_success_count,
+            "failed": final_failure_count,
+            "not_attempted": not_attempted_count,
+            "stop_reason": stop_reason,
+        },
+        "failure_reason_counts": failure_reason_counts,
+        "attempts": attempts,
+        "final_failures": final_failures,
+    }
 
     merged_rows = [
         merge_home_result_into_row(row, cache.get(str(row.get("place_id") or "").strip())) for row in rows
@@ -343,9 +585,13 @@ async def _enrich_home_batch_async(
         "rows": merged_rows,
         "stop_reason": stop_reason,
         "security_blocked": stop_new_requests.is_set(),
-        "home_success_count": counters["success"],
-        "failure_count": counters["failure"],
+        "home_success_count": final_success_count,
+        "failure_count": final_failure_count,
         "not_attempted_count": not_attempted_count,
+        "first_pass": diagnostics_report["first_pass"],
+        "retry_pass": retry_pass_counters,
+        "final_failures": final_failures,
+        "diagnostics_report": diagnostics_report,
     }
 
 

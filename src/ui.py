@@ -21,6 +21,7 @@ from src.parser import parse_places
 from src.pc_crawler import crawl_places_pc
 from src.pc.config import DiagnosticConfig
 from src.pc.detail_scraper import build_full_collector
+from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
 from src.pc.home_enrichment import enrich_home_details
 from src.pc.network_browser_collector import ApolloFirstListCollector
 from src.pc.network_pipeline import run_collection_plan
@@ -1912,11 +1913,44 @@ class SalesDbCrawlerApp(ctk.CTk):
             result["home_success_count"] = home_result["home_success_count"]
             result["home_failure_count"] = home_result["failure_count"]
             result["home_not_attempted_count"] = home_result["not_attempted_count"]
+
+            # PAGE300-6G-R1: first_pass/retry_pass가 없는 fake(구 버전 테스트
+            # fixture 등)와도 호환되도록 .get(..., 기본값)만 사용한다.
+            first_pass = home_result.get("first_pass") or {}
+            retry_pass = home_result.get("retry_pass") or {}
             self.log(
-                f"[ui][network][home] 홈페이지/SNS 보강 종료: stop_reason={home_result['stop_reason']}, "
-                f"성공={home_result['home_success_count']}, 실패={home_result['failure_count']}, "
+                "[ui][network][home] 보강 종료: "
+                f"1차 성공={first_pass.get('success', home_result['home_success_count'])}, "
+                f"1차 실패={first_pass.get('failed', home_result['failure_count'])}, "
+                f"재시도 성공={retry_pass.get('success', 0)}, "
+                f"최종 실패={home_result['failure_count']}, "
                 f"미시도={home_result['not_attempted_count']}"
             )
+
+            final_failures = home_result.get("final_failures") or []
+            total_final_failures = len(final_failures)
+            for index, failure in enumerate(final_failures, start=1):
+                self.log(
+                    f"[ui][network][home][실패 {index}/{total_final_failures}] "
+                    f"업체명={failure.get('name', '')} place_id={failure.get('place_id', '')} "
+                    f"원인={failure.get('status', '')} HTTP={failure.get('http_status')} "
+                    f"시도={failure.get('attempt', '')} 응답시간={failure.get('elapsed_ms', '')}ms"
+                )
+
+            diagnostics_report = home_result.get("diagnostics_report")
+            if diagnostics_report is not None:
+                diagnostics_filename = f"home_enrichment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                try:
+                    DEFAULT_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
+                    artifact = save_json_artifact(
+                        DEFAULT_DIAGNOSTICS_ROOT, diagnostics_filename, diagnostics_report
+                    )
+                    if artifact.success:
+                        self.log(f"[ui][network][home] 실패 진단 저장: {artifact.path}")
+                    else:
+                        self.log(f"[ui][network][home] 진단 저장 실패: {artifact.error_message}")
+                except Exception as exc:
+                    self.log(f"[ui][network][home] 진단 저장 실패: {type(exc).__name__}: {exc}")
 
         self.log(
             f"[ui][network] stop_reason={result.get('stop_reason')}, "

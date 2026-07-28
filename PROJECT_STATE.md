@@ -7795,3 +7795,254 @@ Fake/회귀 테스트만 실행(Live 미실행 - 목록 데이터 소스 실측�
 전부 수행하지 않았다. 위에 기록한 파일(`src/ui.py`,
 `tests/test_ui_network_wiring.py`, `README.md`, `PROJECT_STATE.md`)만
 편집했다.
+
+---
+
+# 2026-07-23 [PAGE300-SSR-1] SSR 상세정보 보강 production 기본 흐름 재배선(DOM 방문 아닌 SSR)
+
+## 배경
+2026-07-22에 자동 상세 배선이 한 차례 롤백된 이력이 있다(바로 위 절 참고) -
+그 라운드가 걷어낸 것은 **업체당 상세 페이지를 실제로 렌더링(`page.goto`)하는
+방식**(`DomMembershipCollector.enrich_detail`/`_fetch_place_detail`)이
+300건 전체에 자동으로 걸리면서, 실행시간이 2배 이상 늘고 300회 연속
+페이지 이동의 차단 위험이 미실측 상태로 기본값이 된 점이었다.
+
+그 사이 별도 라운드(5O/5Q/5R: Apollo Base+Parent 정규화 adapter 검증,
+5S/5T: SSR HTML GET 방식 실측, 5U-R1/5V-R1/5W-R1: 그 실측 산출물에 대한
+사후 감사)를 거치며 **"BrowserContext-shared page.request.get으로 HTML만
+받아오고 렌더링하지 않는" 방식**이 검증됐다. 5W-R1 감사는 이 방식을 실제로
+구현한 1회성 스크립트(`run_insession_ssr_300.py`) 자체에서 (1) 실행
+이력 파일(`execution_history.json`)이 스크립트 자체 코드 흐름으로는 나올 수
+없는 내용을 담고 있는 모순, (2) custom pandas Excel writer가 행 키를
+`상호명`으로 잘못 써서 실제 산출물의 업체명 컬럼이 300/300 전부 공란이 되는
+버그, (3) "TLS fingerprint 100% 공유" 주장이 코드로 뒷받침되지 않는다는
+점을 발견했다.
+
+이번 라운드는 이 SSR 방식을 **production 코드 품질로 다시 구현**하고(위 3개
+결함을 피함 - 기존 `export_places_to_excel`만 사용, 실행 이력에 값을
+검증하지 않고 남겨두지 않음, "쿠키 공유"와 "TLS fingerprint 공유"를 코드
+문서에서 명확히 구분), 2026-07-22 롤백이 우려했던 지점(실행시간 2배·300회
+연속 렌더링·미검증 차단 위험)을 완화하는 방식으로 다시 기본 흐름에
+배선했다: 업체당 페이지 렌더링 대신 HTML GET 1회, 실패 시에만(500/timeout/
+필드 누락) 기존 DOM 방문 방식으로 업체당 최대 1회의 제한적 fallback.
+
+**단, 300건 전체 자동 SSR 실행의 실제 소요시간·차단 발생률은 이번
+라운드에서도 Live로 검증되지 않았다** - 아래 "남은 위험" 참고. 2026-07-22
+절이 지적한 우려("자동 배선 자체가 미검증 상태로 기본값이 됨")는 메커니즘이
+가벼워졌을 뿐 구조적으로는 이번에도 동일하게 남아있다.
+
+## 구현
+- `src/pc/network_browser_collector.py`
+  - `_parse_apollo_state_from_html(html_text)`: `window.__APOLLO_STATE__`
+    값을 `json.JSONDecoder().raw_decode()`로 안전 추출(5W-R1이 지적한
+    non-greedy 정규식의 조기 절단 위험 회피). 병적으로 큰 응답
+    (5MB 초과)은 파싱 시도 없이 거부.
+  - `_classify_ssr_block_signal(status_code, html_text)`: HTTP
+    403/405/429 또는 5S/5T/5W가 실측한 CAPTCHA 텍스트 마커로 차단을
+    판정(SSR 경로는 렌더링이 없어 기존 DOM 기반 `classify_captcha_signal`을
+    쓸 수 없음).
+  - `_fetch_place_detail_ssr(page, row, *, should_continue=None)`: 업체
+    1건의 SSR GET 1회 + Apollo Base/Parent 확인 + place_id exact 확인 +
+    리뷰 완전 누락 확인까지 수행하고 `detail_ssr_*` 진단 키 11개(Excel
+    비노출)를 포함한 dict를 반환.
+  - `DomMembershipCollector.enrich_detail_ssr(rows, *, max_targets=None,
+    should_continue=None, on_progress=None)`: 최종 고유 rows를 순회하며
+    SSR 성공은 병합, 차단/mismatch는 즉시 전체 중단, 500/timeout/필드
+    누락은 기존 `_fetch_place_detail`로 업체당 최대 1회 fallback(그
+    fallback이 차단을 감지해도 즉시 전체 중단), 동일 place_id는 SSR 요청
+    1회만. 기존 `enrich_detail`(단순 list 반환)과 달리 SSR 성공/fallback
+    사용/실패/미시도 건수를 담은 dict를 반환(§11 진행 표시 요구사항 때문에
+    의도적으로 다르게 설계).
+- `src/ui.py`
+  - `_run_network_pipeline`: `run_collection_plan`이 전역 dedup까지 끝낸
+    rows를 반환한 직후, **같은 `with collector_factory(...) as collector:`
+    블록 안에서(세션이 닫히기 전)** `collector.enrich_detail_ssr(rows,
+    max_targets=len(rows), ...)`를 호출하도록 배선. 목록 수집 자체가 이미
+    `security_blocked`였거나 rows가 0건이면 SSR 단계를 시작하지 않는다
+    (이미 감지된 차단 직후 추가 요청을 보내지 않기 위한 설계 판단 - 요청서에
+    명시되지 않아 계획 단계에서 별도로 밝히고 승인받음).
+  - `hasattr(collector, "enrich_detail_ssr")` 가드를 추가해, 레거시
+    `collector_factory=NetworkBrowserCollector`(이 메서드 없음)로 명시
+    롤백하는 기존 비상 경로와 하위호환을 유지(숨은 토글이 아니라 레거시
+    collector 호환 가드 - production 기본 `collector_factory`는 항상
+    `DomMembershipCollector`이므로 기본 흐름에서는 이 분기가 항상 실행됨).
+  - `_note_ssr_progress`/`_ssr_stage_suffix` 신규: 목록 단계 진행률과
+    분리된 "상세정보 보강 중 N/전체" 상태 문구 + 완료/부분완료 문구에 SSR
+    성공/fallback/실패/미시도 건수 추가.
+  - `export_places_to_excel`/`MERGED_COLUMNS`는 무수정, custom Excel
+    writer를 만들지 않음(5W-R1이 지적한 버그의 재발 방지).
+
+## 계획 대비 구현 중 정정 사항
+계획서(§4 step 10)는 "Parent 누락은 정보용 진단일 뿐 fallback 트리거가
+아니다"로 적었으나, 요청서 §8/§13이 "Apollo/Base/Parent 누락"을 동일한
+fallback 트리거 그룹으로, "Parent missing UI fallback"을 별도 필수
+테스트 케이스로 명시하고 있어 구현 중 이 부분을 정정했다 - Parent
+(homepages/newOpening/phoneInfo) 중 하나도 확인되지 않으면 Base만으로도
+반환값 자체는 존재하지만 `needs_fallback`으로 분류해 업체당 1회 DOM
+fallback을 시도하도록 바꿨다.
+
+## 신규 테스트
+`tests/test_pc_ssr_detail_enrichment.py` 36건(요청서 §13의 30건 + UI 배선
+6건) 전부 PASS - `page.request`를 흉내내는 `FakeAPIRequestContext`/
+`FakeSSRResponse`를 새로 만들고, DOM fallback 검증에는
+`tests/test_pc_detail_enrichment.py`의 Fake 패턴을 이 파일 안에
+독립적으로 재구현했다(기존 두 파일 모두 무수정).
+
+## 테스트 결과
+`tests/` 전체 35개 파일을 `.venv\Scripts\python.exe`로 개별 직접 실행
+(pytest 미설치 확인 - 이 프로젝트는 `if __name__=="__main__"` 직접 실행이
+기존 관례). 신규 실패 0건. 기존부터 있던 실패 2건을 확인했으며 둘 다
+이번 변경과 무관함:
+- `tests/test_pc_dom_membership.py`: 2026-07-23 이전 어느 라운드(리뷰수
+  3분할 스키마 변경)부터 갱신되지 않은 채 옛 `리뷰수` 단일 키를 기대하는
+  고정(stale) fixture 문제 - 이번 SSR 작업 범위 밖이라 수정하지 않음.
+- `tests/test_excel_validation.py`: 실제 Live 실행 산출물
+  `output/naver_place_merged_db.xlsx`가 이 개발 환경에 존재하지 않아
+  발생하는 환경 의존 실패(코드 결함 아님).
+
+이 외 §14가 요구한 관련 회귀 전체(apollo adapter/accumulator/field
+policy/browser collector/pipeline/pagination/exporter schema/UI network
+wiring·export·start/detail enrichment/safety) PASS.
+
+## 남은 위험
+1. **300건 전체 SSR 자동 실행의 실제 Live 소요시간·성공률·차단 발생률이
+   검증되지 않았다.** 이번 라운드는 Fake만으로 로직을 검증했다(요청서
+   §14 "Live 네이버 요청은 실행하지 않는다"에 따름). 2026-07-22 절이 롤백
+   사유로 들었던 "미검증 상태로 자동 배선이 기본값이 됨" 우려가 메커니즘만
+   가벼워졌을 뿐(페이지 렌더링 1회 → HTML GET 1회) 구조적으로 이번에도
+   동일하게 남아있다 - 다음 단계(§32 Gemini Live 검증, app.py 50/300)가
+   이를 메워야 한다.
+2. `enrich_detail_ssr`이 반환하는 dict 형태가 기존 `enrich_detail`(단순
+   list)과 다르다 - 두 메서드를 혼동해서 호출하면(예: 반환값을 바로 rows로
+   취급) 조용히 틀린 타입으로 이어질 수 있다. 현재는 `_run_network_pipeline`
+   한 곳에서만 `enrich_detail_ssr`을 호출하므로 실제 위험은 낮다.
+3. `_classify_ssr_block_signal`의 CAPTCHA 텍스트 마커는 5S/5T/5W 실측
+   기준으로 고정한 값이다 - 네이버 측 CAPTCHA 페이지 문구가 바뀌면 감지가
+   누락될 수 있다(DOM 기반 `classify_captcha_signal`처럼 시각적 요소
+   탐지를 하지 않으므로 텍스트 마커에만 의존).
+4. `hasattr(collector, "enrich_detail_ssr")` 가드를 향후 다른
+   collector_factory 구현체에 실수로 잘못된 형태(예: list만 반환)로
+   추가하면 `_run_network_pipeline`이 조용히 오작동할 수 있다(2026-07-22
+   절의 동일 계열 위험과 같은 성격).
+
+## 남은 작업
+- Gemini + Antigravity의 Live app.py 50건/300건 SSR 실측 검증(이번
+  Claude 라운드 범위 밖, 요청서 §32).
+- `tests/test_pc_dom_membership.py`의 stale 리뷰수 키 fixture 정리(이번
+  라운드와 무관한 별도 후속 작업으로 남김).
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash`
+전부 수행하지 않았다. 수정 파일: `src/pc/network_browser_collector.py`,
+`src/ui.py`, `README.md`, `PROJECT_STATE.md`. 신규 파일:
+`tests/test_pc_ssr_detail_enrichment.py`.
+
+---
+
+# 2026-07-28 [ENGINE-BASELINE] 법정동 작업 전 수집 엔진 기준점 확정(감사, 신규 구현 없음)
+
+## 목적
+2026-07-23 이후(§PAGE300-6A~6H, 이 문서에 아직 기록되지 않았던 구간) production
+코드에 실제로 반영된 현재 기능을, 법정동 기능 착수 전 안정 기준점으로 이 문서에
+처음 명시적으로 기록한다. 이번 라운드는 새 기능 구현이 아니라 코드·테스트·문서
+대조 감사이며, 아래 항목은 모두 오늘 `src/pc/home_enrichment.py`,
+`src/ui.py`, `src/pc/network_list_scraper.py`, `src/exporter.py` 코드 판독과
+기존 scratchpad 실측 산출물(6F/6G/6H) 재확인으로 검증했다(재실행 없이 기존
+증거 재사용, 신규 300건 수집 없음).
+
+## 확인된 현재 기준선
+
+**두 수집 모드** (`src/ui.py` `collection_mode_var`, 기본값 `basic`):
+- 빠른 기본 수집(`basic`): 목록 수집만 수행, place_id 기반 home HTML 요청 0회
+  (`_run_network_pipeline`의 `home_enrichment_fn` 호출이
+  `collection_mode == "home_sns"` 분기 안에만 있음 - 코드로 직접 확인).
+- 홈페이지·SNS 포함 수집(`home_sns`): 목록 수집 완료 후 `enrich_home_details`
+  (`src/pc/home_enrichment.py`)가 고유 place_id마다 최대 1회 home HTML GET.
+
+**Excel 14컬럼** (`src/exporter.py` `MERGED_COLUMNS`, 2026-07-27 PAGE300-6E-V3
+`추가 링크` 14번째 컬럼 추가): 업체명/업종/새로오픈여부/방문자리뷰수/블로그리뷰수/
+총리뷰수/주소/대표전화/플레이스 URL/수집일/홈페이지/인스타/블로그/추가 링크.
+README §2/§3은 아직 13컬럼 기준으로 남아있었음 - 이번 라운드에서 갱신(아래
+README 절 참고).
+
+**총리뷰수 정책** (`_compute_total_review_count`,
+`src/pc/network_list_scraper.py:364`): 방문자·블로그 리뷰수가 **둘 다** 정수로
+확인됐을 때만 합산(0도 유효한 확인값), 한쪽이라도 미확인("")이면 총리뷰수도
+공란 - 부분 합계를 채우지 않는다. 6H 검증(아래)에서 이 정책이 실제 300행에
+정확히 적용됨을 셀 단위로 재확인(방문자=미확인/블로그=확인 조합 5건이 전부
+총리뷰수 공란으로 올바르게 처리됨, 최초 자동 스크립트가 미확인 값을 0으로
+잘못 취급해 오탐했던 것으로 확인·정정).
+
+**홈페이지·SNS 보강 재시도/진단 정책** (`src/pc/home_enrichment.py`,
+PAGE300-6G-R1): 1차 동시성 2, 재시도 동시성 1, 재시도 대상은 1차 실패 중
+`_HOME_RETRYABLE_STATUSES`(timeout/request_error/http_5xx/empty_html/
+apollo_missing/base_missing/parent_missing/adapter_empty)만, 403/405/429/
+CAPTCHA/place_id_mismatch/no_place_url/user_stopped는 재시도 금지, 재시도 전
+3초 안정화 대기, 1차 실패율이 대상 수의 10% 초과 시 재시도 큐 자체를 만들지
+않음(동적 계산). place_id별 모든 시도가 `attempts`에, 최종 실패는
+`final_failures`에 남고 `logs/diagnostics/home_enrichment_<timestamp>.json`에
+저장(쿠키/Authorization/token/HTML 원문/Apollo 원문 전부 미포함).
+
+**개인정보/링크 분류**: 개인 이동전화(010/011/016~019, +82 표기 포함) 대표전화
+채택 제외, 원문을 Excel·로그·진단 JSON 어디에도 남기지 않음. 홈페이지/인스타/
+블로그/추가 링크는 도메인 기준 분류, 네이버 내부 place/map/route/image/
+booking/order/talktalk 도메인 제외, 대표 3링크 외 채널(카카오채널/유튜브/
+페이스북/스마트스토어/기타)은 `추가 링크` 셀에 `[라벨] URL` 형식·줄바꿈으로
+직렬화(`_format_extra_links`), 동일 URL은 idempotent 병합으로 중복 제거.
+병합은 항상 place_id exact 기준(업체명 단독 병합 없음).
+
+## 6H 실제 검증 산출물 재확인(신규 실행 없음)
+`scratchpad/page300_6h_single_manual_home_diagnostic_300_validation/`의
+기존 결과를 SHA-256 대조로 재확인(오늘 재수집하지 않음, 파일 해시 완전 동일
+확인):
+- Excel: `output/naver_place_premium_db_20260728_1325.xlsx`
+  (SHA-256 `D30BC3087B0212153027229BEBADF439A0AC76CE32452428CAD3EB8379E826F6`)
+  - 300행(헤더 제외)×14열, 고유 place_id 300, 공란 업체명/주소 0, 개인
+    이동전화 유출 0, 리뷰 산술 오류 0(재검증 후), URL/추가 링크 형식 오류
+    0(재검증 후).
+- 진단 JSON: `logs/diagnostics/home_enrichment_20260728_132734.json`
+  (SHA-256 `B0391E2CA797513DF58FFFEACD07EEA7C115DB147D5F03418D05F5BFBAAD6B66`)
+  - 1차 300 시도(성공 293/실패 7, 전부 HTTP 500) → 재시도 7(성공 7) → 최종
+    성공 300/실패 0/미시도 0. 차단(CAPTCHA/403/405/429) 0건, 민감정보 0건.
+
+## 정리한 임시 파일
+- 루트 `stage_a.log`(0바이트, 미추적, 참조되는 곳 없음) 삭제.
+- `scratchpad/idle_test.pid`, `scratchpad/idle_test_stdout.log`(6F-R1 idle
+  기동 검증 잔재, `.gitignore` 대상, 참조되는 곳 없음) 삭제.
+- 루트 `ui_log_dump.txt`는 **삭제하지 않음** -
+  `scratchpad/page300_6f_actual_ui_300_final_validation/stage_a_evidence.md`가
+  이 파일을 근거로 인용하고 있어 실제 증거 파일로 판단(단, 현재 파일 내용은
+  그 인용 시점 이후 다른 실행으로 덮어써져 인용문과 100% 일치하지는 않음 -
+  후속 라운드에서 정리 필요).
+- `.venv/Lib/site-packages/zzz_auto_ui.pth.disabled_by_startup_regression_fix`/
+  `.py.disabled_by_startup_regression_fix`(2026-07-27 PAGE300-6F-R1에서 비활성화한
+  자동 실행 훅)는 **유지** - 활성 형태(`zzz_auto_ui.pth`/`.py`)는 존재하지 않음을
+  재확인(자동 오염 없음), 비활성 백업은 회귀 수정 이력 증거로 남겨둠.
+
+## 남은 위험
+1. `ui_log_dump.txt`가 여러 세션에 걸쳐 재사용/덮어쓰기되고 있어, 특정 시점의
+   증거로 인용한 문서(`stage_a_evidence.md`)와 파일의 현재 내용이 어긋날 수
+   있다 - 향후 검증에서는 세션마다 고유 파일명을 쓰는 것을 권장.
+2. PROJECT_STATE.md가 2026-07-23~2026-07-28 사이 6개 라운드(6A~6H) 동안 갱신되지
+   않고 있었다 - 이번 절이 그 공백을 사후에 요약했지만, 각 라운드의 세부 구현
+   판단·정정 이력은 이 절에 전부 옮기지 않았다(원본은 각 scratchpad 폴더의
+   `final_report.md` 참고).
+
+## 남은 작업
+1. 법정동 데이터 연결
+2. 법정동 선택 UI
+3. 지역 exact 필터
+4. 검색 조합당 수집 상한 적용(법정동 단위)
+5. 전체 목표 저장 개수 자동 계산(법정동 다중 선택 시)
+6. 예상 남은 시간 개선
+7. 사용자 로그 개선
+8. 새로오픈 true 사례 추가 검증
+9. 최종 QA·배포 준비
+10. 순위 추적 기능
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 수정 파일: `README.md`, `PROJECT_STATE.md`(이번 절). 삭제
+파일: 루트 `stage_a.log`, `scratchpad/idle_test.pid`,
+`scratchpad/idle_test_stdout.log`(모두 미추적 파일, git 이력에 영향 없음).
+production 코드(`src/**`)와 테스트(`tests/**`)는 무수정.

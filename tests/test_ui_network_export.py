@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from src import ui
 from src.exporter import MERGED_COLUMNS, export_places_to_excel
+from src.pc.diagnostics import DiagnosticArtifact
 
 
 class ValidationReporter:
@@ -302,6 +303,73 @@ def check_home_sns_mode_calls_home_enrichment_fn_once(reporter: ValidationReport
             reporter.fail(f"홈페이지·SNS 모드 결과가 예상과 다름: home_calls={home_calls}, returned={returned}, saved_homepage={saved_homepage}")
 
 
+def check_home_sns_diagnostics_saved_and_failure_does_not_block_export(reporter: ValidationReporter) -> None:
+    """PAGE300-6G-R1: home_result에 diagnostics_report가 있으면
+    ui.save_json_artifact로 저장을 시도하고, 저장 자체가 실패해도(디스크
+    등 이유) Excel 저장 흐름은 막히지 않는다. 최종 실패 업체 로그 라인도
+    함께 남는다."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_path = str(Path(tmp_dir) / "out.xlsx")
+        app = _make_app()
+        logs: list = []
+        app.log = lambda message: logs.append(message)
+        rows = [_fake_row(0)]
+        result = _base_result(stop_reason="target_reached", final_count=1, rows=rows, before_trim_count=1)
+        fake_orchestrator = _make_fake_orchestrator(result)
+
+        enriched_row = dict(rows[0], 홈페이지="https://enriched.test")
+
+        def fake_home_enrichment_fn(rows_arg, **kwargs):
+            return {
+                "rows": [enriched_row], "stop_reason": None, "security_blocked": False,
+                "home_success_count": 0, "failure_count": 1, "not_attempted_count": 0,
+                "first_pass": {"attempted": 1, "success": 0, "failed": 1},
+                "retry_pass": {"attempted": 1, "success": 0, "failed": 1, "skipped": 0},
+                "final_failures": [
+                    {
+                        "place_id": "0", "name": "업체0", "status": "timeout",
+                        "http_status": None, "attempt": 2, "elapsed_ms": 15000,
+                    }
+                ],
+                "diagnostics_report": {"run_id": "test-run", "target_count": 1},
+            }
+
+        save_calls: list = []
+
+        def fake_save_json_artifact(run_dir, name, data):
+            save_calls.append((str(run_dir), name, data))
+            return DiagnosticArtifact(name=name, path=None, success=False, error_message="disk full")
+
+        original_save = ui.save_json_artifact
+        ui.save_json_artifact = fake_save_json_artifact
+        try:
+            returned = app._run_network_pipeline(
+                [{"query": "q1"}], 30, 300, output_path,
+                collection_mode="home_sns",
+                collector_factory=_fake_collector_factory, orchestrator=fake_orchestrator,
+                excel_exporter=export_places_to_excel, home_enrichment_fn=fake_home_enrichment_fn,
+            )
+        finally:
+            ui.save_json_artifact = original_save
+
+        exported = Path(output_path).exists() and returned["exported"] is True
+        diagnostics_attempted = len(save_calls) == 1 and save_calls[0][2].get("run_id") == "test-run"
+        failure_logged = any("실패 1/1" in msg and "업체0" in msg and "timeout" in msg for msg in logs)
+        save_failure_logged = any("진단 저장 실패" in msg for msg in logs)
+        ok = exported and diagnostics_attempted and failure_logged and save_failure_logged
+        if ok:
+            reporter.pass_(
+                "홈페이지·SNS 진단: diagnostics_report 저장 시도 + 최종 실패 로그 + "
+                "저장 실패해도 Excel 저장은 그대로 성공"
+            )
+        else:
+            reporter.fail(
+                f"진단 저장/실패 로그 결과가 예상과 다름: exported={exported}, "
+                f"diagnostics_attempted={diagnostics_attempted}, failure_logged={failure_logged}, "
+                f"save_failure_logged={save_failure_logged}, logs={logs}"
+            )
+
+
 def check_zero_rows_no_file_created(reporter: ValidationReporter) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_path = str(Path(tmp_dir) / "out.xlsx")
@@ -329,6 +397,7 @@ def main() -> int:
     check_target_trim_row_count_consistency(reporter)
     check_basic_mode_never_calls_home_enrichment_fn(reporter)
     check_home_sns_mode_calls_home_enrichment_fn_once(reporter)
+    check_home_sns_diagnostics_saved_and_failure_does_not_block_export(reporter)
     check_zero_rows_no_file_created(reporter)
 
     reporter.summary()
