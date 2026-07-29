@@ -727,6 +727,158 @@ def check_region_filter_backfills_valid_rows_from_next_page(reporter: Validation
         reporter.fail(f"16. 다음 페이지 보충 케이스 실패: rows={len(result['rows'])}, stop={result.get('pagination_stop_reason')}, page_count={result.get('page_count')}")
 
 
+# --------------------------------------------------------------------------
+# NEW-OPENING-1: 새로오픈 전용 목록 수집(collect_apollo_first_list_query
+# job["new_opening_only"] 배선) - 2026-07-30 Live 실측(filterOpening="true",
+# display=9, 다음 페이지 없음)을 그대로 반영한다.
+# --------------------------------------------------------------------------
+NEW_OPENING_JOB = {
+    "region": "서울특별시 강동구 천호동",
+    "keyword": "카페",
+    "query": "서울특별시 강동구 천호동 카페",
+    "source_city": "서울특별시",
+    "source_district": "강동구",
+    "source_subregion": "천호동",
+    "source_layer": "legal_dong",
+    "legal_code": "1174010900",
+    "new_opening_only": True,
+}
+
+
+def _item_entity_new_opening(place_id: str, name: str, *, new_opening=None, road_address="서울특별시 강동구 천호동 올림픽로 1") -> dict:
+    entity = {
+        "id": place_id, "name": name, "category": "카페",
+        "visitorReviewsTotal": 10, "cafeBlogReviewsTotal": 5,
+        "roadAddress": road_address, "phone": "02-000-0000",
+    }
+    if new_opening is not None:
+        entity["newOpening"] = new_opening
+    return entity
+
+
+def _apollo_state_main_and_new_opening(query: str, main_items, new_opening_items, start: int = 0) -> dict:
+    """main_items/new_opening_items: (place_id, name, new_opening) 튜플 목록.
+    실측대로 두 operation이 항상 함께 존재하는 page 1 상태를 만든다."""
+    ref_key_of = lambda pid: f"PlaceListBusinessesItem:{pid}:{pid}"
+    state = {}
+    for pid, name, new_opening in {*main_items, *new_opening_items}:
+        state[ref_key_of(pid)] = _item_entity_new_opening(pid, name, new_opening=new_opening)
+    state["ROOT_QUERY"] = {
+        _op_key({"query": query, "start": start, "display": 70}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, _, _ in main_items]}
+        },
+        _op_key({"query": query, "start": start, "display": 9, "filterOpening": "true"}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, _, _ in new_opening_items]}
+        },
+    }
+    return state
+
+
+def check_new_opening_only_selects_filter_opening_and_filters_rows(reporter: ValidationReporter) -> None:
+    main_items = [("1", "카페1", None), ("2", "카페2", None)]
+    new_opening_items = [("10", "새카페1", True), ("11", "새카페2", True), ("12", "가짜새카페", False)]
+    state = _apollo_state_main_and_new_opening(NEW_OPENING_JOB["query"], main_items, new_opening_items)
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, NEW_OPENING_JOB, 10, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is False
+        and sorted(row["place_id"] for row in result["rows"]) == ["10", "11"]
+        and len(result["rejected_rows"]) == 1
+        and result["rejected_rows"][0]["place_id"] == "12"
+        and result["rejected_rows"][0]["판정_상태"] == "NOT_NEW_OPENING"
+    )
+    if ok:
+        reporter.pass_("새로오픈 ON: filterOpening 전용 operation 선택 + newOpening=false 제외")
+    else:
+        reporter.fail(f"새로오픈 ON 선택/필터 케이스 실패: {result}")
+
+
+def check_new_opening_only_never_attempts_pagination(reporter: ValidationReporter) -> None:
+    """새로오픈 전용 목록은 목표(10건)에 못 미쳐도(2건만 확보) 다음 페이지
+    버튼을 시도하지 않고 정상 종료해야 한다(§6/§7 - 오류도 무한 이동도
+    아님)."""
+    main_items = [("1", "카페1", None)]
+    new_opening_items = [("10", "새카페1", True), ("11", "새카페2", True)]
+    state = _apollo_state_main_and_new_opening(NEW_OPENING_JOB["query"], main_items, new_opening_items)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},  # 페이지 2 버튼이 있어도 시도하면 안 됨
+    )
+    result = collect_apollo_first_list_query(page, NEW_OPENING_JOB, 10, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 2
+        and result["page_count"] == 1
+        and result["pagination_stop_reason"] == "new_opening_single_page_exhausted"
+        and page._frame.get_by_role_calls == []  # 페이지 버튼 조회 자체를 시도하지 않음
+    )
+    if ok:
+        reporter.pass_("새로오픈 ON: 목표 미달이어도 다음 페이지를 시도하지 않고 정상 종료(page_count=1)")
+    else:
+        reporter.fail(f"새로오픈 ON 페이지네이션 미시도 검증 실패: {result}, get_by_role_calls={page._frame.get_by_role_calls}")
+
+
+def check_new_opening_only_combines_with_region_filter(reporter: ValidationReporter) -> None:
+    """새로오픈 ON이어도 지역 Exact 필터(§4)는 그대로 함께 적용돼 지역
+    밖 주소는 제외돼야 한다."""
+    main_items = [("1", "카페1", None)]
+    new_opening_items = [("10", "새카페1", True), ("11", "새카페2", True)]
+    state = _apollo_state_main_and_new_opening(NEW_OPENING_JOB["query"], main_items, new_opening_items)
+    # place_id=11만 다른 동(성내동) 주소로 바꿔 지역 밖 처리 대상으로 만든다.
+    state["PlaceListBusinessesItem:11:11"]["roadAddress"] = "서울특별시 강동구 성내동 다른동로 1"
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, NEW_OPENING_JOB, 10, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is False
+        and [row["place_id"] for row in result["rows"]] == ["10"]
+        and any(r["place_id"] == "11" and r["판정_상태"] == "OUT_OF_SCOPE" for r in result["rejected_rows"])
+    )
+    if ok:
+        reporter.pass_("새로오픈 ON + 지역 Exact 필터 동시 적용(지역 밖 주소 제외)")
+    else:
+        reporter.fail(f"새로오픈 ON + 지역 필터 결합 검증 실패: {result}")
+
+
+def check_new_opening_only_no_candidate_is_navigation_error_not_fallback(reporter: ValidationReporter) -> None:
+    """새로오픈 전용 operation이 아예 없으면(예: 이 검색어에 새로오픈 업체가
+    전혀 없는 지역) 일반 목록으로 조용히 대체하지 않고 명시적
+    navigation_error로 보고해야 한다(§6 금지 사항)."""
+    state = _apollo_state(NEW_OPENING_JOB["query"], [("1", "카페1")])  # 메인 목록만 존재, filterOpening 후보 없음
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, NEW_OPENING_JOB, 10, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is True
+        and "NewOpeningListParseError:" in result["navigation_error_message"]
+        and result["rows"] == []
+    )
+    if ok:
+        reporter.pass_("새로오픈 ON: 전용 operation 미발견 시 일반 목록 fallback 없이 명시적 navigation_error")
+    else:
+        reporter.fail(f"새로오픈 ON 미발견 케이스 실패: {result}")
+
+
+def check_new_opening_only_still_detects_captcha(reporter: ValidationReporter) -> None:
+    """새로오픈 ON이어도 CAPTCHA 감지는 기존과 동일하게 동작해야 한다
+    (페이지네이션 루프를 건너뛰어도 최종 captcha probe는 항상 실행됨)."""
+    new_opening_items = [("10", "새카페1", True)]
+    state = _apollo_state_main_and_new_opening(NEW_OPENING_JOB["query"], [("1", "카페1", None)], new_opening_items)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        captcha_selectors={"#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=True, box={"width": 100, "height": 100})},
+    )
+    result = collect_apollo_first_list_query(page, NEW_OPENING_JOB, 10, collected_at="2026-07-29")
+
+    ok = result["navigation_error"] is False and result["active_captcha_detected"] is True
+    if ok:
+        reporter.pass_("새로오픈 ON에서도 CAPTCHA 감지가 정상 동작함")
+    else:
+        reporter.fail(f"새로오픈 ON CAPTCHA 감지 실패: {result}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -745,6 +897,11 @@ def main() -> bool:
         check_collector_closes_page_even_when_collect_raises,
         check_region_filter_excludes_rows_and_does_not_consume_limit,
         check_region_filter_backfills_valid_rows_from_next_page,
+        check_new_opening_only_selects_filter_opening_and_filters_rows,
+        check_new_opening_only_never_attempts_pagination,
+        check_new_opening_only_combines_with_region_filter,
+        check_new_opening_only_no_candidate_is_navigation_error_not_fallback,
+        check_new_opening_only_still_detects_captcha,
     ]
     for check in checks:
         check(reporter)

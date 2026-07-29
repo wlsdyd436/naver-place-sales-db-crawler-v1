@@ -35,6 +35,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from src.pc.apollo_list_adapter import (
     build_rows_from_apollo_list_result,
     extract_main_place_list_from_apollo,
+    extract_new_opening_place_list_from_apollo,
 )
 from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
 from src.pc.detail_scraper import (
@@ -3002,13 +3003,20 @@ _APOLLO_FULL_STATE_JS = """() => {
 }"""
 
 
-def _wait_for_apollo_list_ready(page, frame, expected_query: str, expected_start: int, hard_cap_ms: int = 5000) -> dict:
+def _wait_for_apollo_list_ready(
+    page, frame, expected_query: str, expected_start: int, hard_cap_ms: int = 5000,
+    *, extractor=extract_main_place_list_from_apollo,
+) -> dict:
     """1페이지 window.__APOLLO_STATE__에 메인 placeList(...) operation이 확인될
     때까지 폴링한다. 매 tick마다 전체 apollo state를 다시 읽어
-    extract_main_place_list_from_apollo로 판정하고, error가 없어지면 즉시
-    반환한다(추가 대기 없음). hard_cap_ms 안에 끝내 확인되지 않으면 마지막
-    관찰된 list_result를 그대로 반환한다(호출자가 error 필드로 판단 -
-    이 함수 자체는 성공/실패를 판정하지 않는다)."""
+    extractor(기본값 extract_main_place_list_from_apollo)로 판정하고,
+    error가 없어지면 즉시 반환한다(추가 대기 없음). hard_cap_ms 안에 끝내
+    확인되지 않으면 마지막 관찰된 list_result를 그대로 반환한다(호출자가
+    error 필드로 판단 - 이 함수 자체는 성공/실패를 판정하지 않는다).
+
+    NEW-OPENING-1: extractor=extract_new_opening_place_list_from_apollo를
+    넘기면 새로오픈 전용 placeList(filterOpening=true) operation을 기다린다
+    - 폴링 로직 자체는 어떤 operation을 찾는지와 무관하게 동일하다."""
     elapsed_ms = 0
     while True:
         try:
@@ -3016,7 +3024,7 @@ def _wait_for_apollo_list_ready(page, frame, expected_query: str, expected_start
         except Exception:
             state_result = None
         apollo_state = state_result.get("apollo_state") if isinstance(state_result, dict) else None
-        list_result = extract_main_place_list_from_apollo(apollo_state, expected_query, expected_start)
+        list_result = extractor(apollo_state, expected_query, expected_start)
         if not list_result["error"]:
             return list_result
         if elapsed_ms >= hard_cap_ms:
@@ -3072,6 +3080,33 @@ def _split_region_valid_rows(rows: list, job: dict) -> tuple:
     return valid_rows, rejected
 
 
+_NEW_OPENING_REJECTION_REASON = "새로오픈 확인되지 않음(false/null/누락)"
+
+
+def _split_new_opening_valid_rows(rows: list) -> tuple:
+    """job["new_opening_only"]=True인 Query에서 newOpening이 명시적으로
+    true인 row만 유효로 남긴다(§6) - false/null/필드 누락은 rejected_rows로
+    분리해 per_query_limit을 소비하지 않게 한다. row의 "새로오픈여부"는
+    이미 network_list_scraper._resolve_new_open_tristate가
+    True->"O"/False->"X"/미확인->""로 매핑해둔 값이므로 "O"만 통과시킨다
+    (추측으로 false/null을 새로오픈으로 저장하지 않는다)."""
+    valid_rows = []
+    rejected = []
+    for row in rows:
+        if row.get("새로오픈여부") == "O":
+            valid_rows.append(row)
+        else:
+            rejected.append({
+                "source_query": row.get("source_query"),
+                "업체명": row.get("업체명"),
+                "place_id": row.get("place_id"),
+                "판정_상태": "NOT_NEW_OPENING",
+                "거부_이유": _NEW_OPENING_REJECTION_REASON,
+                "주소": row.get("주소"),
+            })
+    return valid_rows, rejected
+
+
 def collect_apollo_first_list_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
     """신규 Apollo/GraphQL-first 목록 수집. 1페이지는 메인 placeList(...)
     operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
@@ -3088,7 +3123,19 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
     종료(navigation_error=False)로 처리한다.
 
     반환에 추가된 진단 필드(navigation_error 계약 외): "page_count"(확정된
-    페이지 수), "pagination_stop_reason"(정상 종료 사유)."""
+    페이지 수), "pagination_stop_reason"(정상 종료 사유).
+
+    NEW-OPENING-1: job["new_opening_only"]=True면 메인 placeList 대신
+    filterOpening=true 전용 placeList(extract_new_opening_place_list_from_apollo)
+    를 찾는다. 2026-07-30 Live 실측상 이 operation은 page 1에 이미 존재하며
+    "다음 페이지" 개념이 없는 고정 소규모 미리보기이므로(§4 실측 근거,
+    scratchpad/new_opening_filter_implementation), 페이지네이션 루프를
+    시도하지 않고 1페이지 결과만으로 즉시 종료한다 - 새로오픈 업체가
+    목표보다 적어도 오류가 아니라 정상 종료다(§7)."""
+    new_opening_only = bool(job.get("new_opening_only"))
+    list_extractor = extract_new_opening_place_list_from_apollo if new_opening_only else extract_main_place_list_from_apollo
+    error_prefix = "NewOpeningListParseError" if new_opening_only else "ApolloListParseError"
+
     ctx = _QueryObservationContext()
     response_handler = _make_response_handler(ctx)
     request_finished_handler = _make_request_finished_handler(ctx)
@@ -3136,9 +3183,9 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
         if frame is None:
             return _navigation_error_result("ApolloListParseError:search_frame_not_found")
 
-        list_result = _wait_for_apollo_list_ready(page, frame, query_text, 0, hard_cap_ms=5000)
+        list_result = _wait_for_apollo_list_ready(page, frame, query_text, 0, hard_cap_ms=5000, extractor=list_extractor)
         if list_result["error"]:
-            return _navigation_error_result(f"ApolloListParseError:{list_result['error']}")
+            return _navigation_error_result(f"{error_prefix}:{list_result['error']}")
 
         mapped_rows = build_rows_from_apollo_list_result(list_result, collected_at, source_query=query_text)
         for row in mapped_rows:
@@ -3151,6 +3198,9 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
         local_seen: set = set()
         unique_rows = dedup_rows(mapped_rows, local_seen)
         unique_rows, rejected_rows = _split_region_valid_rows(unique_rows, job)
+        if new_opening_only:
+            unique_rows, new_opening_rejected = _split_new_opening_valid_rows(unique_rows)
+            rejected_rows = rejected_rows + new_opening_rejected
 
         def _ensure_parsed_simple(index: int) -> dict:
             """collect_network_query의 _ensure_parsed와 달리 candidate당 재확인
@@ -3175,7 +3225,13 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
         current_page_number = 1
         final_captcha_signal = None
 
-        if target_count and len(unique_rows) >= target_count:
+        if new_opening_only:
+            # §4 Live 실측: 새로오픈 전용 operation은 page 1의 고정 소규모
+            # 미리보기이며 "다음 페이지"가 없다 - 목표 미달이어도 페이지네이션을
+            # 시도하지 않고 확보된 만큼으로 정상 종료한다(§7 - 오류/무한 이동
+            # 아님).
+            pagination_stop_reason = "new_opening_single_page_exhausted"
+        elif target_count and len(unique_rows) >= target_count:
             pagination_stop_reason = "per_query_limit_reached"
         else:
             while current_page_number < max_pages:

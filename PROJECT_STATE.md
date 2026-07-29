@@ -8437,3 +8437,149 @@ target_count 자동계산), `.gitignore`(`.spec` 예외 추가),
 `NaverPlaceSalesDBCollector.spec`은 이번 라운드에서 내용 변경 없이 git
 추적 대상으로만 전환됨(아직 `git add` 안 함 - 사용자가 직접 결정).
 수집 엔진과 `scripts/update_legal_dong_snapshot.py`는 무수정.
+
+---
+
+# 2026-07-30 [NEW-OPENING-1] 보조 검색 제거 + 지역 목록 가나다순 + 새로오픈 전용 수집 구현
+
+## 배경
+그동안 별도 라운드로 진행된 지역 Exact 필터/Provider Alias 정책/EXE
+패키징 작업이 이 세션 밖에서 커밋된 뒤(HEAD `af6c29a`→`0ab10a0`), 이번
+라운드는 세 가지를 한 번에 정리한다: ①역·상권/세부업종 보조 검색 기능
+완전 제거, ②시군구·법정동 목록 가나다순 표시, ③그동안 항상 잠겨 있던
+"새로오픈 업체만 수집" 체크박스를 실제 전용 목록 수집 기능으로 구현.
+
+## ① 보조 검색 기능 완전 제거
+`src/ui.py`에서 `build_auxiliary_query_plan`, `_build_subdivision_section`,
+`_open_subregion_popup`/`_close_subregion_popup`/`_render_subregion_selection`/
+`_set_all_subregions`/`get_selected_subregions`/`_update_subdivision_summary`/
+`_refresh_subdivision_view`/`_reload_subdivision_data`/
+`_ensure_subdivision_data_loaded`, `auto_subdivide_var`,
+`region_selection_vars`/`_subdivision_layers`/`_subdivision_loaded_key`를
+전부 삭제했다. 왼쪽 패널 "2. 선택 사항" 섹션 자체가 사라지면서 이후
+섹션(키워드 입력~수집 모드) 번호를 1씩 당겨 재배치했다(§_build_ui 순서
+무변경, 번호만 정리).
+
+`data/regions_kr_sample.json`을 전수 감사한 결과 유일한 실사용처가
+`src/pc/region_data.load_region_layers`(→ui.py의 보조 검색 기능)뿐임을
+확인하고 파일 자체를 삭제했다. `src/pc/region_data.py`(로더)와
+`src/pc/region_expander.py`(완전히 미사용 상태였던 PoC-4 tier 빌더,
+역시 역/상권·세부업종 개념)도 함께 삭제했고, `NaverPlaceSalesDBCollector.
+spec`의 `regions_kr_sample.json` datas 항목도 제거했다(존재하지 않는
+파일을 번들하려 하면 빌드 자체가 실패하므로). `src/pc/vertical_presets.py`
+(업종 유형 분류, `data/verticals_kr.json` 기반)는 이름만 유사할 뿐 별개
+기능이라 이번 범위에서 제외하고 그대로 뒀다.
+
+## ② 시군구·법정동 가나다순 정렬
+`src/ui.py`에 `_sort_korean_names`/`_sort_legal_dong_items` 순수 함수를
+추가했다 - `unicodedata.normalize("NFC", ...)` 기준 비교로 OS locale에
+의존하지 않으며, 법정동은 이름이 같으면 `legal_code`를 보조 키로 쓴다.
+`_reload_legal_dong_sigungu_options`/`_reload_legal_dong_checkboxes`가
+로더 반환값을 이 함수로 정렬한 뒤 화면에 반영한다. `legal_dong_loader.py`
+자체(및 원본 Snapshot 레코드 순서/legal_code)는 무수정 - "legal_code
+오름차순 보존" 계약을 그대로 유지한 채 UI 레이어에서만 가나다순으로
+다시 정렬한다. Query Queue는 `get_selected_legal_dongs()`가 이미 정렬된
+`_legal_dong_current_items`를 순회하므로 자동으로 가나다순이 된다.
+
+## ③ 새로오픈 전용 수집 구현
+### Live 실측(§4, `scratchpad/new_opening_filter_implementation/`)
+검색어 1개("서울특별시 강동구 카페")만 사용해 실측한 결과:
+- 새로오픈 전용 placeList operation은 **별도 필터 토글 클릭 없이도** 페이지
+  1의 `window.__APOLLO_STATE__`에 메인 목록과 함께 이미 존재한다
+  (`input: {"display": 9, "filterOpening": "true", ...}`).
+- `filterOpening` 값은 **문자열 `"true"`**다(Python bool `True`가 아님).
+- 이 operation은 실측상 항상 9건 이하이고, 실제 Naver "전체필터→더보기
+  →새로오픈 칩→결과보기" UI 흐름을 그대로 클릭해봐도 새 operation이
+  추가되지 않았다 - **다음 페이지 개념이 없는 고정 소규모 미리보기**로
+  판단했다(page 2 이동 후에도 `window.__APOLLO_STATE__`의 operation
+  목록이 동일함을 확인).
+- 이 operation의 items는 전부 `newOpening: true`였다(메인 목록에도
+  `newOpening: true`인 항목이 섞여 있으나 다수는 `null`).
+
+### 구현
+- `src/pc/apollo_list_adapter.py`에 `extract_new_opening_place_list_from_apollo`
+  를 신규 추가했다(기존 `extract_main_place_list_from_apollo`는 무수정 -
+  두 함수의 스코어링 로직은 의도적으로 중복 허용, 필터 조건만 정반대라
+  통합 리팩터링은 회귀 위험 대비 보류). `filterOpening in (True, "true")`
+  인 candidate만 선택하고, 없으면 "no_new_opening_operation_found"를
+  반환한다(일반 목록으로 조용히 대체하지 않음).
+- `src/pc/network_browser_collector.py`: `_wait_for_apollo_list_ready`에
+  `extractor` 파라미터를 추가(기본값은 기존 메인 선택 함수, 하위호환
+  무수정). `collect_apollo_first_list_query`가 `job["new_opening_only"]`
+  를 읽어 extractor를 전환하고, 신규 `_split_new_opening_valid_rows`로
+  `새로오픈여부 != "O"`인 row를 목표 소비 전에 제외한다(false/null/누락
+  전부 거부, `rejected_rows`에 "NOT_NEW_OPENING"으로 기록). 기존
+  `_split_region_valid_rows`(지역 Exact 필터)는 새로오픈 ON에서도 그대로
+  함께 적용된다. `new_opening_only=True`면 페이지네이션 루프 자체를
+  건너뛰고(`pagination_stop_reason="new_opening_single_page_exhausted"`)
+  1페이지 결과만으로 즉시 종료한다 - Live 실측 근거(다음 페이지 없음)를
+  그대로 반영한 것이다.
+- `src/ui.py`: `build_legal_dong_query_plan`에 `new_opening_only: bool`
+  키워드 인자를 추가해 모든 job에 이 필드를 싣는다.
+  `_build_collection_queries`가 `self.new_open_only_var.get()`을 그대로
+  전달한다. `_build_filter_section`에서 체크박스 생성 시 `state="disabled"`
+  를 제거했고(§5 - 이제 기본 사용 가능), `_set_left_panel_state`에서
+  이 체크박스를 강제로 다시 잠그던 특례 코드도 제거했다(다른 위젯과
+  동일하게 수집 중에는 잠기고 종료 후 정상 복구됨). UI→Query Plan→
+  worker→network pipeline(`run_collection_plan`)→Apollo-first
+  collector(`ApolloFirstListCollector.collect_query`)까지는 job dict가
+  그대로 흘러가는 기존 provenance 패턴을 그대로 재사용했으므로
+  `network_pipeline.py`/`ApolloFirstListCollector`는 **무수정**이다.
+
+## 테스트
+신규/수정 테스트 후 전체 `pytest -q`: **152 passed**(기존 149 + 신규 3),
+4 warnings(기존 무관 경고만). 커스텀스크립트 전체 재확인 0 FAIL:
+`test_ui_network_start`(14)/`test_ui_network_wiring`(19)/
+`test_network_product_integration_no_live`(11)/`test_pc_network_pipeline`(12)/
+`test_ui_apollo_list_wiring`(9)/`test_ui_dom_membership_wiring`(4)/
+`test_ui_network_export`(10)/`test_ui_policy_text`(24)/
+`test_pc_ssr_detail_enrichment`(36)/`test_pc_apollo_list_collector`(20,
+새로오픈 관련 5건 포함). `test_pc_region_data.py`/`test_pc_region_expander.py`
+삭제(대상 모듈 삭제로 무의미), `test_ui_legal_dong_wiring.py`에 보조검색
+제거·가나다순·새로오픈 wiring 테스트 다수 추가(34개), `test_pc_new_opening_
+selector.py` 신규(operation 선택 규칙 7건), `test_ui_network_start.py`/
+`test_ui_policy_text.py`의 옛 "새로오픈 항상 disabled" 계약 테스트를 새
+계약(사용 가능 + job 전달)에 맞게 재작성.
+
+## 제한적 Live 검증(§10)
+검색어 1개("서울특별시 강동구 천호동 카페", per_query_limit=10)로 새로오픈
+OFF/ON을 순차 실행(`scratchpad/new_opening_filter_implementation/
+live_verification_off_on.json`). 첫 OFF 실행에서 일시적 navigation_error
+(0건, 안전하게 중단·재현 안 됨)가 1회 있었으나 재실행 시 정상 확인됐다.
+- OFF: 10/10 OFFICIAL_EXACT, 중복 place_id 0, 차단·429·navigation_error 없음
+  (기존 회귀 없음, 새로오픈 전용 목록 혼입 없음).
+- ON: 최종 유효 2건(전부 `새로오픈여부="O"`, 전부 OFFICIAL_EXACT), 7건은
+  같은 강동구지만 다른 법정동(천호동 아님)이라 지역 Exact 필터로
+  OUT_OF_SCOPE 거부됨(목표 소비 안 함), 중복 0, 차단·CAPTCHA·429 0,
+  `stop_reason=queue_exhausted`(목표 미달이어도 정상 종료 - 새로오픈
+  업체가 원래 적은 지역이었음). 기본모드/홈페이지·SNS 모드 소량 비교는
+  이번 라운드에서 생략했다(선택 사항, Live 요청 최소화 우선).
+
+## 남은 위험
+1. 새로오픈 전용 operation의 "다음 페이지 없음" 판단은 이번 실측(검색어
+   1개) 범위에서 내린 결론이다 - 더 큰 지역/다른 검색어에서 정말 항상
+   그런지는 추가 실측 전까지 확정이 아니다.
+2. `extract_main_place_list_from_apollo`/`extract_new_opening_place_list_
+   from_apollo`의 스코어링 루프 중복은 의도적으로 남겨뒀다(리팩터링 시
+   회귀 범위가 넓어 보류) - 추후 별도 라운드에서 통합 검토 필요.
+3. PyInstaller 실제 재빌드는 이번 라운드에서 하지 않았다(spec에서
+   regions_kr_sample.json 항목만 제거) - 다음 패키징 검증 라운드에서
+   확인 필요.
+
+## 남은 작업
+1. 더 다양한 검색어/지역에서 새로오픈 전용 목록의 페이지네이션 가능성
+   재확인
+2. PyInstaller 재빌드 검증(regions_kr_sample.json 제거가 빌드에 영향 없는지)
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 수정 파일: `src/ui.py`, `src/pc/apollo_list_adapter.py`,
+`src/pc/network_browser_collector.py`, `src/pc/legal_dong_loader.py`(주석만),
+`NaverPlaceSalesDBCollector.spec`, `README.md`(§1/§6/§7/§11),
+`tests/test_ui_legal_dong_wiring.py`, `tests/test_ui_network_start.py`,
+`tests/test_ui_policy_text.py`, `tests/test_pc_legal_dong_loader.py`,
+`PROJECT_STATE.md`(이번 절). 신규 파일: `tests/test_pc_new_opening_
+selector.py`. 삭제 파일: `src/pc/region_data.py`, `src/pc/region_expander.py`,
+`tests/test_pc_region_data.py`, `tests/test_pc_region_expander.py`,
+`data/regions_kr_sample.json`. `scripts/update_legal_dong_snapshot.py`는
+무수정.

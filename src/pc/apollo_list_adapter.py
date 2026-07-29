@@ -259,6 +259,160 @@ def extract_main_place_list_from_apollo(apollo_state, expected_query: str, expec
     }
 
 
+def extract_new_opening_place_list_from_apollo(apollo_state, expected_query: str, expected_start: int = 0) -> dict:
+    """새로오픈 전용 placeList(...) operation만 선택한다(NEW-OPENING-1).
+
+    2026-07-30 Live 실측(scratchpad/new_opening_filter_implementation)으로
+    확인한 사실: 새로오픈 전용 operation은 input.filterOpening이 Python
+    bool True가 아니라 문자열 "true"로 온다(둘 다 인정). 이 operation은
+    page 1 Apollo state에 메인 목록과 함께 이미 존재하며, 별도의 "필터
+    토글 클릭" 없이도 나타난다(실측 확인) - 이 함수는 페이지 로드만으로
+    이미 채워진 이 candidate를 찾아 선택하는 역할만 한다. 실측상 이
+    candidate는 항상 display=9였지만, display 값 자체를 선택 조건으로
+    쓰지 않는다(filterOpening 조건만으로 판별 - 요청서 §6).
+
+    선택 절차는 extract_main_place_list_from_apollo와 같은 원칙(구조적
+    유효성 우선, query/start는 동점 처리용 보조 신호, 모호하면
+    "ambiguous_placelist_operation" 오류)을 따르되 후보 조건이 정반대라
+    별도 함수로 둔다(그 함수를 필터 조건만 반전시켜 재사용하도록 리팩터링
+    하면 이미 여러 테스트로 굳어진 기존 로직을 건드리는 위험이 커서
+    피했다 - ponytail: 이 두 함수의 스코어링 루프는 의도적으로 중복
+    허용, 통합은 더 넓은 회귀 범위에서 재검토).
+
+    전용 목록을 하나도 찾지 못하면 "no_new_opening_operation_found" 오류를
+    반환한다 - 일반 목록으로 조용히 대체하지 않는다(호출자가 명확한 오류로
+    처리해야 함, §6 금지 사항)."""
+    if not isinstance(apollo_state, dict):
+        return _empty_result("apollo_state_missing")
+
+    root_query = apollo_state.get(_ROOT_QUERY_KEY)
+    if not isinstance(root_query, dict):
+        result = _empty_result("root_query_missing")
+        result["available"] = True
+        return result
+
+    candidate_operation_keys = [
+        key for key in root_query if isinstance(key, str) and key.startswith(_PLACE_LIST_PREFIX)
+    ]
+    if not candidate_operation_keys:
+        result = _empty_result("no_placelist_operation_found")
+        result["available"] = True
+        return result
+
+    excluded_operation_keys = []
+    scored_candidates = []
+    for key in candidate_operation_keys:
+        parsed = _parse_operation_args(key, _PLACE_LIST_PREFIX)
+        if parsed is None:
+            excluded_operation_keys.append({"key": key, "reason": "parse_error"})
+            continue
+        input_obj = parsed.get("input") if isinstance(parsed.get("input"), dict) else parsed
+
+        if input_obj.get("filterOpening") not in (True, "true"):
+            excluded_operation_keys.append({"key": key, "reason": "not_filter_opening"})
+            continue
+
+        resolved = _resolve_ref(apollo_state, root_query.get(key))
+        businesses = _resolve_ref(apollo_state, resolved.get("businesses")) if isinstance(resolved, dict) else None
+        items_refs = businesses.get("items") if isinstance(businesses, dict) else None
+        if not isinstance(items_refs, list):
+            excluded_operation_keys.append({"key": key, "reason": "businesses_items_missing"})
+            continue
+
+        resolved_items: list = []
+        item_refs: list = []
+        missing_refs: list = []
+        unique_ids: set = set()
+        for entry in items_refs:
+            entity = _resolve_ref(apollo_state, entry)
+            ref = entry.get("__ref") if isinstance(entry, dict) else None
+            if entity is None:
+                if isinstance(ref, str):
+                    missing_refs.append(ref)
+                continue
+            resolved_items.append(entity)
+            if isinstance(ref, str):
+                item_refs.append(ref)
+            entity_id = entity.get("id")
+            if entity_id is not None:
+                unique_ids.add(str(entity_id))
+
+        query_score = _query_similarity_score(input_obj.get("query"), expected_query)
+        start_value = input_obj.get("start")
+        if start_value == expected_start:
+            start_score = 1.0
+        elif "start" not in input_obj:
+            start_score = 0.5
+        else:
+            start_score = 0.0
+
+        scored_candidates.append({
+            "key": key,
+            "items": resolved_items,
+            "item_refs": item_refs,
+            "missing_refs": missing_refs,
+            "unique_id_count": len(unique_ids),
+            "id_set": frozenset(unique_ids),
+            "size": len(resolved_items),
+            "query_score": query_score,
+            "start_score": start_score,
+        })
+
+    if not scored_candidates:
+        only_structural_failures = bool(excluded_operation_keys) and all(
+            entry["reason"] in ("businesses_items_missing", "parse_error") for entry in excluded_operation_keys
+        )
+        error = "businesses_items_missing" if only_structural_failures else "no_new_opening_operation_found"
+        result = _empty_result(error)
+        result["available"] = True
+        result["candidate_operation_keys"] = candidate_operation_keys
+        result["excluded_operation_keys"] = excluded_operation_keys
+        return result
+
+    diagnostics_candidates = [
+        {
+            "key": c["key"], "size": c["size"], "query_score": c["query_score"],
+            "start_score": c["start_score"], "unique_id_count": c["unique_id_count"],
+        }
+        for c in scored_candidates
+    ]
+
+    if len(scored_candidates) == 1:
+        chosen = scored_candidates[0]
+    else:
+        ranked = sorted(
+            scored_candidates,
+            key=lambda c: (c["size"], c["query_score"], c["start_score"]),
+            reverse=True,
+        )
+        best = ranked[0]
+        tied = [
+            c for c in ranked
+            if c["size"] == best["size"] and c["query_score"] == best["query_score"] and c["start_score"] == best["start_score"]
+        ]
+        if len(tied) > 1 and len({c["id_set"] for c in tied}) > 1:
+            result = _empty_result("ambiguous_placelist_operation")
+            result["available"] = True
+            result["candidate_operation_keys"] = candidate_operation_keys
+            result["excluded_operation_keys"] = excluded_operation_keys
+            result["selection_diagnostics"] = {"candidates_scored": diagnostics_candidates, "chosen_key": None}
+            return result
+        chosen = ranked[0]
+
+    return {
+        "available": True,
+        "error": "",
+        "selected_operation_key": chosen["key"],
+        "candidate_operation_keys": candidate_operation_keys,
+        "excluded_operation_keys": excluded_operation_keys,
+        "items": chosen["items"],
+        "item_refs": chosen["item_refs"],
+        "missing_ref_count": len(chosen["missing_refs"]),
+        "missing_refs": chosen["missing_refs"],
+        "selection_diagnostics": {"candidates_scored": diagnostics_candidates, "chosen_key": chosen["key"]},
+    }
+
+
 def build_rows_from_apollo_list_result(list_result: dict, collected_at: str, *, source_query: str = None) -> list:
     """extract_main_place_list_from_apollo의 items를 network_list_scraper._map_item_to_row로
     순서 보존 매핑한다(순수 함수 - source_page/source_city 등은 호출자가 이후 붙인다,

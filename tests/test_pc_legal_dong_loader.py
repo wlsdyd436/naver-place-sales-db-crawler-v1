@@ -214,13 +214,13 @@ def test_spec_includes_legal_dong_snapshot_in_datas():
     assert "'data'" in text or '"data"' in text
 
 
-def test_spec_includes_regions_kr_sample_in_datas():
-    """EXE-PACKAGE-1: regions_kr_sample.json이 datas에 없으면
-    _ensure_subdivision_data_loaded()가 앱 시작 시(auto_subdivide_var
-    값과 무관) FileNotFoundError로 크래시한다(src/ui.py REGIONS_SAMPLE_PATH
-    참고)."""
+def test_spec_does_not_bundle_removed_regions_kr_sample():
+    """NEW-OPENING-1: 역/상권·세부업종 보조 검색 기능 제거와 함께
+    data/regions_kr_sample.json 자체가 삭제됐으므로, spec의 datas에도
+    더 이상 존재하면 안 된다(존재하지도 않는 파일을 번들하려 하면
+    PyInstaller 빌드 자체가 실패한다)."""
     text = SPEC_PATH.read_text(encoding="utf-8")
-    assert "regions_kr_sample.json" in text
+    assert "regions_kr_sample.json" not in text
 
 
 if __name__ == "__main__":

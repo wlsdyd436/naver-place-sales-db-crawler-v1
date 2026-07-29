@@ -129,8 +129,7 @@ class _SimpleVar:
 
 
 def _make_region_app(*, sido="서울특별시", sigungu="강동구", legal_dongs=None,
-                      per_query_limit=10, keyword="카페", auto_subdivide=False,
-                      subregions=None):
+                      per_query_limit=10, keyword="카페", new_open_only=False):
     """`_build_collection_queries`/`_recalculate_target_count`(실제 바운드
     메서드, override 없음)를 그대로 호출하기 위한 헤드리스 fake app. 시군구가
     있는 지역 기준(세종 등 시군구 없는 지역은 개별 테스트에서 sigungu=""로
@@ -141,8 +140,7 @@ def _make_region_app(*, sido="서울특별시", sigungu="강동구", legal_dongs
     app.legal_dong_sido_var = _SimpleVar(sido)
     app.legal_dong_sigungu_var = _SimpleVar(sigungu if sigungu else ui._LEGAL_DONG_NO_SIGUNGU)
     app.get_selected_legal_dongs = lambda: list(legal_dongs or [])
-    app.auto_subdivide_var = _SimpleVar(auto_subdivide)
-    app.get_selected_subregions = lambda: subregions or {"landmarks": [], "subcategory_keywords": []}
+    app.new_open_only_var = _SimpleVar(new_open_only)
     app.target_count_var = _SimpleVar(ui._DEFAULT_TARGET_COUNT)
     app.legal_dong_query_count_var = _SimpleVar("")
     app.target_count_entry = object()  # hasattr 체크만 통과하면 됨(위젯 메서드 불필요)
@@ -176,37 +174,186 @@ def test_3_two_legal_dongs_selected_query_2_target_20():
     assert app.target_count_var.get() == "20"
 
 
-def test_4_auto_subdivide_off_by_default_adds_no_aux_query():
-    """auto_subdivide=False(기본값)면 보조 데이터가 있어도(강동구) 추가 Query가
-    생기지 않는다 - 강동구 샘플 데이터가 존재한다는 이유만으로 법정동 1개가
-    Query 10개로 확장되던 회귀를 재발 방지한다."""
+# --------------------------------------------------------------------------
+# NEW-OPENING-1 §9-A: 보조 검색(역·상권/세부업종) 기능 완전 제거 확인
+# --------------------------------------------------------------------------
+def test_aux_search_ui_attributes_no_longer_exist():
+    """역·상권/세부업종 보조 검색 UI/상태가 클래스에서 완전히 제거됐는지
+    확인한다 - 이름이 남아있으면 §2 요구사항 위반이다."""
+    removed_names = (
+        "_build_subdivision_section", "auto_subdivide_var", "get_selected_subregions",
+        "_open_subregion_popup", "_close_subregion_popup", "_render_subregion_selection",
+        "_set_all_subregions", "_update_subdivision_summary", "_refresh_subdivision_view",
+        "_reload_subdivision_data", "_ensure_subdivision_data_loaded",
+    )
+    for name in removed_names:
+        assert not hasattr(ui.SalesDbCrawlerApp, name), f"{name}이 여전히 존재함(보조 검색 미완전 제거)"
+    assert not hasattr(ui, "build_auxiliary_query_plan")
+    assert not hasattr(ui, "REGIONS_SAMPLE_PATH")
+
+
+def test_query_queue_contains_only_official_region_and_keyword():
+    """법정동을 여러 개 선택해도 최종 Query Queue의 각 query 문자열은 오직
+    "공식 시도/시군구/법정동 + 키워드" 조합만 포함해야 한다 - 역명/상권명/
+    세부업종 기반 Query가 섞여 있으면 실패다."""
     app = _make_region_app(
-        legal_dongs=[_item("1174010900", "천호동")], per_query_limit=10,
-        auto_subdivide=False, subregions={"landmarks": ["올림픽공원"], "subcategory_keywords": ["브런치"]},
+        legal_dongs=[_item("1174010900", "천호동"), _item("1174010200", "성내동")],
+        per_query_limit=10, keyword="카페",
     )
     queue = app._build_collection_queries()
-    assert len(queue) == 1
+    assert len(queue) == 2
+    expected_queries = {"서울특별시 강동구 천호동 카페", "서울특별시 강동구 성내동 카페"}
+    assert {job["query"] for job in queue} == expected_queries
+    assert all(job["source_layer"] in ("legal_dong", "district") for job in queue)
 
 
-def test_4_auto_subdivide_on_adds_aux_query_and_recalculates_target():
-    """사용자가 보조 검색을 명시적으로 켜면(auto_subdivide=True) 실제 최종
-    Query Queue 개수를 기준으로 target_count가 다시 계산된다."""
+# --------------------------------------------------------------------------
+# NEW-OPENING-1 §7: UI의 new_open_only_var가 job까지 명시적으로 전달됨
+# --------------------------------------------------------------------------
+def test_new_open_only_false_by_default_in_job():
+    app = _make_region_app(legal_dongs=[_item("1174010900", "천호동")], new_open_only=False)
+    queue = app._build_collection_queries()
+    assert all(job["new_opening_only"] is False for job in queue)
+
+
+def test_new_open_only_true_threaded_into_every_job():
     app = _make_region_app(
-        legal_dongs=[_item("1174010900", "천호동")], per_query_limit=10,
-        auto_subdivide=True, subregions={"landmarks": ["올림픽공원"], "subcategory_keywords": ["브런치"]},
+        legal_dongs=[_item("1174010900", "천호동"), _item("1174010200", "성내동")],
+        new_open_only=True,
     )
     queue = app._build_collection_queries()
-    app._recalculate_target_count()
-    assert len(queue) == 3  # 법정동 1개 + landmarks 1개 + subcategory_keywords 1개
-    assert app.target_count_var.get() == "30"
+    assert len(queue) == 2
+    assert all(job["new_opening_only"] is True for job in queue)
 
 
-def test_auto_subdivide_var_default_is_false_in_source():
-    """§2 - 체크박스 생성 시점의 기본값이 False인지(위젯 생성 자체는 Tk 루트가
-    필요해 여기서는 소스 코드로 확인한다 - target_count_entry_always_disabled
-    테스트와 동일한 패턴)."""
-    source = inspect.getsource(ui.SalesDbCrawlerApp._build_subdivision_section)
-    assert "self.auto_subdivide_var = ctk.BooleanVar(value=False)" in source
+def test_new_open_checkbox_no_longer_force_disabled_in_source():
+    """§5 - 새로오픈 체크박스를 항상 잠그던 코드(예: state="disabled" 고정
+    생성, _set_left_panel_state의 강제 재잠금)가 더 이상 없어야 한다."""
+    build_source = inspect.getsource(ui.SalesDbCrawlerApp._build_filter_section)
+    panel_state_source = inspect.getsource(ui.SalesDbCrawlerApp._set_left_panel_state)
+    assert 'ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var, state="disabled")' not in build_source
+    assert "new_open_checkbox" not in panel_state_source
+
+
+# --------------------------------------------------------------------------
+# §3/§9-B 시군구·법정동 가나다순 정렬(순수 함수 + 실제 wiring)
+# --------------------------------------------------------------------------
+def test_sort_korean_names_gu_order():
+    names = ["강서구", "강동구", "강남구", "강북구"]
+    assert ui._sort_korean_names(names) == ["강남구", "강동구", "강북구", "강서구"]
+
+
+def test_sort_legal_dong_items_ga_dong_order():
+    items = [_item("1", "가양동"), _item("2", "가산동"), _item("3", "가락동")]
+    sorted_items = ui._sort_legal_dong_items(items)
+    assert [i["eup_myeon_dong"] for i in sorted_items] == ["가락동", "가산동", "가양동"]
+
+
+def test_sort_legal_dong_items_mixed_eup_myeon_dong():
+    """읍/면/동이 섞인 목록도 이름 문자열 기준 가나다순으로만 정렬된다
+    (계층 종류로 별도 그룹핑하지 않음)."""
+    items = [_item("1", "조치원읍"), _item("2", "가락동"), _item("3", "나성면")]
+    sorted_items = ui._sort_legal_dong_items(items)
+    assert [i["eup_myeon_dong"] for i in sorted_items] == ["가락동", "나성면", "조치원읍"]
+
+
+def test_sort_legal_dong_items_same_name_uses_legal_code_tiebreaker():
+    """이름이 같은 법정동(다른 시군구에서 옮겨 합친 경우 등)은 legal_code
+    오름차순을 보조 키로 사용해 정렬 결과가 결정적이어야 한다."""
+    items = [_item("2000000000", "신교동"), _item("1000000000", "신교동")]
+    sorted_items = ui._sort_legal_dong_items(items)
+    assert [i["legal_code"] for i in sorted_items] == ["1000000000", "2000000000"]
+
+
+def test_sort_korean_names_normalization_insensitive():
+    """NFC/NFD 정규화 차이가 있는 문자열도(정렬 키만 NFC로 맞춰 비교하므로)
+    같은 값으로 취급되어 올바른 위치에 정렬돼야 한다(OS locale에 의존하지
+    않음, §3). 반환값 자체는 원본 문자열을 그대로 보존한다(정규화로
+    바꿔치기하지 않음)."""
+    import unicodedata
+    nfd_name = unicodedata.normalize("NFD", "강동구")
+    result = ui._sort_korean_names(["강서구", nfd_name, "강남구"])
+    assert result == ["강남구", nfd_name, "강서구"]
+
+
+class _StubLoaderForSort:
+    """실제 list_sigungus/list_legal_dongs가 legal_code 오름차순(=미정렬,
+    Snapshot 원본 순서)으로 반환한다고 가정하고, ui.py 쪽 wiring이 이를
+    가나다순으로 다시 정렬해 화면/상태에 반영하는지 확인하기 위한 스텁."""
+
+    def __init__(self, sigungus, dongs):
+        self._sigungus = sigungus
+        self._dongs = dongs
+
+    def list_sigungus(self, sido):
+        return list(self._sigungus)
+
+    def list_legal_dongs(self, sido, sigungu):
+        return list(self._dongs)
+
+
+class _FakeDropdown:
+    def __init__(self):
+        self.values = None
+        self.state = None
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self.values = kwargs["values"]
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+
+
+def _make_sort_wiring_app(*, sigungus, dongs):
+    app = ui.SalesDbCrawlerApp.__new__(ui.SalesDbCrawlerApp)
+    app.legal_dong_sido_var = _SimpleVar("서울특별시")
+    app.legal_dong_sigungu_var = _SimpleVar("")
+    app.legal_dong_sigungu_dropdown = _FakeDropdown()
+    app._legal_dong_loader = _StubLoaderForSort(sigungus, dongs)
+    app._legal_dong_popup = None
+    app.legal_dong_selected_count_var = _SimpleVar("")
+    app.legal_dong_query_count_var = _SimpleVar("")
+    app.target_count_var = _SimpleVar(ui._DEFAULT_TARGET_COUNT)
+    app.limit_var = _SimpleVar("30")
+    app.keyword_input_var = _SimpleVar("카페")
+    app.new_open_only_var = _SimpleVar(False)
+    app.target_count_entry = object()
+    return app
+
+
+def test_reload_sigungu_options_sorts_gu_names():
+    app = _make_sort_wiring_app(sigungus=["강서구", "강동구", "강남구"], dongs=[])
+    app._reload_legal_dong_sigungu_options()
+    assert app.legal_dong_sigungu_dropdown.values == ["강남구", "강동구", "강서구"]
+    assert app.legal_dong_sigungu_var.get() == "강남구"
+
+
+def test_reload_sigungu_options_sejong_no_sigungu_still_disabled():
+    """세종특별자치시처럼 시군구가 없는 지역은 정렬 로직이 끼어들어도
+    기존 "(시군구 없음)" 처리가 그대로 유지돼야 한다(회귀 없음)."""
+    app = _make_sort_wiring_app(sigungus=[], dongs=[])
+    app._reload_legal_dong_sigungu_options()
+    assert app.legal_dong_sigungu_dropdown.values == [ui._LEGAL_DONG_NO_SIGUNGU]
+    assert app.legal_dong_sigungu_dropdown.state == "disabled"
+    assert app.legal_dong_sigungu_var.get() == ui._LEGAL_DONG_NO_SIGUNGU
+
+
+def test_reload_legal_dong_checkboxes_sorts_and_preserves_legal_code(monkeypatch):
+    """_reload_legal_dong_checkboxes는 실제로 ctk.BooleanVar()를 생성하므로
+    (Tk 루트 없이는 RuntimeError) 이 테스트에서만 BooleanVar를 가벼운
+    fake로 바꿔치기한다 - 로직(정렬/legal_code 보존) 검증이 목적이며 실제
+    Tk 위젯 동작 자체는 검증 대상이 아니다."""
+    monkeypatch.setattr(ui.ctk, "BooleanVar", lambda value=False: _SimpleVar(value))
+    dongs = [_item("1174010900", "천호동"), _item("1174010200", "성내동"), _item("1174010300", "길동")]
+    app = _make_sort_wiring_app(sigungus=["강동구"], dongs=dongs)
+    app._reload_legal_dong_checkboxes()
+    names = [item["eup_myeon_dong"] for item in app._legal_dong_current_items]
+    assert names == ["길동", "성내동", "천호동"]
+    # legal_code 자체는 값이 바뀌지 않고, 각 이름에 그대로 매칭된다.
+    by_name = {item["eup_myeon_dong"]: item["legal_code"] for item in app._legal_dong_current_items}
+    assert by_name == {"천호동": "1174010900", "성내동": "1174010200", "길동": "1174010300"}
+    # 선택 상태(BooleanVar) 키도 legal_code 기준으로 전부 생성돼 있어야 한다.
+    assert set(app.legal_dong_selection_vars.keys()) == {"1174010900", "1174010200", "1174010300"}
 
 
 # --------------------------------------------------------------------------

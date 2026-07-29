@@ -110,12 +110,18 @@ def check_readme_zero_rows_no_file(reporter: ValidationReporter) -> None:
         reporter.fail("README에 0건 시 파일 미생성 문구가 없음")
 
 
-def check_readme_new_open_filter_unsupported(reporter: ValidationReporter) -> None:
-    ok = "새로오픈" in README_TEXT and ("지원하지 않" in README_TEXT or "지원하지 않습니다" in README_TEXT)
+def check_readme_new_open_filter_supported_with_exhaustion_guidance(reporter: ValidationReporter) -> None:
+    """NEW-OPENING-1: README는 이제 새로오픈 필터가 실제 전용 목록 수집
+    기능임을 설명하고, 목표보다 적을 수 있다는 안내를 함께 제공해야 한다."""
+    ok = (
+        "새로오픈" in README_TEXT
+        and "새로오픈 전용 목록" in README_TEXT
+        and "목표보다 적으면" in README_TEXT
+    )
     if ok:
-        reporter.pass_("README: 새로오픈 필터 현재 미지원 명시")
+        reporter.pass_("README: 새로오픈 필터 사용 가능 + 목표 미달 정상 안내 명시")
     else:
-        reporter.fail("README에 새로오픈 필터 미지원 문구가 없음")
+        reporter.fail("README에 새로오픈 필터 사용 가능/목표 미달 안내 문구가 없음")
 
 
 def check_readme_fields_may_be_blank(reporter: ValidationReporter) -> None:
@@ -278,20 +284,19 @@ def check_ux1_global_target_not_guaranteed(reporter: ValidationReporter) -> None
         reporter.fail(f"UX-1: 전체 목표가 보장값이 아니라는 안내가 없음\n{GLOBAL_TARGET_COUNT_SECTION_SOURCE}")
 
 
-def check_ux1_new_open_currently_unavailable(reporter: ValidationReporter) -> None:
-    ok = "정확하게 판별할 수 없어 사용할 수 없습니다" in FILTER_SECTION_SOURCE
+def check_ux1_new_open_now_available_with_exhaustion_guidance(reporter: ValidationReporter) -> None:
+    """NEW-OPENING-1: 새로오픈 필터가 실제 전용 목록 수집 기능으로 구현되면서
+    "사용할 수 없습니다" 안내는 사라지고, 대신 목표보다 적을 수 있다는
+    안내로 바뀌었다(§5/§8)."""
+    ok = (
+        "정확하게 판별할 수 없어 사용할 수 없습니다" not in FILTER_SECTION_SOURCE
+        and "새로오픈 전용 목록만 수집합니다" in FILTER_SECTION_SOURCE
+        and "목표보다 적으면" in FILTER_SECTION_SOURCE
+    )
     if ok:
-        reporter.pass_("UX-1: 새로오픈 필터가 현재 정확 판별 불가로 사용할 수 없다는 안내 존재")
+        reporter.pass_("UX-1: 새로오픈 필터 사용 가능 안내 + 목표 미달 가능 안내 존재")
     else:
-        reporter.fail(f"UX-1: 새로오픈 현재 사용 불가 안내가 없음\n{FILTER_SECTION_SOURCE}")
-
-
-def check_ux1_new_open_column_kept_blank(reporter: ValidationReporter) -> None:
-    ok = "새로오픈여부' 열은 유지되며" in FILTER_SECTION_SOURCE and "빈칸으로 저장됩니다" in FILTER_SECTION_SOURCE
-    if ok:
-        reporter.pass_("UX-1: Excel '새로오픈여부' 열은 유지되고 현재 결과는 빈칸이라는 안내 존재")
-    else:
-        reporter.fail(f"UX-1: 새로오픈여부 열 유지/빈칸 안내가 없음\n{FILTER_SECTION_SOURCE}")
+        reporter.fail(f"UX-1: 새로오픈 사용 가능 안내가 예상과 다름\n{FILTER_SECTION_SOURCE}")
 
 
 def check_ux1_per_query_vs_global_example(reporter: ValidationReporter) -> None:
@@ -335,12 +340,18 @@ def check_ux1_forbidden_phrases_absent_in_new_ui_text(reporter: ValidationReport
         reporter.fail(f"UX-1: 새 UI 문구에 금지 표현이 있음: {found}")
 
 
-def check_ux1_new_open_checkbox_disabled_contract_preserved(reporter: ValidationReporter) -> None:
-    ok = 'state="disabled"' in FILTER_SECTION_SOURCE and "new_open_checkbox" in FILTER_SECTION_SOURCE
+def check_ux1_new_open_checkbox_no_longer_disabled(reporter: ValidationReporter) -> None:
+    """NEW-OPENING-1: 새로오픈 체크박스는 더 이상 생성 시점에 disabled로
+    고정되지 않는다(§5) - 정상 사용 가능한 필터로 바뀌었다."""
+    ok = (
+        'ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var, state="disabled")'
+        not in FILTER_SECTION_SOURCE
+        and "new_open_checkbox" in FILTER_SECTION_SOURCE
+    )
     if ok:
-        reporter.pass_("UX-1: 새로오픈 체크박스 disabled 계약이 문구 개선 후에도 유지됨")
+        reporter.pass_("UX-1: 새로오픈 체크박스가 더 이상 강제 disabled로 생성되지 않음")
     else:
-        reporter.fail(f"UX-1: 새로오픈 체크박스 disabled 계약이 사라짐\n{FILTER_SECTION_SOURCE}")
+        reporter.fail(f"UX-1: 새로오픈 체크박스가 여전히 강제 disabled로 생성됨\n{FILTER_SECTION_SOURCE}")
 
 
 def check_ux1_default_values_unchanged(reporter: ValidationReporter) -> None:
@@ -361,7 +372,7 @@ def main() -> int:
     check_readme_target_shortfall_possible(reporter)
     check_readme_captcha_429_no_bypass(reporter)
     check_readme_zero_rows_no_file(reporter)
-    check_readme_new_open_filter_unsupported(reporter)
+    check_readme_new_open_filter_supported_with_exhaustion_guidance(reporter)
     check_readme_fields_may_be_blank(reporter)
     check_readme_no_direct_http_client(reporter)
     check_official_product_disclaimer(reporter)
@@ -376,11 +387,10 @@ def main() -> int:
     check_ux1_global_target_aggregates_combinations(reporter)
     check_ux1_global_target_dedup_then_save(reporter)
     check_ux1_global_target_not_guaranteed(reporter)
-    check_ux1_new_open_currently_unavailable(reporter)
-    check_ux1_new_open_column_kept_blank(reporter)
+    check_ux1_new_open_now_available_with_exhaustion_guidance(reporter)
     check_ux1_per_query_vs_global_example(reporter)
     check_ux1_forbidden_phrases_absent_in_new_ui_text(reporter)
-    check_ux1_new_open_checkbox_disabled_contract_preserved(reporter)
+    check_ux1_new_open_checkbox_no_longer_disabled(reporter)
     check_ux1_default_values_unchanged(reporter)
 
     reporter.summary()

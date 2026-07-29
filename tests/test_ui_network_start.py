@@ -485,21 +485,28 @@ def check_worker_unexpected_exception_restores_ui_without_success_wording(report
 # ---------------------------------------------------------------------------
 
 
-def check_new_open_filter_disabled_and_normalized(reporter: ValidationReporter) -> None:
+def check_new_open_filter_enabled_and_threaded_into_jobs(reporter: ValidationReporter) -> None:
+    """NEW-OPENING-1: 새로오픈 체크박스는 더 이상 항상 잠기지 않으며(§5),
+    체크한 값이 query_queue의 각 job["new_opening_only"]까지 명시적으로
+    전달돼야 한다(별도 thread 인자가 아니라 job dict를 통해 collector까지
+    흘러간다 - §7)."""
     filter_source = inspect.getsource(ui.SalesDbCrawlerApp._build_filter_section)
     panel_state_source = inspect.getsource(ui.SalesDbCrawlerApp._set_left_panel_state)
     static_ok = (
-        'state="disabled"' in filter_source
-        and "new_open_checkbox" in filter_source
-        and "정확하게 판별할 수 없어 사용할 수 없습니다" in filter_source
-        and "new_open_checkbox" in panel_state_source
-        and '"disabled"' in panel_state_source
+        'ctk.CTkCheckBox(filter_frame, text="새로오픈 업체만 수집", variable=self.new_open_only_var, state="disabled")'
+        not in filter_source
+        and "new_open_checkbox" not in panel_state_source
     )
     if not static_ok:
-        reporter.fail(f"새로오픈 필터 정적 검증 결과가 예상과 다름\nfilter_source={filter_source}\npanel_state_source={panel_state_source}")
+        reporter.fail(f"새로오픈 필터가 여전히 강제로 잠겨 있음\nfilter_source={filter_source}\npanel_state_source={panel_state_source}")
         return
 
-    app, logs, statuses, running_calls = _make_app()
+    app, logs, statuses, running_calls = _make_app(
+        query_queue=[{
+            "region": "서울특별시 강동구", "keyword": "카페", "query": "서울특별시 강동구 카페",
+            "new_opening_only": True,
+        }],
+    )
     app.new_open_only_var = FakeVar(True)
     fake_threading, instances = _make_fake_threading()
 
@@ -507,10 +514,16 @@ def check_new_open_filter_disabled_and_normalized(reporter: ValidationReporter) 
         saved.set("threading", fake_threading)
         app.start_crawl()
 
-    if instances and app.new_open_only_var.get() is False:
-        reporter.pass_("새로오픈 필터: 체크박스 disabled 생성 + 안내 문구 + 좌측 패널 복구 후에도 강제 disabled 유지 + Network 실행 전 False로 정규화됨")
+    query_queue = instances[0].args[0] if instances else []
+    if (
+        instances
+        and app.new_open_only_var.get() is True
+        and query_queue
+        and all(job.get("new_opening_only") is True for job in query_queue)
+    ):
+        reporter.pass_("새로오픈 필터: 체크박스 사용 가능(강제 disabled 없음) + query_queue의 모든 job에 new_opening_only=True 전달됨")
     else:
-        reporter.fail(f"새로오픈 필터 정규화 결과가 예상과 다름: instances={len(instances)}, new_open_only_var={app.new_open_only_var.get()}")
+        reporter.fail(f"새로오픈 필터 wiring 결과가 예상과 다름: instances={len(instances)}, new_open_only_var={app.new_open_only_var.get()}, query_queue={query_queue}")
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +574,7 @@ def main() -> int:
     check_running_state_applied_before_thread_start(reporter)
     check_worker_normal_completion_restores_ui(reporter)
     check_worker_unexpected_exception_restores_ui_without_success_wording(reporter)
-    check_new_open_filter_disabled_and_normalized(reporter)
+    check_new_open_filter_enabled_and_threaded_into_jobs(reporter)
     check_legacy_rollback_path_reachable_via_internal_constant(reporter)
 
     reporter.summary()

@@ -2,10 +2,9 @@
 #
 # 이 모듈은 scripts/update_legal_dong_snapshot.py(개발자용 갱신 도구)가 만든
 # Snapshot 파일만 읽는다 - 행안부 API를 직접 호출하지 않으며, 앱 실행 중
-# 네트워크 호출이 0회임을 보장한다. Snapshot이 없거나 손상되면 조용히
-# data/regions_kr_sample.json(다른 용도의 별도 샘플 데이터)으로 폴백하지
-# 않고 LegalDongSnapshotError를 던진다 - 호출자(UI)가 명확한 오류로 처리해야
-# 한다.
+# 네트워크 호출이 0회임을 보장한다. Snapshot이 없거나 손상되면 조용히 다른
+# 데이터로 폴백하지 않고 LegalDongSnapshotError를 던진다 - 호출자(UI)가
+# 명확한 오류로 처리해야 한다.
 import json
 import re
 import sys
