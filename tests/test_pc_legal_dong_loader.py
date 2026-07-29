@@ -214,5 +214,14 @@ def test_spec_includes_legal_dong_snapshot_in_datas():
     assert "'data'" in text or '"data"' in text
 
 
+def test_spec_includes_regions_kr_sample_in_datas():
+    """EXE-PACKAGE-1: regions_kr_sample.json이 datas에 없으면
+    _ensure_subdivision_data_loaded()가 앱 시작 시(auto_subdivide_var
+    값과 무관) FileNotFoundError로 크래시한다(src/ui.py REGIONS_SAMPLE_PATH
+    참고)."""
+    text = SPEC_PATH.read_text(encoding="utf-8")
+    assert "regions_kr_sample.json" in text
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
