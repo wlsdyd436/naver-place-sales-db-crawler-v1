@@ -78,6 +78,7 @@ from src.pc.network_list_scraper import (
     to_common_entity,
     trim_membership_rows_to_target,
 )
+from src.pc.run_control import wait_while_paused
 
 _SEARCH_URL_TEMPLATE = "https://map.naver.com/v5/search/{query}"
 
@@ -3107,7 +3108,75 @@ def _split_new_opening_valid_rows(rows: list) -> tuple:
     return valid_rows, rejected
 
 
-def collect_apollo_first_list_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
+_REVIEW_BELOW_MIN_REASON = "총리뷰수가 최소값 미만"
+_REVIEW_ABOVE_MAX_REASON = "총리뷰수가 최대값 초과"
+_REVIEW_UNKNOWN_REASON = "총리뷰수를 확인할 수 없음(빈 값/파싱 불가)"
+
+
+def _parse_review_count(value) -> int | None:
+    """row["총리뷰수"](정수 또는 숫자 문자열)를 int로 변환한다. 비어있거나
+    숫자로 해석할 수 없으면 None(REVIEW_UNKNOWN 처리 대상)을 반환한다."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_review_valid_rows(rows: list, review_min: int | None, review_max: int | None) -> tuple:
+    """review_min/review_max(둘 중 하나라도 설정된 경우에만 호출) 기준으로
+    row["총리뷰수"]가 범위 안인 row만 유효로 남긴다(§4 - 총리뷰수를 기준
+    필드로 사용하기로 확정, scratchpad/network_controls_fix/review_filter_contract_audit.md).
+    _split_region_valid_rows/_split_new_opening_valid_rows와 동일하게
+    per_query_limit 판정보다 먼저 호출돼야 한다 - 제외된 row가 상한을
+    소비하지 않게 하기 위함이다. 총리뷰수가 비어있거나 파싱 불가하면
+    범위를 판정할 수 없으므로 REVIEW_UNKNOWN으로 분류해 제외한다(레거시의
+    "빈 값=0으로 취급" 대신, 실제로 확인 불가능하다는 사실을 진단에 남긴다)."""
+    valid_rows = []
+    rejected = []
+    for row in rows:
+        review_count = _parse_review_count(row.get("총리뷰수"))
+        if review_count is None:
+            status, reason = "REVIEW_UNKNOWN", _REVIEW_UNKNOWN_REASON
+        elif review_min is not None and review_count < review_min:
+            status, reason = "REVIEW_BELOW_MIN", _REVIEW_BELOW_MIN_REASON
+        elif review_max is not None and review_count > review_max:
+            status, reason = "REVIEW_ABOVE_MAX", _REVIEW_ABOVE_MAX_REASON
+        else:
+            status, reason = None, None
+        if status is None:
+            valid_rows.append(row)
+        else:
+            rejected.append({
+                "source_query": row.get("source_query"),
+                "업체명": row.get("업체명"),
+                "place_id": row.get("place_id"),
+                "판정_상태": status,
+                "거부_이유": reason,
+                "주소": row.get("주소"),
+            })
+    return valid_rows, rejected
+
+
+def _review_filter_stats(candidate_count: int, rejected: list) -> dict:
+    """_split_review_valid_rows의 rejected 목록에서 §8 진단 카운터를 만든다."""
+    return {
+        "candidate": candidate_count,
+        "accepted": candidate_count - len(rejected),
+        "rejected_by_min": sum(1 for r in rejected if r["판정_상태"] == "REVIEW_BELOW_MIN"),
+        "rejected_by_max": sum(1 for r in rejected if r["판정_상태"] == "REVIEW_ABOVE_MAX"),
+        "unknown": sum(1 for r in rejected if r["판정_상태"] == "REVIEW_UNKNOWN"),
+    }
+
+
+def _merge_review_filter_stats(a: dict, b: dict) -> dict:
+    return {key: a.get(key, 0) + b.get(key, 0) for key in ("candidate", "accepted", "rejected_by_min", "rejected_by_max", "unknown")}
+
+
+def collect_apollo_first_list_query(
+    page, job, target_count, *, collected_at, max_pages: int = 5, pause_event=None, stop_event=None
+) -> dict:
     """신규 Apollo/GraphQL-first 목록 수집. 1페이지는 메인 placeList(...)
     operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
     response를 harvest한다. run_collection_plan이 기대하는 최소 계약
@@ -3167,6 +3236,7 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             "page_count": 0,
             "pagination_stop_reason": None,
             "rejected_rows": [],
+            "review_filter_stats": None,
         }
 
     try:
@@ -3195,12 +3265,24 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             row["source_subregion"] = job.get("source_subregion")
             row["source_layer"] = job.get("source_layer")
 
+        review_min = job.get("review_min")
+        review_max = job.get("review_max")
+        review_filter_enabled = review_min is not None or review_max is not None
+        review_filter_stats = {"candidate": 0, "accepted": 0, "rejected_by_min": 0, "rejected_by_max": 0, "unknown": 0}
+
         local_seen: set = set()
         unique_rows = dedup_rows(mapped_rows, local_seen)
         unique_rows, rejected_rows = _split_region_valid_rows(unique_rows, job)
         if new_opening_only:
             unique_rows, new_opening_rejected = _split_new_opening_valid_rows(unique_rows)
             rejected_rows = rejected_rows + new_opening_rejected
+        if review_filter_enabled:
+            candidate_count = len(unique_rows)
+            unique_rows, review_rejected = _split_review_valid_rows(unique_rows, review_min, review_max)
+            rejected_rows = rejected_rows + review_rejected
+            review_filter_stats = _merge_review_filter_stats(
+                review_filter_stats, _review_filter_stats(candidate_count, review_rejected)
+            )
 
         def _ensure_parsed_simple(index: int) -> dict:
             """collect_network_query의 _ensure_parsed와 달리 candidate당 재확인
@@ -3235,6 +3317,14 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             pagination_stop_reason = "per_query_limit_reached"
         else:
             while current_page_number < max_pages:
+                # 다음 페이지 이동 전(§5 요청서) - 일시정지 중이면 여기서
+                # 대기하고, 대기 중 또는 대기 후 중지가 감지되면 새 페이지로
+                # 넘어가지 않고 지금까지 확보한 rows를 보존한 채 정상 종료한다.
+                wait_while_paused(pause_event, stop_event)
+                if stop_event is not None and stop_event.is_set():
+                    pagination_stop_reason = "user_stopped"
+                    break
+
                 probe = _probe_captcha_state(page)
                 final_captcha_signal = classify_captcha_signal(
                     marker_present_in_dom=probe["marker_present"],
@@ -3324,6 +3414,13 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
 
                 newly_unique = dedup_rows(page_mapped_rows, local_seen)
                 newly_valid, newly_rejected = _split_region_valid_rows(newly_unique, job)
+                if review_filter_enabled:
+                    candidate_count = len(newly_valid)
+                    newly_valid, newly_review_rejected = _split_review_valid_rows(newly_valid, review_min, review_max)
+                    newly_rejected = newly_rejected + newly_review_rejected
+                    review_filter_stats = _merge_review_filter_stats(
+                        review_filter_stats, _review_filter_stats(candidate_count, newly_review_rejected)
+                    )
                 unique_rows.extend(newly_valid)
                 rejected_rows.extend(newly_rejected)
                 current_page_number = target_page_number
@@ -3357,6 +3454,7 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             "page_count": current_page_number,
             "pagination_stop_reason": pagination_stop_reason,
             "rejected_rows": rejected_rows,
+            "review_filter_stats": review_filter_stats if review_filter_enabled else None,
         }
     finally:
         for event, event_handler in (
@@ -3381,9 +3479,11 @@ class ApolloFirstListCollector:
     이 컨텍스트가 닫힌(브라우저 세션이 종료된) 뒤 별도로 담당한다.
     """
 
-    def __init__(self, *, collected_at, session_factory=None, max_pages: int = 5):
+    def __init__(self, *, collected_at, session_factory=None, max_pages: int = 5, pause_event=None, stop_event=None):
         self.collected_at = collected_at
         self.max_pages = max_pages
+        self.pause_event = pause_event
+        self.stop_event = stop_event
         self._session_factory = session_factory or _default_session_factory
         self._session_cm = None
         self._session = None
@@ -3412,6 +3512,8 @@ class ApolloFirstListCollector:
                 per_query_limit,
                 collected_at=self.collected_at,
                 max_pages=self.max_pages,
+                pause_event=self.pause_event,
+                stop_event=self.stop_event,
             )
         finally:
             try:

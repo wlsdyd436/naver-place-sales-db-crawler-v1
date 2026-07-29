@@ -28,6 +28,7 @@ from src.pc.network_browser_collector import ApolloFirstListCollector
 from src.pc.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
 from src.pc.network_pipeline import run_collection_plan
 from src.pc.pipeline import collect_pc_full
+from src.pc.run_control import wait_while_paused
 
 
 # LEGALDONG-UI-2: 공식 법정동 Snapshot(§_build_region_section)이 시도/시군구/
@@ -109,6 +110,17 @@ def _parse_positive_int(raw: str, max_value: int | None = None) -> int | None:
     return value
 
 
+def _parse_review_bound(raw: str) -> int | None:
+    """review_min_var/review_max_var 하나를 파싱한다(NETWORK-CONTROLS-1).
+    0을 유효한 값으로 허용해야 하므로(총리뷰수 0 이상 전부라는 의미) 0을
+    None으로 취급하는 _parse_positive_int를 재사용하지 않는다. 공백/빈
+    문자열은 None(제한 없음)이고, 그 외 값은 int()로 변환하며 실패 시
+    ValueError를 그대로 전파한다 - legacy _start_legacy_crawl의 기존 리뷰
+    입력 검증과 동일한 계약이다."""
+    raw = (raw or "").strip()
+    return int(raw) if raw else None
+
+
 def _sort_korean_names(values: list) -> list:
     """OS locale(strcoll 등)에 의존하지 않는 안정 정렬 - NFC 정규화 후
     코드포인트 비교만 사용한다(§3 시군구 목록 가나다순)."""
@@ -128,7 +140,7 @@ def _sort_legal_dong_items(items: list[dict]) -> list[dict]:
 
 def build_legal_dong_query_plan(
     sido: str, sigungu: str, legal_dongs: list[dict], keyword: str, per_query_limit: int,
-    *, new_opening_only: bool = False,
+    *, new_opening_only: bool = False, review_min: int | None = None, review_max: int | None = None,
 ) -> list[dict]:
     """공식 법정동 Snapshot 기반 선택(시도/시군구/법정동 다중선택)으로 검색
     조합을 만드는 순수 함수(Tk 불필요). job 형태({"region","keyword","query",
@@ -148,6 +160,9 @@ def build_legal_dong_query_plan(
     new_opening_only(NEW-OPENING-1): UI의 새로오픈 체크박스 값을 그대로
     job에 실어 collect_apollo_first_list_query까지 전달한다 - Query
     문자열 생성에는 영향을 주지 않는다(공식 지역명+키워드만 사용).
+
+    review_min/review_max(NETWORK-CONTROLS-1): UI의 리뷰 최소·최대 입력값을
+    동일한 방식으로 job에 실어 전달한다(둘 다 기본 None=필터 비활성).
     """
 
     def _norm(text: str) -> str:
@@ -172,6 +187,8 @@ def build_legal_dong_query_plan(
                 "legal_code": "",
                 "per_query_limit": per_query_limit,
                 "new_opening_only": new_opening_only,
+                "review_min": review_min,
+                "review_max": review_max,
             })
         return jobs
 
@@ -196,6 +213,8 @@ def build_legal_dong_query_plan(
             "legal_code": legal_code,
             "per_query_limit": per_query_limit,
             "new_opening_only": new_opening_only,
+            "review_min": review_min,
+            "review_max": review_max,
         })
     return jobs
 
@@ -946,6 +965,8 @@ class SalesDbCrawlerApp(ctk.CTk):
         jobs = build_legal_dong_query_plan(
             sido, sigungu, self.get_selected_legal_dongs(), keyword, per_query_limit,
             new_opening_only=self.new_open_only_var.get(),
+            review_min=_parse_review_bound(self.review_min_var.get()),
+            review_max=_parse_review_bound(self.review_max_var.get()),
         )
 
         seen_queries: set = set()
@@ -1285,6 +1306,15 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.show_error("검색 조합당 수집 상한 오류", message)
             return
 
+        try:
+            review_min = _parse_review_bound(self.review_min_var.get())
+            review_max = _parse_review_bound(self.review_max_var.get())
+        except ValueError:
+            message = "리뷰수는 숫자만 입력해야 합니다."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("리뷰 필터 오류", message)
+            return
+
         if not output_path:
             self.log("[ui] 실패: 저장 경로가 비어 있습니다")
             return
@@ -1335,6 +1365,8 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log(f"[ui] 수집 모드={collection_mode}")
         if self.new_open_only_var.get():
             self.log("[ui] 새로오픈 전용 목록을 수집합니다.")
+        if review_min is not None or review_max is not None:
+            self.log(f"[ui] 리뷰 필터(총리뷰수 기준)={review_min if review_min is not None else '제한없음'}~{review_max if review_max is not None else '제한없음'}")
 
         threading.Thread(
             target=self._run_network_pipeline_worker,
@@ -1767,14 +1799,22 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log(f"[ui][network] Queue 생성 완료: {total}건")
         self.log(f"[ui][network] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
 
-        with collector_factory(collected_at=collected_at) as collector:
+        def _network_should_continue() -> bool:
+            # NETWORK-CONTROLS-1: 다음 job(검색 조합) 시작 전(§5 요청서) -
+            # 일시정지 중이면 여기서 대기한다. 동기 컨텍스트(worker thread,
+            # Tk UI 스레드 아님)라 블로킹 대기가 안전하다. stop_event가
+            # pause_event보다 우선하므로 대기 중 중지되면 즉시 빠져나온다.
+            wait_while_paused(self.pause_event, self.stop_event)
+            return not self.stop_event.is_set()
+
+        with collector_factory(collected_at=collected_at, pause_event=self.pause_event, stop_event=self.stop_event) as collector:
             result = orchestrator(
                 query_queue,
                 per_query_limit=per_query_limit,
                 target_count=target_count,
                 collected_at=collected_at,
                 collect_query=collector.collect_query,
-                should_continue=lambda: not self.stop_event.is_set(),
+                should_continue=_network_should_continue,
                 on_security_block=self._note_security_block,
             )
 
@@ -1791,7 +1831,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 ssr_result = collector.enrich_detail_ssr(
                     rows,
                     max_targets=len(rows),
-                    should_continue=lambda: not self.stop_event.is_set(),
+                    should_continue=_network_should_continue,
                     on_progress=self._note_ssr_progress,
                 )
                 result["rows"] = ssr_result["rows"]
@@ -1835,6 +1875,8 @@ class SalesDbCrawlerApp(ctk.CTk):
                 rows,
                 should_continue=lambda: not self.stop_event.is_set(),
                 on_progress=self._note_home_progress,
+                pause_event=self.pause_event,
+                stop_event=self.stop_event,
             )
             result["rows"] = home_result["rows"]
             result["home_stop_reason"] = home_result["stop_reason"]
@@ -1889,6 +1931,20 @@ class SalesDbCrawlerApp(ctk.CTk):
         if result.get("navigation_error"):
             nav_message = (result.get("navigation_error_message") or "")[:120]
             self.log(f"[ui][network] navigation_error 상세(로그 전용): {nav_message}")
+
+        duplicate_removed_count = result.get("duplicate_removed_count", 0)
+        self.after(0, self.duplicate_removed_var.set, f"중복 제거: {duplicate_removed_count}개")
+
+        review_filter_stats = result.get("review_filter_stats")
+        if review_filter_stats is not None:
+            self.log(
+                "[ui][network] 리뷰 필터: 후보 "
+                f"{review_filter_stats['candidate']}건 중 채택 {review_filter_stats['accepted']}건 / "
+                f"제외 {review_filter_stats['candidate'] - review_filter_stats['accepted']}건"
+                f"(최소미만 {review_filter_stats['rejected_by_min']}, "
+                f"최대초과 {review_filter_stats['rejected_by_max']}, "
+                f"확인불가 {review_filter_stats['unknown']})"
+            )
 
         result = self._export_network_result(result, output_path, excel_exporter)
 

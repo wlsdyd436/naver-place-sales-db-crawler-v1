@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 
 import openpyxl
 
@@ -51,6 +52,8 @@ def _make_app():
     app.pause_event = threading.Event()
     app.log = lambda message: None
     app.set_status = lambda message: None
+    app.after = lambda delay, func, *args: func(*args)
+    app.duplicate_removed_var = SimpleNamespace(set=lambda value: None)
     app._security_block_decision = None
     return app
 
@@ -69,7 +72,7 @@ class FakeNetworkCollector:
         raise AssertionError("이 통합 테스트에서는 collect_query가 직접 호출되면 안 됨(fake orchestrator만 사용)")
 
 
-def _fake_collector_factory(*, collected_at):
+def _fake_collector_factory(*, collected_at, pause_event=None, stop_event=None):
     return FakeNetworkCollector(collected_at)
 
 

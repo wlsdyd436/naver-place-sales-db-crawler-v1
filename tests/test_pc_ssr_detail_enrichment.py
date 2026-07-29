@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -734,6 +735,8 @@ def main() -> int:
         app.pause_event = threading.Event()
         app.log = lambda message: None
         app.set_status = lambda message: None
+        app.after = lambda delay, func, *args: func(*args)
+        app.duplicate_removed_var = SimpleNamespace(set=lambda value: None)
         app._security_block_decision = None
         return app
 
@@ -757,7 +760,7 @@ def main() -> int:
     rows31 = [_fake_row(i) for i in range(3)]
     holder31: dict = {}
 
-    def factory31(*, collected_at):
+    def factory31(*, collected_at, pause_event=None, stop_event=None):
         c = FakeSSRCollector(collected_at)
         holder31["collector"] = c
         return c
@@ -798,7 +801,7 @@ def main() -> int:
         exporter_calls34.append(list(merged))
         return export_places_to_excel(merged, mobile, pc, output_path)
 
-    def factory34(*, collected_at):
+    def factory34(*, collected_at, pause_event=None, stop_event=None):
         return FakeSSRCollector(collected_at, ssr_rows_out=enriched_rows34)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -819,7 +822,7 @@ def main() -> int:
         "ui_fallback_success_count": 0, "failure_count": 0, "not_attempted_count": 2,
     }
 
-    def factory35(*, collected_at):
+    def factory35(*, collected_at, pause_event=None, stop_event=None):
         return FakeSSRCollector(collected_at, ssr_return=partial_ssr_return35)
 
     exporter_calls35: list = []

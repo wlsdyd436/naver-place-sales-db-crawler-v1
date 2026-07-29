@@ -66,6 +66,13 @@ def run_collection_plan(
     _map_item_to_row가 이미 끝낸 상태로 넘겨준다는 전제) - 호출부(향후 live
     collect_query 구현)가 collected_at을 필요로 할 수 있어 시그니처에만
     남겨둔다.
+
+    반환 dict에 추가된 진단 필드: "duplicate_removed_count"(전체 job에 걸쳐
+    dedup_rows가 실제로 걸러낸 행 수 누적), "review_filter_stats"(리뷰
+    필터가 적용된 job이 하나라도 있으면 candidate/accepted/rejected_by_min/
+    rejected_by_max/unknown을 job 간 합산한 dict, 없으면 None) - 둘 다
+    collect_query가 반환하는 값을 그대로 신뢰하고 집계만 한다(network_pipeline
+    자체는 dedup/리뷰 판정 로직을 갖지 않는다).
     """
     if seen is None:
         seen = set()
@@ -83,6 +90,8 @@ def run_collection_plan(
             "navigation_error": False,
             "navigation_error_message": "",
             "rejected_rows": [],
+            "duplicate_removed_count": 0,
+            "review_filter_stats": None,
         }
 
     total_jobs = len(jobs)
@@ -97,6 +106,8 @@ def run_collection_plan(
     navigation_error = False
     navigation_error_message = ""
     stop_reason = None
+    duplicate_removed_count = 0
+    review_filter_stats = None
 
     for job in jobs:
         if should_continue is not None and not should_continue():
@@ -115,8 +126,17 @@ def run_collection_plan(
 
         raw_rows = result.get("rows") or []
         capped_rows = raw_rows[:per_query_limit] if per_query_limit else raw_rows
-        rows.extend(dedup_rows(capped_rows, seen))
+        deduped_rows = dedup_rows(capped_rows, seen)
+        duplicate_removed_count += len(capped_rows) - len(deduped_rows)
+        rows.extend(deduped_rows)
         before_trim_count = len(rows)
+
+        job_review_stats = result.get("review_filter_stats")
+        if job_review_stats is not None:
+            if review_filter_stats is None:
+                review_filter_stats = {"candidate": 0, "accepted": 0, "rejected_by_min": 0, "rejected_by_max": 0, "unknown": 0}
+            for key in review_filter_stats:
+                review_filter_stats[key] += job_review_stats.get(key, 0)
 
         captcha_detected = bool(result.get("active_captcha_detected"))
         this_status_429 = bool(result.get("status_429_seen"))
@@ -152,6 +172,8 @@ def run_collection_plan(
         "navigation_error": navigation_error,
         "navigation_error_message": navigation_error_message,
         "rejected_rows": rejected_rows,
+        "duplicate_removed_count": duplicate_removed_count,
+        "review_filter_stats": review_filter_stats,
     }
 
 

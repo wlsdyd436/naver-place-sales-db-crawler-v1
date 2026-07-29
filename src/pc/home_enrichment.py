@@ -56,6 +56,7 @@ from src.pc.network_list_scraper import (
     build_place_url_from_id,
     extract_normalized_apollo_detail,
 )
+from src.pc.run_control import wait_while_paused_async
 
 _HOME_ENRICHMENT_CONCURRENCY = 2
 _HOME_RETRY_CONCURRENCY = 1
@@ -334,7 +335,8 @@ def _external_url_count(result: dict) -> int:
 
 
 async def _enrich_home_batch_async(
-    rows, *, should_continue=None, on_progress=None, backend_config=None, request_context_factory=None
+    rows, *, should_continue=None, on_progress=None, backend_config=None, request_context_factory=None,
+    pause_event=None, stop_event=None,
 ) -> dict:
     """asyncio.Semaphore(2)로 1차 순회를 수행하고(동시성/차단/사용자중지/
     dedup 정책은 기존과 동일), 1차 실패 중 일시적(transient) 상태만
@@ -423,12 +425,22 @@ async def _enrich_home_batch_async(
         pass_counters = {"attempted": 0, "success": 0, "failed": 0}
 
         async def _run_one(place_id: str) -> None:
+            # 다음 업체 home GET 전(§5 요청서). 60개 place_id 전부가
+            # asyncio.create_task로 한꺼번에 스케줄되므로, 여기 첫 번째
+            # 대기만으로는 실효성이 없다(일시정지가 켜지기도 전에 전부
+            # 이 지점을 통과해버림) - 진짜 동시성 제한 지점인 semaphore
+            # 획득 "직후"에도 다시 확인해야, 아직 순번이 안 온 나머지
+            # place_id가 실제로 새 요청을 시작하기 직전에 걸린다. 이미
+            # semaphore를 획득해 진행 중인 요청은 이 지점을 다시 지나지
+            # 않으므로 취소되지 않고 안전하게 끝까지 완료된다.
+            await wait_while_paused_async(pause_event, stop_event)
             if _should_stop():
                 if not is_retry:
                     cache[place_id] = _not_attempted_result(place_id)
                     _report_progress()
                 return  # retry pass: 1차 결과를 그대로 보존(덮어쓰지 않음)
             async with semaphore:
+                await wait_while_paused_async(pause_event, stop_event)
                 if _should_stop():
                     if not is_retry:
                         cache[place_id] = _not_attempted_result(place_id)
@@ -595,10 +607,20 @@ async def _enrich_home_batch_async(
     }
 
 
-def enrich_home_details(rows, *, should_continue=None, on_progress=None) -> dict:
+def enrich_home_details(rows, *, should_continue=None, on_progress=None, pause_event=None, stop_event=None) -> dict:
     """`asyncio.run()`으로 새 event loop를 만들고 그 안에서만 async Playwright를
     생성/사용/종료한다(sync 목록 수집 단계의 browser/context/page는 전혀
     참조하지 않음 - 그 세션은 이 함수가 호출되는 시점에 이미 완전히
     종료되어 있다). `asyncio.run()`이 함수 종료 시 loop를 자동으로 닫으므로
-    '단일 event loop 소유 + 정상 종료'가 보장된다."""
-    return asyncio.run(_enrich_home_batch_async(rows, should_continue=should_continue, on_progress=on_progress))
+    '단일 event loop 소유 + 정상 종료'가 보장된다.
+
+    pause_event/stop_event(선택, threading.Event)는 ui.py의 일시정지·중지
+    버튼과 그대로 연결된다 - 매 place_id의 신규 home GET 시작 직전에
+    wait_while_paused_async로 대기한다(이미 진행 중인 요청은 취소하지
+    않음)."""
+    return asyncio.run(
+        _enrich_home_batch_async(
+            rows, should_continue=should_continue, on_progress=on_progress,
+            pause_event=pause_event, stop_event=stop_event,
+        )
+    )

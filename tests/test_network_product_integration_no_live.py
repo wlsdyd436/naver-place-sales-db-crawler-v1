@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from urllib.parse import quote, unquote
 
 import openpyxl
@@ -238,7 +239,7 @@ def _make_collector_factory(pages, *, session_registry=None, session_factory_err
     session_factory만 fake로 주입한다 - collect_network_query/
     NetworkBrowserCollector.collect_query 자체는 전혀 monkeypatch하지 않는다."""
 
-    def factory(*, collected_at):
+    def factory(*, collected_at, pause_event=None, stop_event=None):
         def session_factory():
             if session_factory_error is not None:
                 raise session_factory_error
@@ -266,6 +267,8 @@ def _make_app():
     statuses: list = []
     app.log = lambda message: logs.append(message)
     app.set_status = lambda message: statuses.append(message)
+    app.after = lambda delay, func=None, *args, **kwargs: (func(*args, **kwargs) if func else None)
+    app.duplicate_removed_var = SimpleNamespace(set=lambda value: None)
     return app, logs, statuses
 
 

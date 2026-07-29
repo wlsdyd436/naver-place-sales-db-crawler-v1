@@ -361,10 +361,108 @@ def check_empty_jobs(reporter: ValidationReporter) -> None:
         collected_at="2026-07-14",
         collect_query=fake_collect,
     )
-    if result["rows"] == [] and result["stop_reason"] == "empty_jobs":
-        reporter.pass_("empty_jobs: jobs=[]이면 rows=[], stop_reason=empty_jobs")
+    if result["rows"] == [] and result["stop_reason"] == "empty_jobs" and result["duplicate_removed_count"] == 0 and result["review_filter_stats"] is None:
+        reporter.pass_("empty_jobs: jobs=[]이면 rows=[], stop_reason=empty_jobs, duplicate_removed_count=0, review_filter_stats=None")
     else:
         reporter.fail(f"empty_jobs 결과가 예상과 다름: {result}")
+
+
+def check_duplicate_removed_count_zero_when_no_duplicates(reporter: ValidationReporter) -> None:
+    """NETWORK-CONTROLS-1: 중복이 실제로 없으면 duplicate_removed_count=0을
+    그대로 표시해야 한다(항상 0으로 고정하던 기존 UI 버그와 달리, 실측값이
+    우연히 0인 경우도 정확히 구분돼야 함)."""
+    jobs = [{"query": "q1"}, {"query": "q2"}]
+
+    def fake_collect(job, per_query_limit):
+        if job["query"] == "q1":
+            return {"rows": [_row("1"), _row("2")]}
+        return {"rows": [_row("3")]}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-07-14", collect_query=fake_collect,
+    )
+    if result["duplicate_removed_count"] == 0:
+        reporter.pass_("duplicate_removed_count: 중복이 없으면 0")
+    else:
+        reporter.fail(f"duplicate_removed_count 결과가 예상과 다름: {result}")
+
+
+def check_duplicate_removed_count_within_query(reporter: ValidationReporter) -> None:
+    """한 job의 rows 안에서 같은 place_id가 반복되면(Query 내부 중복) 그
+    건수만큼 duplicate_removed_count에 반영돼야 한다."""
+    jobs = [{"query": "q1"}]
+
+    def fake_collect(job, per_query_limit):
+        return {"rows": [_row("1"), _row("1"), _row("1"), _row("2")]}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-07-14", collect_query=fake_collect,
+    )
+    if result["final_count"] == 2 and result["duplicate_removed_count"] == 2:
+        reporter.pass_("duplicate_removed_count: Query 내부 중복(place_id '1' 2회 초과분)이 정확히 집계됨")
+    else:
+        reporter.fail(f"duplicate_removed_count(Query 내부) 결과가 예상과 다름: {result}")
+
+
+def check_duplicate_removed_count_across_queries(reporter: ValidationReporter) -> None:
+    """서로 다른 job이 같은 place_id를 반환하면(Query 간 전역 중복) 그
+    건수만큼 duplicate_removed_count에 반영돼야 한다."""
+    jobs = [{"query": "q1"}, {"query": "q2"}]
+
+    def fake_collect(job, per_query_limit):
+        return {"rows": [_row("dup-1")]}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-07-14", collect_query=fake_collect,
+    )
+    if result["final_count"] == 1 and result["duplicate_removed_count"] == 1:
+        reporter.pass_("duplicate_removed_count: Query 간 전역 중복(job1/job2 동일 place_id)이 정확히 집계됨")
+    else:
+        reporter.fail(f"duplicate_removed_count(Query 간) 결과가 예상과 다름: {result}")
+
+
+def check_review_filter_stats_aggregated_across_jobs(reporter: ValidationReporter) -> None:
+    """collect_query가 반환하는 review_filter_stats를 job 여러 개에 걸쳐
+    정확히 합산해야 한다(network_pipeline은 판정 로직 없이 집계만 함)."""
+    jobs = [{"query": "q1"}, {"query": "q2"}]
+
+    def fake_collect(job, per_query_limit):
+        if job["query"] == "q1":
+            return {
+                "rows": [_row("1")],
+                "review_filter_stats": {"candidate": 5, "accepted": 1, "rejected_by_min": 2, "rejected_by_max": 1, "unknown": 1},
+            }
+        return {
+            "rows": [_row("2")],
+            "review_filter_stats": {"candidate": 3, "accepted": 1, "rejected_by_min": 1, "rejected_by_max": 0, "unknown": 1},
+        }
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-07-14", collect_query=fake_collect,
+    )
+    expected = {"candidate": 8, "accepted": 2, "rejected_by_min": 3, "rejected_by_max": 1, "unknown": 2}
+    if result["review_filter_stats"] == expected:
+        reporter.pass_("review_filter_stats: job 2개의 통계가 정확히 합산됨")
+    else:
+        reporter.fail(f"review_filter_stats 합산 결과가 예상과 다름: {result['review_filter_stats']} (expected {expected})")
+
+
+def check_review_filter_stats_none_when_not_reported(reporter: ValidationReporter) -> None:
+    """collect_query가 review_filter_stats를 아예 반환하지 않으면(리뷰 필터
+    비활성 job) 최종 결과도 None이어야 한다(하위 호환 - 기존 fake collector도
+    그대로 동작해야 함)."""
+    jobs = [{"query": "q1"}]
+
+    def fake_collect(job, per_query_limit):
+        return {"rows": [_row("1")]}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-07-14", collect_query=fake_collect,
+    )
+    if result["review_filter_stats"] is None:
+        reporter.pass_("review_filter_stats: 어떤 job도 반환하지 않으면 None 유지")
+    else:
+        reporter.fail(f"review_filter_stats가 None이어야 하는데: {result['review_filter_stats']}")
 
 
 def main() -> int:
@@ -382,6 +480,11 @@ def main() -> int:
     check_should_continue_false_after_first_job(reporter)
     check_should_continue_none_keeps_existing_behavior(reporter)
     check_empty_jobs(reporter)
+    check_duplicate_removed_count_zero_when_no_duplicates(reporter)
+    check_duplicate_removed_count_within_query(reporter)
+    check_duplicate_removed_count_across_queries(reporter)
+    check_review_filter_stats_aggregated_across_jobs(reporter)
+    check_review_filter_stats_none_when_not_reported(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

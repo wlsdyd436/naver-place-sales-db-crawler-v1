@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import threading
+from types import SimpleNamespace
 
 
 # ARCH-300C WIRE-2B-2/2C-1: src.ui._run_network_pipeline 검증용 standalone
@@ -51,6 +52,8 @@ def _make_app():
     statuses: list = []
     app.log = lambda message: logs.append(message)
     app.set_status = lambda message: statuses.append(message)
+    app.after = lambda delay, func, *args: func(*args)
+    app.duplicate_removed_var = SimpleNamespace(set=lambda value: None)
     app._security_block_decision = None
     return app, logs, statuses
 
@@ -83,7 +86,7 @@ class FakeCollectorFactory:
         self.calls: list = []
         self.instances: list = []
 
-    def __call__(self, *, collected_at):
+    def __call__(self, *, collected_at, pause_event=None, stop_event=None):
         self.calls.append(collected_at)
         instance = FakeNetworkCollector(collected_at)
         self.instances.append(instance)

@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
 import sys
+import threading
+import time
 
 
 # 신규 Apollo/GraphQL-first 목록 수집(collect_apollo_first_list_query/
@@ -536,7 +538,7 @@ def check_collector_opens_and_closes_one_page_per_query(reporter: ValidationRepo
     calls: list = []
     original = network_browser_collector.collect_apollo_first_list_query
 
-    def fake_collect(page, job, per_query_limit, *, collected_at, max_pages):
+    def fake_collect(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
         calls.append(page)
         return {"rows": [], "active_captcha_detected": False, "status_429_seen": False,
                 "navigation_error": False, "navigation_error_message": "", "page_count": 1,
@@ -568,7 +570,7 @@ def check_collector_closes_page_even_when_collect_raises(reporter: ValidationRep
 
     original = network_browser_collector.collect_apollo_first_list_query
 
-    def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages):
+    def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
         raise RuntimeError("boom")
 
     network_browser_collector.collect_apollo_first_list_query = fake_collect_raises
@@ -879,6 +881,255 @@ def check_new_opening_only_still_detects_captcha(reporter: ValidationReporter) -
         reporter.fail(f"새로오픈 ON CAPTCHA 감지 실패: {result}")
 
 
+# --------------------------------------------------------------------------
+# NETWORK-CONTROLS-1: 리뷰 최소·최대 필터(job["review_min"/"review_max"])와
+# 일시정지·중지(pause_event/stop_event)를 collect_apollo_first_list_query에
+# 연결한 결과를 검증한다. 기준 필드는 총리뷰수(방문자+블로그 합산, 사용자
+# 확정 - scratchpad/network_controls_fix/review_filter_contract_audit.md).
+# --------------------------------------------------------------------------
+REVIEW_JOB = dict(CHIPYEONGDONG_JOB, review_min=50, review_max=200)
+
+
+def _item_entity_with_reviews(place_id: str, name: str, visitor, blog, road_address="전남광주 서구 치평동 치평로 1") -> dict:
+    entity = {
+        "id": place_id, "name": name, "category": "카페",
+        "roadAddress": road_address, "phone": "02-000-0000",
+    }
+    if visitor is not None:
+        entity["visitorReviewsTotal"] = visitor
+    if blog is not None:
+        entity["cafeBlogReviewsTotal"] = blog
+    return entity
+
+
+def _apollo_state_with_reviews(query: str, items, start: int = 0) -> dict:
+    """items: (place_id, name, visitor, blog) 튜플 목록. visitor/blog가 None이면
+    해당 키를 아예 만들지 않아 총리뷰수가 ""(REVIEW_UNKNOWN 대상)이 되게 한다."""
+    ref_key_of = lambda pid: f"PlaceListBusinessesItem:{pid}:{pid}"
+    state = {ref_key_of(pid): _item_entity_with_reviews(pid, name, visitor, blog) for pid, name, visitor, blog in items}
+    state["ROOT_QUERY"] = {
+        _op_key({"query": query, "start": start, "display": 70}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, *_ in items]}
+        },
+    }
+    return state
+
+
+_REVIEW_PAGE1_ITEMS = [
+    ("1", "미만1", 10, 5),       # 총 15 - 최소(50) 미만
+    ("2", "적합1", 30, 40),      # 총 70 - 범위(50~200) 안
+    ("3", "초과1", 150, 100),    # 총 250 - 최대(200) 초과
+    ("4", "적합2", 50, 50),      # 총 100 - 범위 안
+    ("5", "미확인", None, None),  # 총리뷰수 확인 불가
+    ("6", "경계최소", 25, 25),   # 총 50 - 최소 경계값(포함)
+]  # 유효 3건(2/4/6), 제외 3건(1 미만, 3 초과, 5 미확인)
+
+
+def check_review_filter_excludes_rows_and_does_not_consume_limit(reporter: ValidationReporter) -> None:
+    state = _apollo_state_with_reviews(REVIEW_JOB["query"], _REVIEW_PAGE1_ITEMS)
+    page = FakeApolloPage([_apollo_state_result(state)])  # click_plan 없음 -> 다음 페이지 없음
+    result = collect_apollo_first_list_query(page, REVIEW_JOB, 10, collected_at="2026-07-29")
+
+    rejected = result["rejected_rows"]
+    rejected_by_status = {r["판정_상태"] for r in rejected}
+    stats = result["review_filter_stats"]
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 3
+        and {row["업체명"] for row in result["rows"]} == {"적합1", "적합2", "경계최소"}
+        and len(rejected) == 3
+        and rejected_by_status == {"REVIEW_BELOW_MIN", "REVIEW_ABOVE_MAX", "REVIEW_UNKNOWN"}
+        and stats == {"candidate": 6, "accepted": 3, "rejected_by_min": 1, "rejected_by_max": 1, "unknown": 1}
+        and result["pagination_stop_reason"] == "pagination_exhausted"
+    )
+    if ok:
+        reporter.pass_("NC-1. 리뷰 필터 제외 row는 per_query_limit을 소비하지 않고 rejected_rows/review_filter_stats로 정확히 분리됨")
+    else:
+        reporter.fail(f"NC-1. 리뷰 필터 제외 케이스 실패: rows={result['rows']}, rejected={rejected}, stats={stats}")
+
+
+def check_review_filter_backfills_valid_rows_from_next_page(reporter: ValidationReporter) -> None:
+    """1페이지 유효 3건(목표 5건 미달)이면 2페이지로 이동해 유효 row로
+    보충한다(§4 요청서 - 제외 후 다음 페이지에서 보충)."""
+    state = _apollo_state_with_reviews(REVIEW_JOB["query"], _REVIEW_PAGE1_ITEMS)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+    page2_items = [
+        ("11", "적합3", 60, 60, "전남광주 서구 치평동 치평로 300"),
+        ("12", "미만2", 5, 5, "전남광주 서구 치평동 치평로 310"),
+    ]
+
+    original_get_by_role = page._frame.get_by_role
+
+    def _patched_get_by_role(role, name=None, exact=None):
+        locator = original_get_by_role(role, name=name, exact=exact)
+        if name == "2":
+            original_locator_click = locator.click
+
+            def _click_and_schedule():
+                original_locator_click()
+                body = json.dumps({
+                    "result": {"place": {"list": [
+                        {"id": pid, "name": name_, "roadAddress": addr, "visitorReviewCount": v, "blogCafeReviewCount": b}
+                        for pid, name_, v, b, addr in page2_items
+                    ]}}
+                }).encode("utf-8")
+                page.schedule_after_click(FakeResponse(CANDIDATE_URL, 200, "xhr", body=body))
+
+            locator.click = _click_and_schedule
+        return locator
+
+    page._frame.get_by_role = _patched_get_by_role
+    result = collect_apollo_first_list_query(page, REVIEW_JOB, 5, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 4
+        and {row["업체명"] for row in result["rows"]} == {"적합1", "적합2", "경계최소", "적합3"}
+        and result["page_count"] == 2
+    )
+    if ok:
+        reporter.pass_("NC-2. 리뷰 필터 제외로 부족해진 1페이지 결과를 2페이지 유효 row로 보충함")
+    else:
+        reporter.fail(f"NC-2. 리뷰 필터 다음 페이지 보충 실패: rows={[r.get('업체명') for r in result['rows']]}, page_count={result.get('page_count')}")
+
+
+def check_review_filter_combines_with_region_filter(reporter: ValidationReporter) -> None:
+    """지역 밖(쌍촌동/마륵동) row는 지역 필터가 먼저 걸러내고, 남은 row에만
+    리뷰 필터가 적용돼야 한다(§4 처리 순서)."""
+    query = CHIPYEONGDONG_JOB["query"]
+    ref_key_of = lambda pid: f"PlaceListBusinessesItem:{pid}:{pid}"
+    items = [
+        ("1", "지역밖", "전남광주 서구 쌍촌동 운천로 1", 999, 999),   # 지역 밖(리뷰는 충분) - REGION에서 제외
+        ("2", "적합", "전남광주 서구 치평동 치평로 1", 60, 60),        # 지역 안 + 리뷰 범위 안 - 유효
+        ("3", "지역안리뷰미달", "전남광주 서구 치평동 치평로 2", 1, 1),  # 지역 안이지만 리뷰 미달 - REVIEW에서 제외
+    ]
+    state = {ref_key_of(pid): _item_entity_with_reviews(pid, name, v, b, road_address=addr) for pid, name, addr, v, b in items}
+    state["ROOT_QUERY"] = {
+        _op_key({"query": query, "start": 0, "display": 70}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, *_ in items]}
+        },
+    }
+    page = FakeApolloPage([_apollo_state_result(state)])
+    review_job = dict(CHIPYEONGDONG_JOB, review_min=50, review_max=200)
+    result = collect_apollo_first_list_query(page, review_job, 10, collected_at="2026-07-29")
+
+    rejected_status_by_name = {r["업체명"]: r["판정_상태"] for r in result["rejected_rows"]}
+    ok = (
+        len(result["rows"]) == 1
+        and result["rows"][0]["업체명"] == "적합"
+        and rejected_status_by_name.get("지역밖") == "OUT_OF_SCOPE"
+        and rejected_status_by_name.get("지역안리뷰미달") == "REVIEW_BELOW_MIN"
+    )
+    if ok:
+        reporter.pass_("NC-3. 지역 필터와 리뷰 필터가 함께 정확히 적용됨(지역 밖은 OUT_OF_SCOPE, 지역 안 리뷰 미달은 REVIEW_BELOW_MIN)")
+    else:
+        reporter.fail(f"NC-3. 지역+리뷰 필터 조합 실패: rows={result['rows']}, rejected={rejected_status_by_name}")
+
+
+def check_review_filter_disabled_when_both_bounds_none(reporter: ValidationReporter) -> None:
+    """review_min/review_max가 둘 다 None이면(필터 비활성) 기존 동작과
+    동일하게 review_filter_stats는 None이고 모든 row가 그대로 통과해야 한다."""
+    state = _apollo_state_with_reviews(CHIPYEONGDONG_JOB["query"], _REVIEW_PAGE1_ITEMS)
+    page = FakeApolloPage([_apollo_state_result(state)])
+    result = collect_apollo_first_list_query(page, CHIPYEONGDONG_JOB, 10, collected_at="2026-07-29")
+
+    ok = len(result["rows"]) == 6 and result["review_filter_stats"] is None
+    if ok:
+        reporter.pass_("NC-4. review_min/max 미설정 시 리뷰 필터 비활성(전 row 통과, stats=None)")
+    else:
+        reporter.fail(f"NC-4. 필터 비활성 케이스 실패: rows={len(result['rows'])}, stats={result['review_filter_stats']}")
+
+
+def check_pause_event_blocks_next_page_until_resumed(reporter: ValidationReporter) -> None:
+    """일시정지 중에는 다음 페이지로 넘어가지 않고 대기하다가, 재개되면
+    이어서 정상적으로 다음 페이지 결과를 반영해야 한다(§5 요청서)."""
+    state = _apollo_state_with_addresses(CHIPYEONGDONG_JOB["query"], _PAGE1_MIXED_ITEMS)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+    page2_items = [
+        ("11", "치평동카페11", "전남광주 서구 치평동 치평로 200"),
+        ("12", "치평동카페12", "전남광주 서구 치평동 치평로 210"),
+        ("13", "치평동카페13", "전남광주 서구 치평동 치평로 220"),
+        ("14", "치평동카페14", "전남광주 서구 치평동 치평로 230"),
+    ]
+    original_get_by_role = page._frame.get_by_role
+
+    def _patched_get_by_role(role, name=None, exact=None):
+        locator = original_get_by_role(role, name=name, exact=exact)
+        if name == "2":
+            original_locator_click = locator.click
+
+            def _click_and_schedule():
+                original_locator_click()
+                body = json.dumps({
+                    "result": {"place": {"list": [
+                        {"id": pid, "name": name_, "roadAddress": addr}
+                        for pid, name_, addr in page2_items
+                    ]}}
+                }).encode("utf-8")
+                page.schedule_after_click(FakeResponse(CANDIDATE_URL, 200, "xhr", body=body))
+
+            locator.click = _click_and_schedule
+        return locator
+
+    page._frame.get_by_role = _patched_get_by_role
+
+    pause_event = threading.Event()
+    stop_event = threading.Event()
+    pause_event.set()
+
+    def _resume_after_delay():
+        time.sleep(0.3)
+        pause_event.clear()
+
+    threading.Thread(target=_resume_after_delay, daemon=True).start()
+    started = time.monotonic()
+    result = collect_apollo_first_list_query(
+        page, CHIPYEONGDONG_JOB, 10, collected_at="2026-07-29",
+        pause_event=pause_event, stop_event=stop_event,
+    )
+    elapsed = time.monotonic() - started
+
+    ok = elapsed >= 0.2 and len(result["rows"]) == 10 and result["page_count"] == 2
+    if ok:
+        reporter.pass_("NC-5. 일시정지 중 다음 페이지로 넘어가지 않고 대기하다가 재개 후 정상 이어짐")
+    else:
+        reporter.fail(f"NC-5. 일시정지 대기 실패: elapsed={elapsed:.2f}s, rows={len(result['rows'])}, page_count={result.get('page_count')}")
+
+
+def check_stop_event_aborts_pagination_before_next_page(reporter: ValidationReporter) -> None:
+    """중지 중이면(일시정지 아님) 다음 페이지로 아예 넘어가지 않고 1페이지
+    결과만 보존한 채 정상 종료해야 한다(§5 요청서 - stop이 pause보다 우선)."""
+    state = _apollo_state_with_addresses(CHIPYEONGDONG_JOB["query"], _PAGE1_MIXED_ITEMS)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+    pause_event = threading.Event()
+    stop_event = threading.Event()
+    stop_event.set()
+
+    result = collect_apollo_first_list_query(
+        page, CHIPYEONGDONG_JOB, 10, collected_at="2026-07-29",
+        pause_event=pause_event, stop_event=stop_event,
+    )
+
+    ok = (
+        len(result["rows"]) == 6
+        and result["pagination_stop_reason"] == "user_stopped"
+        and page._frame.get_by_role_calls == []
+    )
+    if ok:
+        reporter.pass_("NC-6. 중지 시 다음 페이지 이동을 시도하지 않고 확보된 1페이지 결과로 정상 종료")
+    else:
+        reporter.fail(f"NC-6. 중지 케이스 실패: rows={len(result['rows'])}, stop={result.get('pagination_stop_reason')}, calls={page._frame.get_by_role_calls}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -902,6 +1153,12 @@ def main() -> bool:
         check_new_opening_only_combines_with_region_filter,
         check_new_opening_only_no_candidate_is_navigation_error_not_fallback,
         check_new_opening_only_still_detects_captcha,
+        check_review_filter_excludes_rows_and_does_not_consume_limit,
+        check_review_filter_backfills_valid_rows_from_next_page,
+        check_review_filter_combines_with_region_filter,
+        check_review_filter_disabled_when_both_bounds_none,
+        check_pause_event_blocks_next_page_until_resumed,
+        check_stop_event_aborts_pagination_before_next_page,
     ]
     for check in checks:
         check(reporter)

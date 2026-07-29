@@ -279,6 +279,56 @@ def check_user_stop_mid_batch(reporter: ValidationReporter) -> None:
         reporter.fail(f"5. 사용자 중지 검증 실패: {result}")
 
 
+def check_pause_event_blocks_new_requests_until_resumed(reporter: ValidationReporter) -> None:
+    """NETWORK-CONTROLS-1 회귀 가드: 5개 place_id가 전부 asyncio.create_task로
+    거의 동시에 스케줄되므로, _run_one 진입 시점(semaphore 획득 전)의 pause
+    체크 단 한 번만으로는 실효성이 없다 - 동시성 상한(2)에 걸려 아직 순번이
+    안 온 나머지 place_id는 이미 그 첫 체크를 통과한 뒤 semaphore 대기열에
+    들어가 있으므로, semaphore를 실제로 획득하는 시점에 다시 확인해야만
+    막힌다(2026-07-30 실제 UI 검증에서 이 재확인이 없어 일시정지가 전혀
+    동작하지 않음을 실측으로 확인했다). 5개 모두 동일한 인위적 지연(0.05s)을
+    줘 두 슬롯(0,1)이 먼저 점유되고 나머지(2,3,4)가 semaphore 대기 상태에
+    들어간 뒤에, 독립된 실제 스레드가 pause_event를 켜는 방식으로 재현한다."""
+    import threading
+    import time
+
+    place_ids = [str(400 + i) for i in range(5)]
+    rows = [_row(pid) for pid in place_ids]
+    responses = {pid: FakeAsyncResponse(200, _success_html_for(pid)) for pid in place_ids}
+    pause_event = threading.Event()
+    stop_event = threading.Event()
+
+    def _pause_then_resume():
+        time.sleep(0.02)  # 2,3,4가 semaphore 대기열에 들어갈 시간을 준다
+        pause_event.set()
+        time.sleep(0.3)
+        pause_event.clear()
+
+    ctx = FakeAsyncRequestContext(responses, delay_by_place_id={pid: 0.05 for pid in place_ids})
+    threading.Thread(target=_pause_then_resume, daemon=True).start()
+    # 재확인 게이트가 없다면(회귀) 대기열의 2,3,4는 pause 여부와 무관하게
+    # 0.05s 안팎으로 곧바로 끝나 전체 소요시간이 0.3s보다 훨씬 짧다. 게이트가
+    # 있으면 재개(0.32s 시점)까지 실제로 막혀 총 소요시간이 0.3s 이상이어야 한다.
+    started = time.monotonic()
+    result = _run(
+        _enrich_home_batch_async(
+            rows, request_context_factory=_factory_for(ctx),
+            pause_event=pause_event, stop_event=stop_event,
+        )
+    )
+    elapsed = time.monotonic() - started
+    ok = (
+        result["home_success_count"] == 5
+        and result["not_attempted_count"] == 0
+        and set(ctx.get_calls) == set(place_ids)
+        and elapsed >= 0.28
+    )
+    if ok:
+        reporter.pass_(f"7. 일시정지 중 새 요청이 막혔다가({elapsed:.2f}s 소요) 재개 후 전부 정상 완료(semaphore 재확인 게이트 회귀 가드)")
+    else:
+        reporter.fail(f"7. 일시정지 재확인 게이트 검증 실패: elapsed={elapsed:.2f}s, result={result}, get_calls={ctx.get_calls}")
+
+
 def check_duplicate_place_id_fetched_once(reporter: ValidationReporter) -> None:
     rows = [_row("111"), _row("111"), _row("111")]
     ctx = FakeAsyncRequestContext({"111": FakeAsyncResponse(200, _success_html_for("111"))})
@@ -779,6 +829,7 @@ def main() -> bool:
         check_concurrency_capped_at_two,
         check_blocked_response_stops_new_scheduling,
         check_user_stop_mid_batch,
+        check_pause_event_blocks_new_requests_until_resumed,
         check_duplicate_place_id_fetched_once,
         check_merge_home_result_into_row_unit_cases,
         check_core_fields_never_overwritten_by_home_result,

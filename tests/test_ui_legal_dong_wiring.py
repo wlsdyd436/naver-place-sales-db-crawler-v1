@@ -18,6 +18,8 @@ def _make_app():
     app.pause_event = threading.Event()
     app.log = lambda message: None
     app.set_status = lambda message: None
+    app.after = lambda delay, func, *args: func(*args)
+    app.duplicate_removed_var = _SimpleVar("중복 제거: 0개")
     app._security_block_decision = None
     return app
 
@@ -129,7 +131,8 @@ class _SimpleVar:
 
 
 def _make_region_app(*, sido="서울특별시", sigungu="강동구", legal_dongs=None,
-                      per_query_limit=10, keyword="카페", new_open_only=False):
+                      per_query_limit=10, keyword="카페", new_open_only=False,
+                      review_min="", review_max=""):
     """`_build_collection_queries`/`_recalculate_target_count`(실제 바운드
     메서드, override 없음)를 그대로 호출하기 위한 헤드리스 fake app. 시군구가
     있는 지역 기준(세종 등 시군구 없는 지역은 개별 테스트에서 sigungu=""로
@@ -141,6 +144,8 @@ def _make_region_app(*, sido="서울특별시", sigungu="강동구", legal_dongs
     app.legal_dong_sigungu_var = _SimpleVar(sigungu if sigungu else ui._LEGAL_DONG_NO_SIGUNGU)
     app.get_selected_legal_dongs = lambda: list(legal_dongs or [])
     app.new_open_only_var = _SimpleVar(new_open_only)
+    app.review_min_var = _SimpleVar(review_min)
+    app.review_max_var = _SimpleVar(review_max)
     app.target_count_var = _SimpleVar(ui._DEFAULT_TARGET_COUNT)
     app.legal_dong_query_count_var = _SimpleVar("")
     app.target_count_entry = object()  # hasattr 체크만 통과하면 됨(위젯 메서드 불필요)
@@ -236,6 +241,53 @@ def test_new_open_checkbox_no_longer_force_disabled_in_source():
 
 
 # --------------------------------------------------------------------------
+# NETWORK-CONTROLS-1: UI의 review_min_var/review_max_var가 job까지 명시적으로
+# 전달됨(§4 요청서 - Query Job provenance-threading 패턴, new_opening_only와
+# 동일한 방식)
+# --------------------------------------------------------------------------
+def test_review_bounds_none_by_default_in_job():
+    app = _make_region_app(legal_dongs=[_item("1174010900", "천호동")])
+    queue = app._build_collection_queries()
+    assert all(job["review_min"] is None and job["review_max"] is None for job in queue)
+
+
+def test_review_bounds_threaded_into_every_job():
+    app = _make_region_app(
+        legal_dongs=[_item("1174010900", "천호동"), _item("1174010200", "성내동")],
+        review_min="10", review_max="200",
+    )
+    queue = app._build_collection_queries()
+    assert len(queue) == 2
+    assert all(job["review_min"] == 10 and job["review_max"] == 200 for job in queue)
+
+
+def test_review_bounds_only_min_set():
+    app = _make_region_app(legal_dongs=[_item("1174010900", "천호동")], review_min="5", review_max="")
+    queue = app._build_collection_queries()
+    assert queue[0]["review_min"] == 5
+    assert queue[0]["review_max"] is None
+
+
+def test_start_network_crawl_rejects_non_numeric_review_bound():
+    """§4 요청서 - 리뷰수는 숫자만 입력해야 하며, 비숫자 입력은 legacy와
+    동일한 안내 문구로 차단하고 수집을 시작하지 않아야 한다."""
+    app = _make_region_app(legal_dongs=[_item("1174010900", "천호동")], review_min="abc")
+    logs: list = []
+    errors: list = []
+    app.log = lambda message: logs.append(message)
+    app.show_error = lambda title, message: errors.append((title, message))
+    app.output_path_var = _SimpleVar("output/test.xlsx")
+    app._legal_dong_loader = type("L", (), {"list_sigungus": lambda self, sido: []})()
+    app.legal_dong_sigungu_var = _SimpleVar("강동구")
+    app._validate_single_keyword = lambda raw: None
+    app._build_collection_queries = lambda: (_ for _ in ()).throw(
+        AssertionError("리뷰수 검증에 실패하면 _build_collection_queries가 호출되면 안 됨")
+    )
+    ui.SalesDbCrawlerApp._start_network_crawl(app)
+    assert any("리뷰수는 숫자만 입력해야 합니다" in message for _, message in errors)
+
+
+# --------------------------------------------------------------------------
 # §3/§9-B 시군구·법정동 가나다순 정렬(순수 함수 + 실제 wiring)
 # --------------------------------------------------------------------------
 def test_sort_korean_names_gu_order():
@@ -317,6 +369,8 @@ def _make_sort_wiring_app(*, sigungus, dongs):
     app.limit_var = _SimpleVar("30")
     app.keyword_input_var = _SimpleVar("카페")
     app.new_open_only_var = _SimpleVar(False)
+    app.review_min_var = _SimpleVar("")
+    app.review_max_var = _SimpleVar("")
     app.target_count_entry = object()
     return app
 
@@ -401,7 +455,7 @@ def test_legal_dong_query_plan_reaches_orchestrator_unchanged(tmp_path):
     app._run_network_pipeline(
         jobs, 30, 30, str(tmp_path / "out.xlsx"),
         collection_mode="basic",
-        collector_factory=lambda *, collected_at: _FakeCollector(collected_at),
+        collector_factory=lambda *, collected_at, pause_event=None, stop_event=None: _FakeCollector(collected_at),
         orchestrator=fake_orchestrator,
         excel_exporter=lambda rows, mobile, pc, path: path,
         home_enrichment_fn=lambda *a, **k: (_ for _ in ()).throw(
@@ -436,7 +490,7 @@ def test_legal_dong_query_plan_reaches_home_sns_mode(tmp_path):
     app._run_network_pipeline(
         jobs, 30, 30, str(tmp_path / "out.xlsx"),
         collection_mode="home_sns",
-        collector_factory=lambda *, collected_at: _FakeCollector(collected_at),
+        collector_factory=lambda *, collected_at, pause_event=None, stop_event=None: _FakeCollector(collected_at),
         orchestrator=fake_orchestrator,
         excel_exporter=lambda rows, mobile, pc, path: path,
         home_enrichment_fn=fake_home_enrichment,
@@ -458,7 +512,7 @@ def test_basic_mode_never_calls_home_enrichment(tmp_path):
     app._run_network_pipeline(
         jobs, 30, 30, str(tmp_path / "out.xlsx"),
         collection_mode="basic",
-        collector_factory=lambda *, collected_at: _FakeCollector(collected_at),
+        collector_factory=lambda *, collected_at, pause_event=None, stop_event=None: _FakeCollector(collected_at),
         orchestrator=fake_orchestrator,
         excel_exporter=lambda rows, mobile, pc, path: path,
         home_enrichment_fn=_boom,
