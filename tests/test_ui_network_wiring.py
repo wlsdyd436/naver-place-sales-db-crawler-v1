@@ -570,9 +570,9 @@ def check_default_values_for_network_engine(reporter: ValidationReporter) -> Non
 
 
 def check_target_count_input_enabled_no_stale_guidance(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2C-2: target_count_var가 이제 _start_network_crawl에서
-    실제로 읽히므로, 입력 위젯은 더 이상 disabled로 생성되지 않고 "새 수집
-    엔진 연결 후 적용됩니다." 같은 낡은 안내 문구도 남아있지 않아야 한다.
+    """LEGALDONG-UI-2: 전체 목표 저장 개수는 항상 자동 계산이며 사용자가
+    직접 수정할 수 없다 - 입력 위젯은 항상 disabled로 생성되고, "새 수집
+    엔진 연결 후 적용됩니다." 같은 낡은 안내 문구는 남아있지 않아야 한다.
     실제 Tk 위젯을 만들지 않고(헤드리스 테스트) 위젯 생성 소스 코드로
     확인한다(check_legacy_path_untouched와 동일한 검증 방식).
     """
@@ -580,14 +580,14 @@ def check_target_count_input_enabled_no_stale_guidance(reporter: ValidationRepor
 
     source = inspect.getsource(ui.SalesDbCrawlerApp._build_global_target_count_section)
     ok = (
-        'state="disabled"' not in source
+        'state="disabled"' in source
         and "target_count_entry" in source
         and "새 수집 엔진 연결 후 적용됩니다." not in source
     )
     if ok:
-        reporter.pass_("target_count 활성화: 입력 위젯이 disabled 없이 생성되고 낡은 안내 문구가 제거됨")
+        reporter.pass_("target_count 항상 자동 계산: 입력 위젯이 disabled로 생성되고 낡은 안내 문구는 없음")
     else:
-        reporter.fail(f"target_count 활성화 결과가 예상과 다름: source에서 disabled/낡은 안내 문구 제거 확인 실패\n{source}")
+        reporter.fail(f"target_count 자동 계산 결과가 예상과 다름: source에서 disabled 생성/낡은 안내 문구 제거 확인 실패\n{source}")
 
 
 def check_run_network_pipeline_passes_target_count_through(reporter: ValidationReporter) -> None:

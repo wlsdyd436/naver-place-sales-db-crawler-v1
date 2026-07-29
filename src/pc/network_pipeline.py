@@ -82,12 +82,14 @@ def run_collection_plan(
             "status_429_seen": False,
             "navigation_error": False,
             "navigation_error_message": "",
+            "rejected_rows": [],
         }
 
     total_jobs = len(jobs)
     effective_target = target_count if target_count else 0
 
     rows: list = []
+    rejected_rows: list = []
     executed_query_count = 0
     before_trim_count = 0
     security_blocked = False
@@ -103,6 +105,7 @@ def run_collection_plan(
 
         result = collect_query(job, per_query_limit) or {}
         executed_query_count += 1
+        rejected_rows.extend(result.get("rejected_rows") or [])
 
         if result.get("navigation_error"):
             navigation_error = True
@@ -148,6 +151,7 @@ def run_collection_plan(
         "status_429_seen": status_429_seen,
         "navigation_error": navigation_error,
         "navigation_error_message": navigation_error_message,
+        "rejected_rows": rejected_rows,
     }
 
 

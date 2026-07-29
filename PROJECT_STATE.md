@@ -8236,3 +8236,204 @@ SNAPSHOT_PATH를 임시 경로로 격리하므로 실제 파일과 무관하게 
 `README.md`(§10 신규 절 추가), `PROJECT_STATE.md`(이번 절). 신규 파일:
 `data/legal_dong_snapshot.json`(최초 생성, git 추적 여부는 사용자가 직접
 `git add` 시점에 결정). UI 코드(`src/ui.py`)와 수집 엔진은 무수정.
+
+---
+
+# 2026-07-29 [LEGALDONG-3] 공식 법정동 Snapshot UI 연결(오프라인 검증)
+
+## 배경
+[LEGALDONG-2]에서 생성한 `data/legal_dong_snapshot.json`(5,067건, 고유 sido
+16개)을 실제로 UI에서 선택할 수 있게 연결했다. 행안부 API 호출/Snapshot
+갱신/`--apply`/Naver Live 수집/지역 exact 필터/전남광주통합특별시 Naver
+별칭 처리는 이번 범위에 포함하지 않는다.
+
+## 구현
+- 신규 `src/pc/legal_dong_loader.py`: `LegalDongSnapshotLoader` 클래스가
+  Snapshot을 1회 로드해 `list_sidos()`/`list_sigungus(sido)`/
+  `list_legal_dongs(sido, sigungu)`/`find_by_legal_code(legal_code)`를
+  제공한다. schema_version/legal_code 10자리/중복/필수 필드를 검증하고
+  `is_active=true`만 노출한다. Snapshot이 없거나 손상되면
+  `LegalDongSnapshotError`를 던지며 `regions_kr_sample.json`으로 조용히
+  대체하지 않는다. `default_snapshot_path()`가 개발 실행/PyInstaller
+  배포 실행(`sys.frozen`/`sys._MEIPASS`) 모두에서 경로를 찾는다 -
+  `NaverPlaceSalesDBCollector.spec`의 `datas`에
+  `data/legal_dong_snapshot.json`을 추가했다.
+- `src/ui.py`에 순수 함수 `build_legal_dong_query_plan(sido, sigungu,
+  legal_dongs, keyword, per_query_limit)`/`calculate_legal_dong_target_count
+  (per_query_limit, query_count)`를 추가하고, 새 섹션 "8. 공식 법정동 선택
+  (전국, 선택 사항)"(시도/시군구 콤보박스 + 법정동 다중 체크박스 + 전체
+  선택·해제 + 선택 개수/검색 조합 수/자동 target_count 표시)을 만들었다.
+  `_build_collection_queries()`가 `is_legal_dong_mode_active()`(공식
+  패널에서 시도를 골랐는지)에 따라 기존 시/도+구 흐름과 새 법정동 흐름을
+  분기한다 - 기본모드/홈페이지·SNS 모드 둘 다 이 메서드 하나만 거치므로
+  자동으로 동일한 검색계획을 쓴다. 시도를 "(선택 안 함)"으로 두면 기존
+  동작이 1바이트도 바뀌지 않는다(회귀 없음, 기존 25개 UI/수집 테스트 전부
+  그대로 통과).
+- 전체 목표 저장 개수(`target_count_entry`)는 공식 패널 사용 중에만
+  `state="disabled"`로 자동 계산값을 표시하고, 패널을 쓰지 않으면 기존처럼
+  직접 입력 가능한 상태로 남는다.
+- Snapshot 로드 실패 시 `__init__`에서 오류를 저장해 §8 패널에 오류 문구를
+  보여주고 "수집 시작" 버튼을 비활성화한다(현재 Snapshot은 정상이라
+  실제로는 발생하지 않지만, 계약으로 고정).
+
+## 회귀 조사 및 수정
+`is_legal_dong_mode_active()`가 `self._legal_dong_loader`를 참조하는데,
+기존 `tests/test_ui_network_start.py`의 헤드리스 fake app(`SalesDbCrawlerApp
+.__new__(...)`, 실제 Tk `__init__` 미실행)이 이 속성을 갖지 않아 Tkinter
+`Misc.__getattr__`가 무한 재귀에 빠지는 회귀를 발견했다 - `getattr(self,
+"_legal_dong_loader", None)` 방어 코드를 추가하고, 그 fake app 픽스처에
+`_legal_dong_loader = None`/`legal_dong_sido_var`를 명시적으로 채워
+해결했다(다른 fake app 픽스처들은 이 메서드 경로를 타지 않아 영향 없음).
+
+## 테스트 결과
+신규 `tests/test_pc_legal_dong_loader.py`(15개) + `tests/test_ui_legal_dong
+_wiring.py`(17개) = 32개 신규 pytest 전부 PASS. 기존 `tests/test_pc_region
+_data.py`(3)/`tests/test_ui_network_export.py`(10)/`tests/test_ui_network
+_start.py`(15, 회귀 수정 후)/`tests/test_ui_network_wiring.py`(19)/
+`tests/test_ui_pc_full_wiring.py`(4)/`tests/test_ui_apollo_list_wiring.py`
+(9)/`tests/test_ui_dom_membership_wiring.py`(4)/`tests/test_ui_policy_text
+.py`(25)/`tests/test_ui_query_builder.py`(9)/`tests/test_network_product
+_integration_no_live.py`(11)/`tests/test_pc_ssr_detail_enrichment.py`(36)
+전부 기존 PASS 수 그대로 유지. 전체 `pytest -q`는 78 → 110 passed(신규
+32개만 증가, 기존 항목 무변경). 실제 API·Naver Live 요청 0회.
+
+## 남은 위험
+1. 전남광주통합특별시/세종특별자치시 등 공식 명칭의 Naver 검색어 호환성이
+   아직 검증되지 않았다 - 다음 단계(Live 호환성 검증) 전까지 UI에 공식
+   명칭을 그대로 노출하되 별칭 변환은 하지 않는다.
+2. 지역 exact 필터는 여전히 미구현이다([LEGALDONG-1]의 "천호동=천호1동
+   관용 처리" 충돌도 미확정 - 그 구현 전에 결정 필요).
+3. 세종특별자치시 등 `sigungu=""` 지역의 검색 결과가 실제 Naver 응답에서
+   기대한 범위로 나오는지는 Live 검증 전까지 확인되지 않는다.
+
+## 남은 작업
+1. Naver 검색어/주소 명칭과 공식 법정동 명칭(특히 전남광주통합특별시)의
+   호환성 Live 검증
+2. 지역 exact 필터 구현(§남은 위험 2 확정 후)
+3. PyInstaller 배포본에서 실제로 Snapshot이 번들되는지 빌드 검증(이번
+   라운드는 `.spec`에 `datas` 항목만 추가했고 실제 빌드는 실행하지 않음)
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 수정 파일: `src/ui.py`, `tests/test_ui_network_start.py`
+(fake app 픽스처 보강), `NaverPlaceSalesDBCollector.spec`, `README.md`(§11
+신규 절), `PROJECT_STATE.md`(이번 절). 신규 파일: `src/pc/legal_dong_loader.py`,
+`tests/test_pc_legal_dong_loader.py`, `tests/test_ui_legal_dong_wiring.py`.
+수집 엔진(`src/pc/network_browser_collector.py` 등)과 `scripts/update_legal_dong_snapshot.py`는
+무수정.
+
+---
+
+# 2026-07-29 [LEGALDONG-4] 지역 UI 단일화 + target_count 항상 자동 계산 + spec Git 추적
+
+## 배경
+[LEGALDONG-3]에서 공식 법정동 Snapshot 선택 UI를 "8. 공식 법정동 선택
+(전국, 선택 사항)"이라는 **별도 패널**로 추가했으나, 기존 REGION_DATA
+하드코딩 기반 "1. 지역 선택"(시/도+구 다중 체크박스)이 여전히 공존해 두
+지역 선택 경로가 동시에 존재하는 문제가 있었다. 이번 라운드는 이를
+하나로 통합하고, target_count를 항상 자동 계산으로 고정하고, PyInstaller
+`.spec` 파일을 Git으로 추적 가능하게 만들었다.
+
+## 통합 내용
+- **REGION_DATA(하드코딩된 8개 시/도 목록) 완전 제거**. `city_dropdown`/
+  `district_checkbox_frame`/`get_selected_districts`/`_reload_district_data`
+  /`_on_district_toggle`와 순수 함수 `build_collection_queries`(구 기반
+  fallback/legal_dong/landmark 분류)를 전부 삭제했다.
+- **"1. 지역 선택"이 공식 Snapshot 하나만의 유일한 production 출처**가
+  됐다 - 이전 "8. 공식 법정동 선택" 패널의 시도/시군구 콤보박스 + 법정동
+  다중선택을 이 자리로 옮기고, 법정동 다중선택은 인라인 스크롤 영역 대신
+  "법정동 선택" 버튼이 여는 팝업(Toplevel, 기존 역/상권 팝업과 동일한
+  셸 재사용)으로 바꿨다. `is_legal_dong_mode_active()`(두 경로 중 어느
+  쪽을 쓸지 분기하던 메서드)도 더 이상 필요 없어 삭제했다.
+- **"2. 선택 사항"(구 "2. 세부구역 설정")은 역/상권(landmarks)·세부업종
+  (subcategory_keywords) 보조 검색 힌트로 재정의**했다 - `regions_kr_
+  sample.json`을 현재 선택된 공식 시도/시군구 기준으로 조회하며, 법정동
+  (legal_dongs)은 이 샘플 데이터에서 더 이상 읽지 않는다(법정동은 오직
+  공식 Snapshot에서만). 데이터 없는 지역(대부분)은 오류 대신 "준비 중"
+  안내만 보여준다.
+- 신규 순수 함수 `build_auxiliary_query_plan(sido, sigungu, landmarks,
+  subcategory_keywords, keyword, per_query_limit)`을 추가해, 보조 선택이
+  활성화되면 공식 법정동 Query Plan에 추가 검색 조합을 덧붙이고
+  `_build_collection_queries()`가 최종적으로 중복 제거한다(기존
+  `build_legal_dong_query_plan`은 그대로 보존).
+- **전체 목표 저장 개수(target_count)는 항상 `per_query_limit x
+  len(final_query_queue)`로 자동 계산**되며, 입력창(`target_count_entry`)
+  은 생성 시점과 `_set_left_panel_state`(좌측 패널 상태 복구) 양쪽 모두에서
+  항상 `disabled`로 고정했다(사용자 입력 검증 로직 자체를 제거 - 계산값이
+  0 이하면 "계산할 수 없습니다" 오류로 차단). `_start_network_crawl`은
+  화면 표시값이 아니라 방금 만든 query_queue 길이로 다시 계산해 검증한다.
+- `.gitignore`의 `*.spec`에 `!NaverPlaceSalesDBCollector.spec` 예외를
+  추가해 이 배포 설정 파일만 Git으로 추적 가능하게 했다(다른 임시 `.spec`
+  파일은 계속 무시). `.spec`의 `datas`에 이미 있던
+  `data/legal_dong_snapshot.json` 번들 설정은 유지했다.
+
+## 회귀 조사 및 수정
+- `_build_ui()`에 삭제된 `_build_legal_dong_section()`을 호출하는 코드가
+  남아있어 실제 앱 인스턴스화 시 `AttributeError`가 발생하는 것을 실제
+  GUI Smoke 테스트(`app = ui.SalesDbCrawlerApp()` 직접 실행)로 발견하고
+  제거했다 - 오프라인 pytest만으로는 잡히지 않았던 문제였다.
+- `_set_left_panel_state`가 `target_count_entry`를 다른 입력과 동일하게
+  `normal`로 복구시키면 "항상 disabled" 계약이 깨지므로, 기존 `new_open_
+  checkbox` 특례와 동일한 방식으로 강제 `disabled` 유지 코드를 추가했다.
+- `tests/test_ui_query_builder.py`(삭제된 `build_collection_queries` 전용
+  테스트, 다른 목적 없음)를 삭제했다.
+- `tests/test_ui_network_start.py`/`tests/test_network_product_integration_
+  no_live.py`의 헤드리스 fake app(`SalesDbCrawlerApp.__new__(...)`, 실제
+  Tk `__init__` 미실행)이 신규 필수 속성(`_legal_dong_loader`/
+  `legal_dong_sido_var`/`target_count_entry` 등)을 갖지 않아 Tkinter
+  `Misc.__getattr__`가 무한 재귀에 빠지는 회귀를 발견하고, 각 fixture에
+  해당 속성을 채워 해결했다(기존 `new_open_checkbox` 특례와 동일한 원인).
+- `target_count_var`가 사용자 입력값으로 검증되던 기존 테스트(무효/300
+  초과값 개별 검증, per_query_limit과의 분리 검증 계약)들을 "target_count는
+  항상 자동 계산되고 사용자 입력은 무시된다"는 새 계약에 맞게 재작성했다
+  (`tests/test_ui_network_start.py`/`tests/test_ui_network_wiring.py`).
+
+## 실제 GUI Smoke 테스트 결과
+`app = ui.SalesDbCrawlerApp()`을 실제로 1회 인스턴스화해(수집 시작 버튼
+클릭·Naver 접근·자동 UI 조작 훅·API 호출 전부 없음) 확인:
+- 앱 실행 직후 자동 수집되지 않고 정상 생성됨, 창 크기 `1240x820`(잘림 없음).
+- 지역 선택 UI가 한 벌만 존재(`city_dropdown`/`district_checkbox_frame`
+  등 옛 위젯 완전 제거 확인).
+- 시도 콤보박스 값 16개(고유 sido), 기본값 "서울특별시" 자동 선택.
+- 시군구 콤보박스가 해당 시도의 실제 시군구 목록(예: 서울 25개)으로
+  채워짐.
+- "법정동 선택" 팝업이 정상적으로 열리고 닫히며, 전체 선택/해제 시 선택
+  개수가 정확히 반영됨(강동구 기준 87개 법정동 전체 선택/해제 확인).
+- "역·상권/세부업종 설정" 팝업도 정상 개폐.
+- `target_count_entry` 상태가 `disabled`로 확인됨(직접 수정 불가).
+- `app.destroy()`로 정상 종료.
+
+## 테스트 결과
+신규/수정 테스트 포함 전체 `pytest -q`: **110 → 114 passed**(spec 추적/
+frozen 경로 신규 테스트 4건 추가, 기존 항목은 계약 변경분만 재작성해
+수 유지). 관련 커스텀스크립트 테스트 10개 파일(`test_pc_region_data`/
+`test_ui_network_export`/`test_ui_network_start`/`test_ui_network_wiring`/
+`test_ui_apollo_list_wiring`/`test_ui_dom_membership_wiring`/
+`test_ui_pc_full_wiring`/`test_ui_policy_text`/`test_network_product_
+integration_no_live`/`test_pc_ssr_detail_enrichment`) 전부 0 FAIL로 재확인.
+실제 API·Naver Live 요청 0회.
+
+## 남은 위험
+1. 전남광주통합특별시/세종특별자치시 등 공식 명칭의 Naver 검색어 호환성은
+   여전히 미검증이다.
+2. 지역 exact 필터는 여전히 미구현이다(천호동/천호1동 관용 처리 충돌 미확정).
+3. PyInstaller 실제 빌드(EXE 생성 후 Snapshot 번들 확인)는 이번 라운드도
+   실행하지 않았다 - `.spec` 파일 내용과 git 추적 가능 여부만 확인함.
+
+## 남은 작업
+1. Naver 검색어/주소 명칭과 공식 법정동 명칭의 호환성 Live 검증
+2. 지역 exact 필터 구현
+3. PyInstaller 실제 빌드 검증(build.bat 실행 후 배포 EXE로 Snapshot 로드 확인)
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 수정 파일: `src/ui.py`(지역 UI 단일화, REGION_DATA 제거,
+target_count 자동계산), `.gitignore`(`.spec` 예외 추가),
+`tests/test_ui_network_start.py`/`tests/test_ui_network_wiring.py`/
+`tests/test_ui_legal_dong_wiring.py`/`tests/test_network_product_integration_no_live.py`
+(신규 계약에 맞게 수정), `tests/test_pc_legal_dong_loader.py`(spec/frozen
+경로 테스트 추가), `README.md`(§1/§11 갱신), `PROJECT_STATE.md`(이번 절).
+삭제 파일: `tests/test_ui_query_builder.py`(대상 함수 삭제로 무의미해짐).
+`NaverPlaceSalesDBCollector.spec`은 이번 라운드에서 내용 변경 없이 git
+추적 대상으로만 전환됨(아직 `git add` 안 함 - 사용자가 직접 결정).
+수집 엔진과 `scripts/update_legal_dong_snapshot.py`는 무수정.

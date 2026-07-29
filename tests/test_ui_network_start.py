@@ -141,6 +141,19 @@ def _make_app(*, districts=("강동구",), query_queue=None):
     app.mode_var = FakeVar("premium")
     app.collection_mode_var = FakeVar("basic")
 
+    # LEGALDONG-UI-2: _start_network_crawl/_start_legacy_crawl이 참조하는
+    # 공식 법정동 상태 - 이 fake app은 지역 자체는 검증하지 않고 per_query_limit
+    # /target_count/thread 배선만 확인하므로, 시군구가 없는 시도를 고른 것으로
+    # 고정해 시군구 필수 검사를 자연스럽게 통과시킨다.
+    class _StubLoader:
+        def list_sigungus(self, sido):
+            return []
+
+    app._legal_dong_loader = _StubLoader()
+    app.legal_dong_sido_var = FakeVar("서울특별시")
+    app.legal_dong_sigungu_var = FakeVar(ui._LEGAL_DONG_NO_SIGUNGU)
+    app.get_selected_legal_dongs = lambda: []
+
     app.total_found_var = FakeVar("")
     app.duplicate_removed_var = FakeVar("")
     app.final_expected_var = FakeVar("")
@@ -193,23 +206,25 @@ def check_default_constants(reporter: ValidationReporter) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. target_count 활성화
+# 2. target_count 항상 자동 계산·읽기 전용(LEGALDONG-UI-2)
 # ---------------------------------------------------------------------------
 
 
-def check_target_count_entry_enabled_and_restored_normal(reporter: ValidationReporter) -> None:
+def check_target_count_entry_always_disabled(reporter: ValidationReporter) -> None:
+    """LEGALDONG-UI-2: 전체 목표 저장 개수는 항상 자동 계산이며 사용자가
+    직접 수정할 수 없다 - 생성 시점과 좌측 패널 상태 복구(_set_left_panel_state)
+    양쪽 모두에서 target_count_entry가 항상 disabled로 유지돼야 한다."""
     build_source = inspect.getsource(ui.SalesDbCrawlerApp._build_global_target_count_section)
     panel_state_source = inspect.getsource(ui.SalesDbCrawlerApp._set_left_panel_state)
     ok = (
-        'state="disabled"' not in build_source
+        'state="disabled"' in build_source
         and "target_count_entry" in build_source
-        and "새 수집 엔진 연결 후 적용됩니다." not in build_source
-        and "target_count_entry" not in panel_state_source
+        and "target_count_entry" in panel_state_source
     )
     if ok:
-        reporter.pass_("target_count 활성화: disabled/낡은 안내 문구 없음, 좌측 패널 상태 전환 시 강제 disabled 예외 없음(다른 입력과 동일하게 normal로 복구됨)")
+        reporter.pass_("target_count 항상 자동 계산: 생성 시 disabled + 좌측 패널 상태 복구 시에도 강제 disabled 유지")
     else:
-        reporter.fail(f"target_count 활성화 결과가 예상과 다름: build_source에 disabled/안내 문구 잔존 또는 panel_state_source에 target_count_entry 특례 존재\n{build_source}\n{panel_state_source}")
+        reporter.fail(f"target_count가 항상 disabled로 유지되지 않음\n{build_source}\n{panel_state_source}")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +242,9 @@ def check_normal_start_crawl_selects_network_worker(reporter: ValidationReporter
         app.start_crawl()
 
     expected_output_path = app.make_timestamped_output_path(app.output_path_var.get(), "network")
+    # LEGALDONG-UI-2: target_count는 항상 per_query_limit x len(query_queue)로
+    # 자동 계산된다(더 이상 target_count_var의 기본값 300을 그대로 쓰지 않음).
+    expected_target_count = 30 * len(expected_queue)
 
     if not instances:
         reporter.fail("Thread가 생성되지 않음")
@@ -236,14 +254,14 @@ def check_normal_start_crawl_selects_network_worker(reporter: ValidationReporter
         thread.target == app._run_network_pipeline_worker
         and thread.args[0] == expected_queue
         and thread.args[1] == 30
-        and thread.args[2] == 300
+        and thread.args[2] == expected_target_count
         and thread.args[3] == expected_output_path
         and thread.daemon is True
         and thread.start_called is True
         and app._run_queue_pipeline != thread.target
     )
     if ok:
-        reporter.pass_("정상 start_crawl: Network worker thread가 선택되고 query_queue/per_query_limit=30/target_count=300/output_path가 정확히 전달되며 legacy worker는 호출되지 않음")
+        reporter.pass_(f"정상 start_crawl: Network worker thread가 선택되고 query_queue/per_query_limit=30/target_count(자동계산)={expected_target_count}/output_path가 정확히 전달되며 legacy worker는 호출되지 않음")
     else:
         reporter.fail(f"정상 start_crawl 결과가 예상과 다름: target={thread.target}, args={thread.args}, expected_queue={expected_queue}, expected_output_path={expected_output_path}")
 
@@ -298,105 +316,54 @@ def check_per_query_limit_boundary_values_allowed(reporter: ValidationReporter) 
 
 
 # ---------------------------------------------------------------------------
-# 5. target_count 오류
+# 5. target_count 항상 자동 계산(LEGALDONG-UI-2 - 사용자 입력 검증 제거)
 # ---------------------------------------------------------------------------
 
 
-def check_invalid_target_count_blocks_execution(reporter: ValidationReporter) -> None:
-    invalid_values = ("0", "-5", "abc", "3.5", "")
-    for invalid_value in invalid_values:
-        app, logs, statuses, running_calls = _make_app()
-        app.target_count_var = FakeVar(invalid_value)
-        fake_threading, instances = _make_fake_threading()
-
-        with _Saved(["threading"]) as saved:
-            saved.set("threading", fake_threading)
-            app.start_crawl()
-
-        if instances or running_calls:
-            reporter.fail(f"target_count={invalid_value!r}: 실행이 차단되지 않음(instances={len(instances)}, running_calls={running_calls})")
-            return
-        if not any("전체 목표 저장 개수" in message for message in logs):
-            reporter.fail(f"target_count={invalid_value!r}: 전체 목표 저장 개수 관련 오류 로그가 없음(logs={logs})")
-            return
-
-    reporter.pass_(f"target_count 오류({len(invalid_values)}종: 0/-5/abc/3.5/빈 문자열) 각각 실행 차단, thread 생성 0회, 필드별 오류 로그 확인")
-
-
-def check_target_count_allows_values_above_300(reporter: ValidationReporter) -> None:
-    """LIMIT-300-A: 전체 목표 저장 개수는 검색 조합당 상한과 별개로 300
-    초과값(301/500/1000)도 그대로 허용해야 한다(target_count에는 max_value를
-    전달하지 않으므로 상한 검증 자체가 없음)."""
-    for allowed_value in ("1", "300", "301", "500", "1000"):
-        app, logs, statuses, running_calls = _make_app()
-        app.target_count_var = FakeVar(allowed_value)
-        fake_threading, instances = _make_fake_threading()
-
-        with _Saved(["threading"]) as saved:
-            saved.set("threading", fake_threading)
-            app.start_crawl()
-
-        if not instances or instances[0].args[2] != int(allowed_value):
-            reporter.fail(f"target_count={allowed_value!r}: 허용돼야 하지만 thread 미생성 또는 값 불일치(instances={instances})")
-            return
-
-    reporter.pass_("target_count(1/300/301/500/1000) 전부 허용되어 thread 정상 생성됨(300 초과도 차단되지 않음)")
-
-
-# ---------------------------------------------------------------------------
-# 5A. 검색 조합당 상한 / 전체 목표 저장 개수 분리 검증 계약
-# ---------------------------------------------------------------------------
-
-
-def check_per_query_limit_and_target_count_validated_independently(reporter: ValidationReporter) -> None:
-    """LIMIT-300-A §4 분리 계약: (1) limit=300/target=1000은 둘 다 유효,
-    (2) limit=301/target=1000은 검색 조합당 상한 오류만 발생(전체 목표는
-    검증 전에 이미 차단), (3) limit=30/target=0은 전체 목표 저장 개수
-    오류만 발생(검색 조합당 상한은 통과)."""
-
-    # (1) 유효 조합: limit=300, target=1000 → 둘 다 통과, thread 생성.
-    app, logs, statuses, running_calls = _make_app()
+def check_target_count_always_computed_from_query_count(reporter: ValidationReporter) -> None:
+    """LEGALDONG-UI-2: 전체 목표 저장 개수는 항상
+    per_query_limit x len(query_queue)로 자동 계산된다 - target_count_var에
+    사용자가 어떤 값(무효값 포함)을 넣어도 무시되고 계산된 값으로
+    덮어써진다. 300을 넘는 계산값도 자동 계산에는 상한이 없으므로 그대로
+    허용된다."""
+    nine_jobs = [
+        {"region": f"서울특별시 강동구 동{i}", "keyword": "카페", "query": f"서울특별시 강동구 동{i} 카페"}
+        for i in range(9)
+    ]
+    app, logs, statuses, running_calls = _make_app(query_queue=nine_jobs)
     app.limit_var = FakeVar("300")
-    app.target_count_var = FakeVar("1000")
+    app.target_count_var = FakeVar("abc")  # 사용자가 뭘 넣어도 무시되고 계산값으로 덮어써져야 함
     fake_threading, instances = _make_fake_threading()
     with _Saved(["threading"]) as saved:
         saved.set("threading", fake_threading)
         app.start_crawl()
-    if not instances or instances[0].args[1] != 300 or instances[0].args[2] != 1000:
-        reporter.fail(f"limit=300/target=1000: 유효해야 하지만 실패(instances={instances})")
-        return
 
-    # (2) limit=301(무효) / target=1000(유효라도 도달 전 차단) → 검색 조합당 상한 오류.
+    expected_target = 300 * 9
+    if not instances or instances[0].args[2] != expected_target:
+        reporter.fail(f"target_count 자동 계산 실패: 기대값={expected_target}, instances={instances}")
+        return
+    if app.target_count_var.get() != str(expected_target):
+        reporter.fail(f"target_count_var가 계산값으로 갱신되지 않음: {app.target_count_var.get()!r}")
+        return
+    reporter.pass_(f"target_count 자동 계산 확인: limit=300 x query_queue=9건 = {expected_target}(300 초과도 정상 허용, 사용자 입력은 무시됨)")
+
+
+def check_invalid_per_query_limit_blocks_before_target_count(reporter: ValidationReporter) -> None:
+    """per_query_limit이 무효하면 target_count 계산 이전에 이미 차단된다 -
+    전체 목표 저장 개수 관련 오류 로그는 섞여 나오지 않아야 한다."""
     app, logs, statuses, running_calls = _make_app()
     app.limit_var = FakeVar("301")
-    app.target_count_var = FakeVar("1000")
     fake_threading, instances = _make_fake_threading()
     with _Saved(["threading"]) as saved:
         saved.set("threading", fake_threading)
         app.start_crawl()
     if instances or not any("검색 조합당 수집 상한" in message for message in logs):
-        reporter.fail(f"limit=301/target=1000: 검색 조합당 상한 오류가 나와야 하는데 결과가 다름(instances={len(instances)}, logs={logs})")
+        reporter.fail(f"limit=301: 검색 조합당 상한 오류가 나와야 하는데 결과가 다름(instances={len(instances)}, logs={logs})")
         return
     if any("전체 목표 저장 개수" in message for message in logs):
-        reporter.fail(f"limit=301/target=1000: 전체 목표 저장 개수 오류가 섞여 나오면 안 됨(logs={logs})")
+        reporter.fail(f"limit=301: 전체 목표 저장 개수 오류가 섞여 나오면 안 됨(logs={logs})")
         return
-
-    # (3) limit=30(유효) / target=0(무효) → 전체 목표 저장 개수 오류.
-    app, logs, statuses, running_calls = _make_app()
-    app.limit_var = FakeVar("30")
-    app.target_count_var = FakeVar("0")
-    fake_threading, instances = _make_fake_threading()
-    with _Saved(["threading"]) as saved:
-        saved.set("threading", fake_threading)
-        app.start_crawl()
-    if instances or not any("전체 목표 저장 개수" in message for message in logs):
-        reporter.fail(f"limit=30/target=0: 전체 목표 저장 개수 오류가 나와야 하는데 결과가 다름(instances={len(instances)}, logs={logs})")
-        return
-    if any("검색 조합당 수집 상한" in message for message in logs):
-        reporter.fail(f"limit=30/target=0: 검색 조합당 상한 오류가 섞여 나오면 안 됨(logs={logs})")
-        return
-
-    reporter.pass_("분리 계약 확인: limit=300/target=1000 유효, limit=301은 조합당 상한 오류만, target=0은 전체 목표 오류만 발생")
+    reporter.pass_("per_query_limit 무효 시 target_count 계산 전에 차단되고, 전체 목표 오류는 섞이지 않음")
 
 
 # ---------------------------------------------------------------------------
@@ -583,13 +550,12 @@ def main() -> int:
     reporter = ValidationReporter()
 
     check_default_constants(reporter)
-    check_target_count_entry_enabled_and_restored_normal(reporter)
+    check_target_count_entry_always_disabled(reporter)
     check_normal_start_crawl_selects_network_worker(reporter)
     check_invalid_per_query_limit_blocks_execution(reporter)
     check_per_query_limit_boundary_values_allowed(reporter)
-    check_invalid_target_count_blocks_execution(reporter)
-    check_target_count_allows_values_above_300(reporter)
-    check_per_query_limit_and_target_count_validated_independently(reporter)
+    check_target_count_always_computed_from_query_count(reporter)
+    check_invalid_per_query_limit_blocks_before_target_count(reporter)
     check_empty_query_queue_blocks_execution(reporter)
     check_stop_event_cleared_before_run(reporter)
     check_running_state_applied_before_thread_start(reporter)

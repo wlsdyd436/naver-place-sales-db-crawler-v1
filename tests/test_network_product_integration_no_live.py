@@ -301,6 +301,10 @@ def _make_app_with_real_ui_recovery():
     app.btn_start = FakeWidget()
     app.left_panel = FakeContainer()
     app.new_open_checkbox = FakeWidget()
+    # LEGALDONG-UI-2: _set_left_panel_state가 target_count_entry도 항상
+    # disabled로 강제하므로(§_build_global_target_count_section), 위
+    # new_open_checkbox와 같은 이유로 이 fixture에도 채워둬야 한다.
+    app.target_count_entry = FakeWidget()
     app.after = lambda delay, func=None, *args, **kwargs: (func(*args, **kwargs) if func else None)
     return app, logs, statuses
 

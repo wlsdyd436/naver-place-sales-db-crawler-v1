@@ -24,27 +24,19 @@ from src.pc.detail_scraper import build_full_collector
 from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
 from src.pc.home_enrichment import enrich_home_details
 from src.pc.network_browser_collector import ApolloFirstListCollector
+from src.pc.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
 from src.pc.network_pipeline import run_collection_plan
 from src.pc.pipeline import collect_pc_full
 from src.pc.region_data import load_region_layers
 
 
-REGION_DATA = {
-    "서울특별시": ["강남구", "강동구", "강북구", "강서구", "관악구", "광진구", "구로구", "금천구", "노원구", "도봉구", "동대문구", "동작구", "마포구", "서대문구", "서초구", "성동구", "성북구", "송파구", "양천구", "영등포구", "용산구", "은평구", "종로구", "중구", "중랑구"],
-    "부산광역시": ["강서구", "금정구", "기장군", "남구", "동구", "동래구", "부산진구", "북구", "사상구", "사하구", "서구", "수영구", "연제구", "영도구", "중구", "해운대구"],
-    "대구광역시": ["군위군", "남구", "달서구", "달성군", "동구", "북구", "서구", "수성구", "중구"],
-    "인천광역시": ["강화군", "계양구", "남동구", "동구", "미추홀구", "부평구", "서구", "연수구", "옹진군", "중구"],
-    "광주광역시": ["광산구", "남구", "동구", "북구", "서구"],
-    "대전광역시": ["대덕구", "동구", "서구", "유성구", "중구"],
-    "울산광역시": ["남구", "동구", "북구", "울주군", "중구"],
-    "세종특별자치시": ["세종시"],
-    "경기도": ["가평군", "고양시", "과천시", "광명시", "광주시", "구리시", "군포시", "김포시", "남양주시", "동두천시", "부천시", "성남시", "수원시", "시흥시", "안산시", "안성시", "안양시", "양주시", "양평군", "여주시", "연천군", "오산시", "용인시", "의왕시", "의정부시", "이천시", "파주시", "평택시", "포천시", "하남시", "화성시"],
-}
-
-# ARCH-300C PoC-6~9에서 만든 강동구 샘플 지역 데이터(법정동/역상권)를 세부구역
-# 미리보기에 읽기 전용으로 재사용한다. 아직 강동구 외 지역은 데이터가 없으며,
-# 그 경우 "준비 중" 문구로 처리한다(§region_data.load_region_layers가 미존재
-# city/gu에 대해 빈 리스트를 반환하므로 예외 처리 불필요).
+# LEGALDONG-UI-2: 공식 법정동 Snapshot(§_build_region_section)이 시도/시군구/
+# 법정동의 유일한 production 출처다 - 하드코딩된 REGION_DATA는 제거했다.
+#
+# regions_kr_sample.json(강동구 샘플)은 "법정동" 출처로는 더 이상 쓰지 않고,
+# 역/상권(landmarks)·세부업종(subcategory_keywords) 보조 검색 힌트로만
+# 재사용한다(§_build_subdivision_section) - 현재 선택된 공식 시도/시군구
+# 기준으로 조회하며, 데이터가 없는 지역은 오류가 아니라 빈 목록으로 처리한다.
 REGIONS_SAMPLE_PATH = Path(__file__).resolve().parent.parent / "data" / "regions_kr_sample.json"
 
 # 다중 키워드로 보이는 입력을 차단하기 위한 패턴(쉼표/세미콜론/슬래시/파이프/
@@ -55,12 +47,11 @@ REGIONS_SAMPLE_PATH = Path(__file__).resolve().parent.parent / "data" / "regions
 # 의도적으로 차단 대상에서 제외한다(UI-CLEANUP-1B).
 _MULTI_KEYWORD_PATTERN = re.compile(r"[,;\n/|·]")
 
-# UI-CLEANUP-1C: 시/군/구를 여러 개 선택할 수 있는 구조로 바꾸면서, 나중에
-# 또 갈아엎지 않도록 처음부터 "여러 구 기준" 쿼리 생성으로 설계한다(사용자
-# 피드백: 구 선택은 결국 다중이 될 거라 지금 정리). 기본 선택 구는 세부구역
-# 샘플 데이터가 있는 강동구 - 다른 시/도로 바꿔 강동구가 없으면 그 시/도의
-# 첫 번째 구를 기본 선택한다.
-_DEFAULT_DISTRICT = "강동구"
+# LEGALDONG-UI-2: 역/상권·세부업종 보조 데이터(regions_kr_sample.json)가
+# 실제로 채워져 있는 시군구 - 다른 시군구를 고르면 데이터가 없어 빈 목록으로
+# 처리되는 것이 정상이다(§_ensure_subdivision_data_loaded). 공식 법정동
+# 선택 자체와는 무관하다.
+_SUBDIVISION_SAMPLE_SIGUNGU = "강동구"
 
 # 왼쪽 설정 패널 섹션 간 여백을 통일하기 위한 상수(위/아래 여백을 맞춰
 # 달라는 요청 대응). 섹션 제목은 위 16/아래 4, 섹션 본문 프레임은 아래 16으로
@@ -91,6 +82,11 @@ _LEFT_PANEL_MIN_WIDTH = 420
 # 전환 시에만 진입)는 이 기본값 변경과 무관하게 여전히 존재한다.
 _DEFAULT_PER_QUERY_LIMIT = "30"
 _DEFAULT_TARGET_COUNT = "300"
+
+# LEGALDONG-UI-2: 세종특별자치시처럼 시군구 계층이 없는 지역을 시군구 콤보박스에 표시할 때
+# 쓰는 placeholder(지역명을 코드에 하드코딩하지 않고, list_sigungus()가 빈
+# 리스트를 반환하는 데이터 구조로만 판단한다).
+_LEGAL_DONG_NO_SIGUNGU = "(시군구 없음)"
 
 # ARCH-300C WIRE-2C-2: 기본 수집 엔진을 고르는 내부 전환 지점이다. 사용자
 # 화면에는 엔진 선택 UI를 노출하지 않는다 - "network"가 기본 실행 경로이고,
@@ -123,81 +119,118 @@ def _parse_positive_int(raw: str, max_value: int | None = None) -> int | None:
     return value
 
 
-def build_collection_queries(city: str, district_selections: list[dict], keyword: str) -> list[dict]:
-    """구별 선택 상태 + 키워드로 최종 수집 쿼리 목록을 만드는 순수 함수(Tk 불필요).
-
-    district_selections: 화면에 표시된 순서 그대로, 각 구에 대해
-      {"district": str, "has_subregion_data": bool, "selected_subregions": [str, ...]}
-    형태의 dict 목록. has_subregion_data가 False면 "{city} {district} {keyword}"
-    구 기준 fallback 쿼리 1개를 만든다. True인데 selected_subregions가 비어
-    있으면(법정동/역상권을 전부 체크 해제) 그 구는 쿼리를 만들지 않고 건너뛴다
-    (세부구역 데이터가 있는 구에서 전부 해제하면 수집 대상에서 제외되어야
-    하기 때문). True이고 목록이 있으면 세부구역마다 "{city} {district}
-    {subregion} {keyword}" 쿼리를 만든다.
-
-    entry는 선택적으로 "legal_dongs": [str, ...] / "landmarks": [str, ...]
-    (region_data.load_region_layers/get_selected_subregions과 동일한 이름의
-    원본 목록)를 함께 넘길 수 있다. selected_subregions의 각 항목이 이 중
-    어느 목록에 속하는지에 따라 아래 source_layer를 분류한다. 넘기지 않으면
-    (기존 테스트 등 하위 호환 호출) "unknown"으로 분류한다 - 실제 UI 인스턴스
-    메서드(_build_collection_queries, ARCH-300C WIRE-1B)는 이 두 목록을 분리
-    전달하므로 실제 화면에서 생성되는 job은 legal_dong/landmark/fallback으로만
-    분류되고 unknown은 발생하지 않는다.
-
-    반환은 `_run_queue_pipeline`이 그대로 받을 수 있는 job 형태
-    [{"region": ..., "keyword": keyword, "query": ...}, ...]에 내부 메타
-    source_city/source_district/source_subregion/source_layer를 추가한
-    것이다 - 기존 region/keyword/query 키와 값은 그대로 유지되며, 이
-    source_* 필드들은 dedup/orchestrator 진단용일 뿐 Excel에는 노출되지
-    않는다(exporter가 MERGED_COLUMNS로만 투영). source_layer 후보:
-    "legal_dong" / "landmark" / "fallback"(세부구역 데이터 없는 구) /
-    "unknown"(legal_dongs/landmarks 미전달 시). 중복 쿼리는 제거하되 처음
-    등장한 순서는 유지한다.
+def build_auxiliary_query_plan(
+    sido: str, sigungu: str, landmarks: list[str], subcategory_keywords: list[str],
+    keyword: str, per_query_limit: int,
+) -> list[dict]:
+    """역/상권(landmarks)·세부업종(subcategory_keywords) 보조 선택으로 추가
+    검색 조합을 만드는 순수 함수(Tk 불필요). 공식 법정동 Query Plan
+    (build_legal_dong_query_plan)에 덧붙여 쓰며, 최종 병합·중복 제거는
+    호출자(_build_collection_queries)가 담당한다 - 법정동(legal_dongs)은
+    이 함수의 입력이 아니다(법정동은 공식 Snapshot에서만 옴, LEGALDONG-UI-2).
     """
+
+    def _norm(text: str) -> str:
+        return " ".join(text.split())
+
+    jobs: list[dict] = []
+    named_layers = [(name, "landmark") for name in landmarks] + [
+        (name, "subcategory") for name in subcategory_keywords
+    ]
+    for name, source_layer in named_layers:
+        region_label = _norm(f"{sido} {sigungu} {name}") if sigungu else _norm(f"{sido} {name}")
+        query = _norm(f"{region_label} {keyword}")
+        if not query:
+            continue
+        jobs.append({
+            "region": region_label,
+            "keyword": keyword,
+            "query": query,
+            "source_city": sido,
+            "source_district": sigungu,
+            "source_subregion": name,
+            "source_layer": source_layer,
+            "legal_code": "",
+            "per_query_limit": per_query_limit,
+        })
+    return jobs
+
+
+def build_legal_dong_query_plan(
+    sido: str, sigungu: str, legal_dongs: list[dict], keyword: str, per_query_limit: int,
+) -> list[dict]:
+    """공식 법정동 Snapshot 기반 선택(시도/시군구/법정동 다중선택)으로 검색
+    조합을 만드는 순수 함수(Tk 불필요). build_auxiliary_query_plan과 동일한
+    job 형태({"region","keyword","query","source_city","source_district",
+    "source_subregion","source_layer", ...})를 반환해 _run_network_pipeline
+    /orchestrator에 그대로 흘러가게 한다 - 기본모드/홈페이지·SNS 모드가
+    동일한 이 job 목록을 받는다(§_build_collection_queries).
+
+    법정동을 하나도 선택하지 않으면 시군구(세종처럼 시군구가 없는 지역은
+    시도) 단위 검색 조합 1개를 만든다("district" 계층). 법정동을 N개
+    선택하면 legal_code로 식별되는 법정동별로 N개의 검색 조합을 만든다
+    ("legal_dong" 계층) - 동일 명칭이 여러 시군구에 있어도(예: "신교동") 항상
+    올바른 legal_code를 provenance로 유지한다. 공백 정규화를 적용하고, 중복
+    쿼리는 제거하되 처음 등장한 순서(=legal_dongs 인자 순서, 화면 표시/선택
+    순서)를 유지한다.
+    """
+
+    def _norm(text: str) -> str:
+        return " ".join(text.split())
+
     jobs: list[dict] = []
     seen_queries: set = set()
-    for entry in district_selections:
-        district = entry["district"]
-        if entry.get("has_subregion_data"):
-            legal_dongs = set(entry.get("legal_dongs") or [])
-            landmarks = set(entry.get("landmarks") or [])
-            for subregion in entry.get("selected_subregions") or []:
-                region_label = f"{city} {district} {subregion}"
-                query = f"{region_label} {keyword}"
-                if query in seen_queries:
-                    continue
-                seen_queries.add(query)
-                if subregion in legal_dongs:
-                    source_layer = "legal_dong"
-                elif subregion in landmarks:
-                    source_layer = "landmark"
-                else:
-                    source_layer = "unknown"
-                jobs.append({
-                    "region": region_label,
-                    "keyword": keyword,
-                    "query": query,
-                    "source_city": city,
-                    "source_district": district,
-                    "source_subregion": subregion,
-                    "source_layer": source_layer,
-                })
-        else:
-            region_label = f"{city} {district}"
-            query = f"{region_label} {keyword}"
-            if query in seen_queries:
-                continue
+
+    if not legal_dongs:
+        region_label = _norm(f"{sido} {sigungu}") if sigungu else _norm(sido)
+        query = _norm(f"{region_label} {keyword}")
+        if query and query not in seen_queries:
             seen_queries.add(query)
             jobs.append({
                 "region": region_label,
                 "keyword": keyword,
                 "query": query,
-                "source_city": city,
-                "source_district": district,
+                "source_city": sido,
+                "source_district": sigungu,
                 "source_subregion": "",
-                "source_layer": "fallback",
+                "source_layer": "district",
+                "legal_code": "",
+                "per_query_limit": per_query_limit,
             })
+        return jobs
+
+    for item in legal_dongs:
+        eup_myeon_dong = item["eup_myeon_dong"]
+        legal_code = item["legal_code"]
+        region_label = (
+            _norm(f"{sido} {sigungu} {eup_myeon_dong}") if sigungu else _norm(f"{sido} {eup_myeon_dong}")
+        )
+        query = _norm(f"{region_label} {keyword}")
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        jobs.append({
+            "region": region_label,
+            "keyword": keyword,
+            "query": query,
+            "source_city": sido,
+            "source_district": sigungu,
+            "source_subregion": eup_myeon_dong,
+            "source_layer": "legal_dong",
+            "legal_code": legal_code,
+            "per_query_limit": per_query_limit,
+        })
     return jobs
+
+
+def calculate_legal_dong_target_count(per_query_limit: int, query_count: int) -> int:
+    """전체 목표 저장 개수 자동 계산: per_query_limit x query_count.
+    둘 중 하나라도 0 이하면 0(미계산 상태)을 반환한다 - 호출자가 0을
+    "계산 불가"로 취급해 기존 _parse_positive_int 검증에서 자연스럽게
+    차단되게 한다(§_start_network_crawl, 새 오류 문구를 따로 만들지 않음)."""
+    if per_query_limit <= 0 or query_count <= 0:
+        return 0
+    return per_query_limit * query_count
 
 
 class LogWriter:
@@ -230,7 +263,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.minsize(1100, 780)
         self.resizable(True, True)
 
-        self.selected_city_var = ctk.StringVar(value="서울특별시")
         self.keyword_input_var = ctk.StringVar(value="카페")
         # ARCH-300C WIRE-2C-2: 기본 실행 경로가 Network/List(_start_network_crawl)
         # 로 바뀌면서 이 값은 진짜 per_query_limit 의미(검색 조합 하나당 상한,
@@ -277,22 +309,59 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.total_queries = 0
         self.total_found_count = 0
 
-        # UI-CLEANUP-1C: 구를 여러 개 선택할 수 있으므로 선택 상태를 전부
-        # "구 이름"을 키로 하는 딕셔너리로 관리한다.
-        #   selected_district_vars: {구이름: BooleanVar}  - 구 체크박스 상태
-        #   _subdivision_layers:    {구이름: {"legal_dongs": [...], "landmarks": [...]}}
-        #                           - 구별로 한 번 로드한 세부구역 데이터 캐시
-        #   region_selection_vars:  {구이름: {"legal_dongs": {이름: BooleanVar},
-        #                                      "landmarks": {이름: BooleanVar}}}
-        # 체크박스가 화면에 그려져 있지 않아도(접힌 상태) 항상 최신 선택 상태를
-        # 담고 있어야 한다 - 요약 문구/예상 쿼리 수/시작 시 검증이 접힌
-        # 상태에서도 정확해야 하기 때문이다.
-        self.selected_district_vars: dict = {}
+        # LEGALDONG-UI-2: 역/상권(landmarks)·세부업종(subcategory_keywords)
+        # 보조 검색 힌트(regions_kr_sample.json, §_build_subdivision_section) -
+        # 현재 선택된 공식 시도/시군구 "단 하나"만 기준으로 조회한다(과거처럼
+        # 여러 구를 동시에 캐시하지 않는다 - 공식 지역 경로가 하나뿐이므로).
+        #   _subdivision_layers:    {"landmarks": [...], "subcategory_keywords": [...]}
+        #   region_selection_vars:  {"landmarks": {이름: BooleanVar},
+        #                             "subcategory_keywords": {이름: BooleanVar}}
+        #   _subdivision_loaded_key: 마지막으로 로드한 (시도, 시군구) - 동일하면
+        #                            재로드하지 않아 사용자의 체크 상태를 보존한다.
         self._subdivision_layers: dict = {}
         self.region_selection_vars: dict = {}
+        self._subdivision_loaded_key = None
+
+        # LEGALDONG-UI-2: 공식 법정동 Snapshot(data/legal_dong_snapshot.json)이
+        # 시도/시군구/법정동의 유일한 production 출처다. 로더는 앱 시작 시
+        # 1회만 로드한다(행안부 API 호출 없음, 순수 파일 읽기). 실패해도
+        # 조용히 regions_kr_sample.json 등으로 대체하지 않고 오류를 그대로
+        # 보관해 §_build_region_section이 화면에 표시하고 수집 시작 버튼을
+        # 비활성화하게 한다.
+        self.legal_dong_sido_var = ctk.StringVar(value="")
+        self.legal_dong_sigungu_var = ctk.StringVar(value=_LEGAL_DONG_NO_SIGUNGU)
+        self.legal_dong_selected_count_var = ctk.StringVar(value="선택한 법정동: 0개")
+        self.legal_dong_query_count_var = ctk.StringVar(value="검색 조합 수: 0개")
+        self.legal_dong_load_error_var = ctk.StringVar(value="")
+        # {legal_code: BooleanVar} - 현재 렌더링된 법정동 체크박스 상태.
+        self.legal_dong_selection_vars: dict = {}
+        # 현재 시도/시군구에 속한 법정동 레코드 목록(화면 표시 순서 그대로,
+        # legal_code로 식별) - _render_legal_dong_checkboxes가 그리는 원본.
+        self._legal_dong_current_items: list = []
+        self._legal_dong_popup = None
+        self._legal_dong_popup_container = None
+        self._legal_dong_loader = None
+        self._legal_dong_load_error = None
+        try:
+            self._legal_dong_loader = LegalDongSnapshotLoader()
+            sidos = self._legal_dong_loader.list_sidos()
+            self.legal_dong_sido_var.set("서울특별시" if "서울특별시" in sidos else (sidos[0] if sidos else ""))
+        except LegalDongSnapshotError as exc:
+            self._legal_dong_load_error = str(exc)
+            self.legal_dong_load_error_var.set(str(exc))
 
         self._build_ui()
-        self._reload_district_data()
+        self._reload_region_selection()
+
+        # per_query_limit/keyword가 바뀌면 자동 target_count도 다시 계산한다
+        # (§_recalculate_target_count) - 위젯이 전부 만들어진 뒤(_build_ui
+        # 이후)에만 안전하게 붙일 수 있다.
+        self.limit_var.trace_add("write", lambda *_args: self._recalculate_target_count())
+        self.keyword_input_var.trace_add("write", lambda *_args: self._recalculate_target_count())
+
+        if self._legal_dong_load_error is not None:
+            self.log(f"[ui] 법정동 Snapshot 로드 실패: {self._legal_dong_load_error}")
+            self.btn_start.configure(state="disabled")
 
     def _build_ui(self):
         self.grid_rowconfigure(0, weight=1)
@@ -350,78 +419,89 @@ class SalesDbCrawlerApp(ctk.CTk):
         self._build_policy_tab()
 
     def _build_region_section(self):
+        """LEGALDONG-UI-2: 공식 법정동 Snapshot(data/legal_dong_snapshot.json)이
+        시도/시군구/법정동의 유일한 production 출처다(REGION_DATA 하드코딩은
+        제거됨). 시도/시군구는 콤보박스 단일 선택, 법정동은 별도 팝업에서
+        다중 선택한다(§_open_legal_dong_popup). Snapshot 로드가 실패했으면
+        오류 문구만 보여주고 수집 시작 버튼을 비활성화한다(§__init__) -
+        regions_kr_sample.json 등으로 조용히 대체하지 않는다."""
         ctk.CTkLabel(self.left_panel, text="1. 지역 선택", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
         region_frame = ctk.CTkFrame(self.left_panel)
         region_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
         region_frame.grid_columnconfigure(0, weight=1)
 
-        # 시/도는 드롭다운 1개 선택을 유지한다(여러 시/도 동시 선택은 이번
-        # 범위 밖). 시/군/구는 체크박스 다중 선택으로 바꾼다 - 나중에 다시
-        # 구조를 바꾸지 않도록, 쿼리 생성(get_selected_districts +
-        # build_collection_queries)을 처음부터 "여러 구"를 전제로 짰다.
-        ctk.CTkLabel(region_frame, text="시/도", anchor="w").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
-        self.city_dropdown = ctk.CTkOptionMenu(
-            region_frame, variable=self.selected_city_var,
-            values=list(REGION_DATA.keys()), command=self._on_city_changed,
+        if self._legal_dong_load_error is not None:
+            ctk.CTkLabel(
+                region_frame, text="지역 데이터 파일 오류로 지역을 선택할 수 없습니다.",
+                anchor="w", text_color="#c0392b", font=ctk.CTkFont(weight="bold"),
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+            ctk.CTkLabel(
+                region_frame, textvariable=self.legal_dong_load_error_var,
+                justify="left", anchor="w", text_color="#c0392b", font=ctk.CTkFont(size=11), wraplength=360,
+            ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+            return
+
+        ctk.CTkLabel(region_frame, text="시도", anchor="w").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+        self.legal_dong_sido_dropdown = ctk.CTkOptionMenu(
+            region_frame, variable=self.legal_dong_sido_var,
+            values=self._legal_dong_loader.list_sidos(),
+            command=self._on_legal_dong_sido_changed,
         )
-        self.city_dropdown.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+        self.legal_dong_sido_dropdown.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
 
-        ctk.CTkLabel(region_frame, text="시/군/구 (여러 개 선택 가능)", anchor="w").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 2))
-        self.district_checkbox_frame = ctk.CTkFrame(region_frame, fg_color="transparent")
-        self.district_checkbox_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 2))
-        # 3열은 "영등포구"처럼 4글자 구 이름이 잘리는 문제가 있어 2열로 줄이고
-        # 각 열에 weight를 줘 왼쪽 패널 폭(_LEFT_PANEL_MIN_WIDTH)을 넉넉히
-        # 나눠 갖게 한다(고정 폭을 텍스트에 억지로 맞추지 않기 위함).
-        self.district_checkbox_frame.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(region_frame, text="시군구", anchor="w").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 0))
+        self.legal_dong_sigungu_dropdown = ctk.CTkOptionMenu(
+            region_frame, variable=self.legal_dong_sigungu_var,
+            values=[_LEGAL_DONG_NO_SIGUNGU], state="disabled",
+            command=self._on_legal_dong_sigungu_changed,
+        )
+        self.legal_dong_sigungu_dropdown.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 8))
 
-        self.district_summary_var = ctk.StringVar(value="")
+        self.legal_dong_popup_button = ctk.CTkButton(
+            region_frame, text="법정동 선택(선택 사항)", command=self._open_legal_dong_popup,
+        )
+        self.legal_dong_popup_button.grid(row=4, column=0, sticky="ew", padx=12, pady=(2, 4))
+
+        ctk.CTkLabel(region_frame, textvariable=self.legal_dong_selected_count_var, anchor="w", text_color="gray").grid(
+            row=5, column=0, sticky="w", padx=12, pady=(4, 0)
+        )
+        ctk.CTkLabel(region_frame, textvariable=self.legal_dong_query_count_var, anchor="w", text_color="gray").grid(
+            row=6, column=0, sticky="w", padx=12, pady=(0, 4)
+        )
         ctk.CTkLabel(
-            region_frame, textvariable=self.district_summary_var, anchor="w", text_color="gray",
-        ).grid(row=4, column=0, sticky="w", padx=12, pady=(2, 10))
+            region_frame,
+            text=(
+                "행정안전부 공식 법정동 데이터를 사용합니다(앱 실행 중 API 호출 없음).\n"
+                "법정동을 선택하지 않으면 시군구(시군구 없는 지역은 시도) 단위로 검색합니다.\n"
+                "전남광주통합특별시/세종특별자치시 등은 공식 명칭을 그대로 표시하며,\n"
+                "네이버 검색어 호환성과 지역 exact 필터는 아직 다음 단계입니다."
+            ),
+            justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11), wraplength=360,
+        ).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 10))
 
-    def _render_district_checkboxes(self):
-        """selected_district_vars(현재 시/도의 구 목록)를 2열 체크박스로 그린다."""
-        for child in self.district_checkbox_frame.winfo_children():
-            child.destroy()
-        row = 0
-        col = 0
-        for district, var in self.selected_district_vars.items():
-            ctk.CTkCheckBox(
-                self.district_checkbox_frame, text=district, variable=var,
-                command=lambda d=district: self._on_district_toggle(d),
-            ).grid(row=row, column=col, sticky="w", padx=8, pady=4)
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
-        self._update_district_summary()
-
-    def _update_district_summary(self):
-        self.district_summary_var.set(f"선택한 구: {len(self.get_selected_districts())}개")
-
-    def get_selected_districts(self) -> list[str]:
-        """현재 체크된 구 이름을 REGION_DATA 순서 그대로 반환한다."""
-        return [district for district, var in self.selected_district_vars.items() if var.get()]
+        self._legal_dong_popup = None
+        self._legal_dong_popup_container = None
 
     def _build_subdivision_section(self):
-        ctk.CTkLabel(self.left_panel, text="2. 세부구역 설정", font=ctk.CTkFont(size=14, weight="bold")).grid(row=2, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        """LEGALDONG-UI-2: 역/상권(landmarks)·세부업종(subcategory_keywords)
+        보조 검색 힌트 - regions_kr_sample.json 기반이며, §1에서 선택한 공식
+        시도/시군구를 기준으로 조회한다. 법정동(legal_dongs)은 이 샘플
+        데이터에서 읽지 않는다(법정동은 공식 Snapshot에서만 읽음). 데이터가
+        없는 지역(대부분의 전국 지역)은 오류가 아니라 빈 목록으로 표시되며,
+        공식 법정동 검색 자체는 정상 동작한다."""
+        ctk.CTkLabel(self.left_panel, text="2. 선택 사항", font=ctk.CTkFont(size=14, weight="bold")).grid(row=2, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
         subdivision_frame = ctk.CTkFrame(self.left_panel)
         subdivision_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
         subdivision_frame.grid_columnconfigure(0, weight=1)
 
-        # 자동 세분화 자체는 여전히 화면 표시/선택 상태 보관용이며, 실제 검색
-        # 쿼리 생성에는 아직 연결되지 않는다(ARCH-300C 계층형 큐는 PoC-6~9
-        # 실험 단계이며 파이프라인 미연결 - get_selected_subregions()가 그
-        # 연결 지점이 될 확장 포인트다).
-        self.auto_subdivide_var = ctk.BooleanVar(value=True)
+        self.auto_subdivide_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            subdivision_frame, text="선택한 구를 동/상권 단위로 자동 세분화",
+            subdivision_frame, text="역·상권/세부업종 보조 검색 포함",
             variable=self.auto_subdivide_var, command=self._refresh_subdivision_view,
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
 
-        # 선택된 구 수 + 예상 수집 쿼리 수(실제 build_collection_queries 결과
-        # 기준)를 함께 보여준다 - 선택이 바뀔 때마다 _update_subdivision_summary
-        # 에서 갱신한다.
+        # 선택된 보조 항목 수(실제 _build_collection_queries 결과 기준)를
+        # 보여준다 - 선택이 바뀔 때마다 _update_subdivision_summary에서 갱신한다.
         self.subdivision_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(
             subdivision_frame, textvariable=self.subdivision_summary_var,
@@ -437,18 +517,11 @@ class SalesDbCrawlerApp(ctk.CTk):
             anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
 
-        # UI-CLEANUP-1D-A: 법정동/역상권 체크박스 목록을 왼쪽 패널에 직접 펼치면
-        # (구가 여러 개일수록) 패널이 매우 길어지고, CTkScrollableFrame 안에서
-        # 큰 위젯 트리를 자주 destroy/recreate하면서 스크롤 잔상처럼 보이는
-        # 렌더링 문제가 있었다. 그래서 메인 화면에는 요약 + 버튼만 두고,
-        # 실제 법정동/역상권 체크박스는 별도 팝업(Toplevel)에서만 그린다
-        # (§_open_subregion_popup). 행정동은 팝업에서도 표시하지 않는다(법정동
-        # 기준으로 300개 목표를 채운다는 REGION-DATA-1 설계 결론 - 행정동을
-        # 섞으면 PoC-5에서 확인된 것처럼 같은 지역이 이중 집계될 위험이 있다).
-        # 체크박스 상태는 get_selected_subregions()를 거쳐 build_collection_queries가
-        # 실제 검색 쿼리에 반영한다.
+        # 역/상권·세부업종 체크박스는 별도 팝업(Toplevel)에서만 그린다(§_open_subregion_popup,
+        # 기존 팝업 셸 재사용). 체크박스 상태는 get_selected_subregions()를
+        # 거쳐 _build_collection_queries가 공식 법정동 Query Plan에 덧붙인다.
         self.subregion_popup_button = ctk.CTkButton(
-            subdivision_frame, text="수집할 동/상권 설정", command=self._open_subregion_popup,
+            subdivision_frame, text="역·상권/세부업종 설정", command=self._open_subregion_popup,
         )
         self.subregion_popup_button.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 10))
 
@@ -534,27 +607,24 @@ class SalesDbCrawlerApp(ctk.CTk):
         ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_global_target_count_section(self):
-        # ARCH-300C WIRE-2B-2: 검색 조합당 상한(§_build_target_count_section,
-        # per_query_limit)과는 별개로, 전역 dedup 이후 최종 저장할 목표
-        # 개수(target_count)를 입력받는다. run_collection_plan이 실제로 "목표
-        # 도달 시 남은 검색 조합 중단"을 구현하고 있으므로 그 문구만 사용하고,
-        # "300개 보장"처럼 과장된 표현은 쓰지 않는다.
-        # WIRE-2C-2: Network/List가 기본 실행 경로가 되어 start_crawl
-        # (_start_network_crawl)이 이 값을 실제로 읽고 검증하므로 입력 위젯을
-        # 활성화한다(WIRE-2B-2A 당시의 임시 disabled 안내 문구는 더 이상
-        # 사실이 아니므로 제거했다).
-        ctk.CTkLabel(self.left_panel, text="6. 전체 목표 저장 개수", font=ctk.CTkFont(size=14, weight="bold")).grid(row=10, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
+        # LEGALDONG-UI-2: 전체 목표 저장 개수(target_count)는 항상 자동
+        # 계산이다(검색 조합당 수집 상한 x 최종 검색 조합 수,
+        # §_recalculate_target_count) - 사용자가 직접 입력하지 못하도록
+        # 위젯을 항상 disabled(읽기 전용)로 만든다. run_collection_plan이
+        # 실제로 "목표 도달 시 남은 검색 조합 중단"을 구현하고 있으므로 그
+        # 문구만 사용하고 "300개 보장"처럼 과장된 표현은 쓰지 않는다.
+        ctk.CTkLabel(self.left_panel, text="6. 전체 목표 저장 개수(자동 계산)", font=ctk.CTkFont(size=14, weight="bold")).grid(row=10, column=0, sticky="w", padx=14, pady=_SECTION_TITLE_PADY)
         global_target_frame = ctk.CTkFrame(self.left_panel)
         global_target_frame.grid(row=11, column=0, sticky="ew", padx=14, pady=_SECTION_BODY_PADY)
         global_target_frame.grid_columnconfigure(0, weight=1)
 
-        self.target_count_entry = ctk.CTkEntry(global_target_frame, textvariable=self.target_count_var, width=100)
+        self.target_count_entry = ctk.CTkEntry(global_target_frame, textvariable=self.target_count_var, width=100, state="disabled")
         self.target_count_entry.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             global_target_frame,
             text=(
-                "여러 검색 조합의 결과를 합치고 중복을 제거한 뒤\n"
-                "Excel에 최종 저장할 최대 업체 수입니다.\n"
+                "검색 조합당 수집 상한 x 검색 조합 수로 자동 계산됩니다(직접 수정 불가).\n"
+                "여러 검색 조합의 결과를 합치고 중복을 제거한 뒤 Excel에 최종 저장할 최대 업체 수입니다.\n"
                 "목표 개수는 보장값이 아니며, 업종·지역 및 검색 결과에 따라 미달할 수 있습니다."
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
@@ -601,6 +671,167 @@ class SalesDbCrawlerApp(ctk.CTk):
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11),
         ).grid(row=3, column=0, sticky="w", padx=28, pady=(0, 10))
+
+    def _on_legal_dong_sido_changed(self, _sido=None):
+        self._reload_legal_dong_sigungu_options()
+        self._reload_legal_dong_checkboxes()
+        self._reload_subdivision_data()
+        self._recalculate_target_count()
+
+    def _reload_legal_dong_sigungu_options(self):
+        """시도가 바뀌면 시군구 목록을 새로 채운다. 시군구가 없는 지역
+        (세종특별자치시 등)은 콤보박스를 비활성화하고 "(시군구 없음)"만
+        보여준다 - 지역명을 코드에 직접 넣지 않고 list_sigungus()가 빈
+        리스트인지로만 판단한다."""
+        sido = self.legal_dong_sido_var.get()
+        sigungus = self._legal_dong_loader.list_sigungus(sido) if self._legal_dong_loader else []
+        if sigungus:
+            self.legal_dong_sigungu_dropdown.configure(values=sigungus, state="normal")
+            self.legal_dong_sigungu_var.set(sigungus[0])
+        else:
+            self.legal_dong_sigungu_dropdown.configure(values=[_LEGAL_DONG_NO_SIGUNGU], state="disabled")
+            self.legal_dong_sigungu_var.set(_LEGAL_DONG_NO_SIGUNGU)
+
+    def _on_legal_dong_sigungu_changed(self, _sigungu=None):
+        self._reload_legal_dong_checkboxes()
+        self._reload_subdivision_data()
+        self._recalculate_target_count()
+
+    def _current_legal_dong_sigungu(self) -> str:
+        """시군구 콤보박스 값을 조회 가능한 실제 값으로 바꾼다("(시군구 없음)"
+        placeholder는 빈 문자열로 취급 - 세종특별자치시 등)."""
+        value = self.legal_dong_sigungu_var.get()
+        return "" if value == _LEGAL_DONG_NO_SIGUNGU else value
+
+    def _current_region_description(self) -> str:
+        """로그 표시용 - 현재 선택된 시도/시군구/법정동을 한 줄로 요약한다."""
+        sido = self.legal_dong_sido_var.get()
+        sigungu = self._current_legal_dong_sigungu()
+        region_desc = f"{sido} {sigungu}".strip() if sigungu else sido
+        selected_names = [item["eup_myeon_dong"] for item in self.get_selected_legal_dongs()]
+        if selected_names:
+            return f"{region_desc}(법정동 {', '.join(selected_names)})"
+        return f"{region_desc}(법정동 미선택 - 시군구 단위)"
+
+    def _reload_legal_dong_checkboxes(self):
+        """시도/시군구 변경 시 그 아래 법정동 목록을 새로 불러오고 선택
+        상태를 전부 초기화한다(시도 변경 시 시군구·법정동 초기화, 시군구
+        변경 시 법정동 초기화 요구사항)."""
+        sido = self.legal_dong_sido_var.get()
+        items = self._legal_dong_loader.list_legal_dongs(sido, self._current_legal_dong_sigungu()) if self._legal_dong_loader else []
+        self._legal_dong_current_items = items
+        self.legal_dong_selection_vars = {item["legal_code"]: ctk.BooleanVar(value=False) for item in items}
+        self._render_legal_dong_checkboxes()
+        self._update_legal_dong_summary()
+
+    def _is_legal_dong_popup_open(self) -> bool:
+        popup = self._legal_dong_popup
+        return popup is not None and popup.winfo_exists()
+
+    def _open_legal_dong_popup(self):
+        """"법정동 선택" 버튼 클릭 시 팝업(Toplevel)을 연다(§_open_subregion_popup과
+        동일한 셸 패턴). 법정동 체크박스는 legal_dong_selection_vars의
+        BooleanVar를 그대로 공유하므로 체크/해제가 즉시 실제 상태에 반영된다."""
+        if self._is_legal_dong_popup_open():
+            self._legal_dong_popup.lift()
+            self._legal_dong_popup.focus_force()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("법정동 선택")
+        popup.geometry("420x560")
+        popup.minsize(360, 400)
+        popup.transient(self)
+        popup.grab_set()
+        popup.grid_rowconfigure(0, weight=1)
+        popup.grid_columnconfigure(0, weight=1)
+        popup.protocol("WM_DELETE_WINDOW", self._close_legal_dong_popup)
+
+        container = ctk.CTkScrollableFrame(popup)
+        container.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+        container.grid_columnconfigure(0, weight=1)
+
+        button_row = ctk.CTkFrame(popup, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ctk.CTkButton(button_row, text="전체 선택", width=100, command=self._select_all_legal_dongs).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=self._deselect_all_legal_dongs).pack(side="left")
+        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_legal_dong_popup).pack(side="right")
+        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_legal_dong_popup).pack(side="right", padx=(0, 6))
+
+        self._legal_dong_popup = popup
+        self._legal_dong_popup_container = container
+        self._render_legal_dong_checkboxes()
+
+    def _close_legal_dong_popup(self):
+        self._update_legal_dong_summary()
+        popup = self._legal_dong_popup
+        self._legal_dong_popup = None
+        self._legal_dong_popup_container = None
+        if popup is not None:
+            try:
+                popup.grab_release()
+                popup.destroy()
+            except Exception:
+                pass
+
+    def _render_legal_dong_checkboxes(self):
+        """팝업이 열려 있을 때만 그린다(닫혀 있으면 그릴 대상이 없음) -
+        공식 데이터 순서(legal_code 오름차순) 그대로 보존한다."""
+        if not self._is_legal_dong_popup_open():
+            return
+        container = self._legal_dong_popup_container
+        for child in container.winfo_children():
+            child.destroy()
+        if not self._legal_dong_current_items:
+            ctk.CTkLabel(container, text="이 시군구는 법정동 목록이 없습니다.", text_color="gray").grid(row=0, column=0, sticky="w")
+            return
+        for row, item in enumerate(self._legal_dong_current_items):
+            legal_code = item["legal_code"]
+            ctk.CTkCheckBox(
+                container, text=item["eup_myeon_dong"],
+                variable=self.legal_dong_selection_vars[legal_code],
+                command=self._on_legal_dong_toggle,
+            ).grid(row=row, column=0, sticky="w", padx=8, pady=2)
+
+    def _on_legal_dong_toggle(self):
+        self._update_legal_dong_summary()
+
+    def _select_all_legal_dongs(self):
+        for var in self.legal_dong_selection_vars.values():
+            var.set(True)
+        self._update_legal_dong_summary()
+
+    def _deselect_all_legal_dongs(self):
+        for var in self.legal_dong_selection_vars.values():
+            var.set(False)
+        self._update_legal_dong_summary()
+
+    def get_selected_legal_dongs(self) -> list:
+        """현재 체크된 법정동 레코드를 화면 표시 순서 그대로 반환한다
+        (legal_code로 식별 - 동일 명칭이라도 서로 다른 레코드로 구분됨)."""
+        return [
+            item for item in self._legal_dong_current_items
+            if self.legal_dong_selection_vars[item["legal_code"]].get()
+        ]
+
+    def _update_legal_dong_summary(self):
+        self.legal_dong_selected_count_var.set(f"선택한 법정동: {len(self.get_selected_legal_dongs())}개")
+        self._recalculate_target_count()
+
+    def _recalculate_target_count(self):
+        """전체 목표 저장 개수는 항상 자동 계산이다(LEGALDONG-UI-2) -
+        검색 조합당 수집 상한 x 최종 검색 조합 수(공식 법정동 선택 + 보조
+        역/상권·세부업종 선택을 병합·중복 제거한 최종 결과, §_build_collection
+        _queries). keyword가 비어 있거나 per_query_limit이 유효하지 않으면
+        0(계산 불가)으로 표시한다. target_count_entry는 항상 disabled이며
+        사용자가 직접 수정할 수 없다(§_build_global_target_count_section)."""
+        if not hasattr(self, "target_count_entry"):
+            return  # _build_ui 진행 중(target_count_entry가 아직 없음) - 최초 렌더 시 1회 무시
+        per_query_limit = _parse_positive_int(self.limit_var.get(), max_value=300)
+        query_count = len(self._build_collection_queries())
+        target = calculate_legal_dong_target_count(per_query_limit or 0, query_count)
+        self.target_count_var.set(str(target))
+        self.legal_dong_query_count_var.set(f"검색 조합 수: {query_count}개")
 
     def _build_dashboard_section(self):
         ctk.CTkLabel(self.right_panel, text="수집 현황", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
@@ -771,61 +1002,46 @@ class SalesDbCrawlerApp(ctk.CTk):
             ctk.CTkLabel(card, text="정식 배포 전 작성 예정", anchor="w", text_color="gray").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
             row += 1
 
-    def _on_city_changed(self, _city: str):
-        self._reload_district_data()
+    def _reload_region_selection(self):
+        """앱 시작 시(§__init__, _build_ui 이후) 초기 지역 상태를 한 번에
+        맞춘다: 시군구 옵션 → 법정동 목록 → 보조 역/상권·세부업종 데이터 →
+        요약/자동 target_count 순서로 채운다."""
+        self._reload_legal_dong_sigungu_options()
+        self._reload_legal_dong_checkboxes()
+        self._reload_subdivision_data()
+        self._recalculate_target_count()
 
-    def _reload_district_data(self):
-        """시/도가 바뀔 때 그 시/도의 구 목록으로 선택 상태를 완전히 새로
-        만든다(다른 시/도의 세부구역 데이터는 이어받지 않는다). 기본으로
-        _DEFAULT_DISTRICT(강동구)가 있으면 그것을, 없으면 첫 번째 구를
-        선택한다.
-        """
-        city = self.selected_city_var.get()
-        districts = REGION_DATA.get(city, [])
-        default_district = _DEFAULT_DISTRICT if _DEFAULT_DISTRICT in districts else (districts[0] if districts else None)
-
-        self.selected_district_vars = {name: ctk.BooleanVar(value=(name == default_district)) for name in districts}
-        self._subdivision_layers = {}
-        self.region_selection_vars = {}
-
-        self._render_district_checkboxes()
-        if default_district:
-            self._ensure_subregion_data_loaded(default_district)
+    def _reload_subdivision_data(self):
+        """시도/시군구가 바뀔 때마다 호출된다 - 새 (시도, 시군구) 조합이면
+        보조 역/상권·세부업종 데이터를 다시 로드하고 전체 선택으로
+        초기화한다(요구사항: 새로 선택된 지역은 전체 선택). 팝업이 열려
+        있으면 내용도 다시 그린다."""
+        self._ensure_subdivision_data_loaded()
         self._render_subregion_selection_if_popup_open()
         self._refresh_subdivision_view()
 
-    def _on_district_toggle(self, district: str):
-        """구 체크박스를 눌렀을 때: 새로 체크된 구면 세부구역 데이터를 로드하고
-        (전체 선택으로 초기화), 세부구역 화면/요약/예상 쿼리 수를 갱신한다.
-        체크 해제된 구는 region_selection_vars에서 지우지 않는다 - 다시
-        체크하면 이전 선택 상태가 그대로 남아 있어야 하기 때문이다.
-        """
-        var = self.selected_district_vars.get(district)
-        if var is not None and var.get():
-            self._ensure_subregion_data_loaded(district)
-        self._render_subregion_selection_if_popup_open()
-        self._update_district_summary()
-        self._refresh_subdivision_view()
-
-    def _ensure_subregion_data_loaded(self, district: str):
-        """이 구의 법정동/역상권 데이터가 아직 로드되지 않았으면 지금 로드하고
-        전체 선택 상태로 초기화한다(요구사항: 새로 선택된 구는 전체 선택)."""
-        if district in self._subdivision_layers:
+    def _ensure_subdivision_data_loaded(self):
+        """현재 시도/시군구의 역/상권·세부업종 보조 데이터가 아직 로드되지
+        않았으면 지금 로드한다(데이터 없는 지역은 오류 없이 빈 목록)."""
+        sido = self.legal_dong_sido_var.get()
+        sigungu = self._current_legal_dong_sigungu()
+        key = (sido, sigungu)
+        if key == self._subdivision_loaded_key:
             return
-        city = self.selected_city_var.get()
-        layers = load_region_layers(REGIONS_SAMPLE_PATH, city, district)
-        self._subdivision_layers[district] = layers
-        self.region_selection_vars[district] = {
-            "legal_dongs": {name: ctk.BooleanVar(value=True) for name in layers.get("legal_dongs", [])},
+        layers = load_region_layers(REGIONS_SAMPLE_PATH, sido, sigungu)
+        self._subdivision_layers = layers
+        self.region_selection_vars = {
             "landmarks": {name: ctk.BooleanVar(value=True) for name in layers.get("landmarks", [])},
+            "subcategory_keywords": {name: ctk.BooleanVar(value=True) for name in layers.get("subcategory_keywords", [])},
         }
+        self._subdivision_loaded_key = key
 
     def _is_subregion_popup_open(self) -> bool:
         popup = self._subregion_popup
         return popup is not None and popup.winfo_exists()
 
     def _open_subregion_popup(self):
-        """"수집할 동/상권 설정" 버튼 클릭 시 팝업(Toplevel)을 연다.
+        """"역·상권/세부업종 설정" 버튼 클릭 시 팝업(Toplevel)을 연다.
 
         이미 열려 있으면 새로 만들지 않고 기존 창을 앞으로 가져온다(중복
         생성/상태 꼬임 방지). 팝업 안의 체크박스는 region_selection_vars의
@@ -838,9 +1054,9 @@ class SalesDbCrawlerApp(ctk.CTk):
             return
 
         popup = ctk.CTkToplevel(self)
-        popup.title("수집할 동/상권 설정")
-        popup.geometry("560x620")
-        popup.minsize(480, 420)
+        popup.title("역·상권/세부업종 설정")
+        popup.geometry("480x560")
+        popup.minsize(400, 420)
         popup.transient(self)
         popup.grab_set()
         popup.grid_rowconfigure(0, weight=1)
@@ -865,8 +1081,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
     def _close_subregion_popup(self):
         """팝업의 적용/닫기/창 닫기(X) 공통 처리 - 상태는 이미 실시간 반영되어
-        있으므로, 메인 화면 요약(선택 구 수/예상 쿼리 수)만 다시 계산하고
-        팝업을 정리한다."""
+        있으므로, 메인 화면 요약만 다시 계산하고 팝업을 정리한다."""
         self._update_subdivision_summary()
         popup = self._subregion_popup
         self._subregion_popup = None
@@ -880,7 +1095,7 @@ class SalesDbCrawlerApp(ctk.CTk):
 
     def _render_subregion_selection_if_popup_open(self):
         """팝업이 열려 있을 때만 내용을 다시 그린다(닫혀 있으면 그릴 대상이
-        없으므로 스킵) - 지역/구 선택이 바뀔 때마다 호출된다."""
+        없으므로 스킵) - 시도/시군구 선택이 바뀔 때마다 호출된다."""
         if self._is_subregion_popup_open():
             self._render_subregion_selection()
 
@@ -906,138 +1121,112 @@ class SalesDbCrawlerApp(ctk.CTk):
         return row
 
     def _render_subregion_selection(self):
-        """팝업 컨테이너에 선택된 구마다 법정동/역상권 체크박스(데이터 있음)
-        또는 "준비 중" 안내(데이터 없음)를 순서대로 그린다. 전체 선택/해제
-        버튼은 팝업 하단에 한 번만 있으므로 여기서는 그리지 않는다."""
+        """팝업 컨테이너에 현재 시도/시군구의 역/상권·세부업종 체크박스
+        (데이터 있음) 또는 "준비 중" 안내(데이터 없음)를 그린다. 전체 선택/
+        해제 버튼은 팝업 하단에 한 번만 있으므로 여기서는 그리지 않는다."""
         if not self._is_subregion_popup_open():
             return
         container = self._subregion_popup_container
         for child in container.winfo_children():
             child.destroy()
 
+        landmark_vars = self.region_selection_vars.get("landmarks", {})
+        subcategory_vars = self.region_selection_vars.get("subcategory_keywords", {})
+
         row = 0
-        for district in self.get_selected_districts():
-            legal_vars = self.region_selection_vars.get(district, {}).get("legal_dongs", {})
-            landmark_vars = self.region_selection_vars.get(district, {}).get("landmarks", {})
-
+        if not landmark_vars and not subcategory_vars:
+            sido = self.legal_dong_sido_var.get()
+            sigungu = self._current_legal_dong_sigungu()
+            region_desc = f"{sido} {sigungu}".strip() if sigungu else sido
             ctk.CTkLabel(
-                container, text=district, anchor="w",
-                font=ctk.CTkFont(size=13, weight="bold"),
-            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 2))
+                container,
+                text=f"이 지역의 보조 검색 데이터는 아직 준비 중입니다.\n공식 법정동 검색({region_desc})은 정상 동작합니다.",
+                justify="left", anchor="w", text_color="gray",
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            return
+
+        if landmark_vars:
+            ctk.CTkLabel(
+                container, text="역/상권", anchor="w",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 2))
             row += 1
+            row = self._build_subregion_checkbox_grid(container, landmark_vars, row)
 
-            if not legal_vars and not landmark_vars:
-                ctk.CTkLabel(
-                    container,
-                    text=f"이 지역의 세부구역 데이터는 아직 준비 중입니다.\n현재는 {district} 기준으로 수집합니다.",
-                    justify="left", anchor="w", text_color="gray",
-                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
-                row += 1
-                continue
-
-            if legal_vars:
-                ctk.CTkLabel(
-                    container, text="법정동", anchor="w",
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 2))
-                row += 1
-                row = self._build_subregion_checkbox_grid(container, legal_vars, row)
-
-            if landmark_vars:
-                ctk.CTkLabel(
-                    container, text="역/상권", anchor="w",
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 2))
-                row += 1
-                row = self._build_subregion_checkbox_grid(container, landmark_vars, row)
-
-        if not self.get_selected_districts():
-            ctk.CTkLabel(container, text="선택된 구가 없습니다.", text_color="gray").grid(row=0, column=0, sticky="w")
+        if subcategory_vars:
+            ctk.CTkLabel(
+                container, text="세부업종", anchor="w",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 2))
+            row += 1
+            row = self._build_subregion_checkbox_grid(container, subcategory_vars, row)
 
     def _set_all_subregions(self, select: bool):
-        # 요구사항: 전체 선택/해제는 "현재 선택된 모든 구"의 법정동/역상권에
-        # 적용한다. 선택 해제된 구의 캐시된 상태까지 건드려도 무해하다(그
-        # 구가 다시 체크되기 전까지는 쿼리 생성에 영향이 없으므로).
-        for district_vars in self.region_selection_vars.values():
-            for group in district_vars.values():
-                for var in group.values():
-                    var.set(select)
+        for group in self.region_selection_vars.values():
+            for var in group.values():
+                var.set(select)
         self._update_subdivision_summary()
 
     def get_selected_subregions(self) -> dict:
-        """선택된 구별로 현재 체크된 법정동/역상권 이름 목록을 반환한다.
-
-        반환: {구이름: {"legal_dongs": [...], "landmarks": [...]}, ...}
-        (선택된 구 중 세부구역 데이터가 로드된 구만 키가 생긴다). 실제 수집
-        쿼리 반영은 _build_collection_queries()가 이 값을 읽어 처리한다.
-        """
-        result = {}
-        for district in self.get_selected_districts():
-            district_vars = self.region_selection_vars.get(district, {})
-            result[district] = {
-                "legal_dongs": [name for name, var in district_vars.get("legal_dongs", {}).items() if var.get()],
-                "landmarks": [name for name, var in district_vars.get("landmarks", {}).items() if var.get()],
-            }
-        return result
+        """현재 시도/시군구 기준으로 체크된 역/상권·세부업종 이름 목록을
+        반환한다. 실제 수집 쿼리 반영은 _build_collection_queries()가
+        build_auxiliary_query_plan을 통해 처리한다."""
+        return {
+            "landmarks": [name for name, var in self.region_selection_vars.get("landmarks", {}).items() if var.get()],
+            "subcategory_keywords": [
+                name for name, var in self.region_selection_vars.get("subcategory_keywords", {}).items() if var.get()
+            ],
+        }
 
     def _build_collection_queries(self) -> list[dict]:
-        """현재 UI 선택 상태(시/도 + 선택된 구들 + 세부구역 + 키워드)로 실제
-        수집 쿼리 목록을 만든다. 계산 자체는 Tk와 무관한 순수 함수
-        build_collection_queries에 위임한다(그래야 Tk 없이 단위 테스트할 수
-        있다). 자동 세분화가 꺼져 있으면 데이터가 있는 구도 구 기준
-        fallback으로만 처리한다.
-        """
-        city = self.selected_city_var.get()
+        """공식 법정동 선택(§1)과 보조 역/상권·세부업종 선택(§2)을 합쳐 최종
+        검색 조합을 만든다(LEGALDONG-UI-2). 계산 자체는 Tk와 무관한 순수
+        함수(build_legal_dong_query_plan/build_auxiliary_query_plan)에
+        위임한다. 기본모드/홈페이지·SNS 모드(§_start_network_crawl/
+        _start_legacy_crawl) 둘 다 이 메서드 하나만 거치므로 자동으로 동일한
+        검색계획을 사용하게 된다."""
         keyword = self.keyword_input_var.get().strip()
         if not keyword:
             return []
 
-        selected_subregions = self.get_selected_subregions()
-        auto_subdivide = self.auto_subdivide_var.get()
+        per_query_limit = _parse_positive_int(self.limit_var.get(), max_value=300) or 0
+        sido = self.legal_dong_sido_var.get()
+        sigungu = self._current_legal_dong_sigungu()
 
-        district_selections = []
-        for district in self.get_selected_districts():
-            layers = self._subdivision_layers.get(district, {})
-            has_data = auto_subdivide and bool(layers.get("legal_dongs") or layers.get("landmarks"))
-            subregions: list[str] = []
-            legal_dongs: list[str] = []
-            landmarks: list[str] = []
-            if has_data:
-                entry = selected_subregions.get(district, {"legal_dongs": [], "landmarks": []})
-                legal_dongs = entry["legal_dongs"]
-                landmarks = entry["landmarks"]
-                subregions = legal_dongs + landmarks
-            district_selections.append({
-                "district": district,
-                "has_subregion_data": has_data,
-                "selected_subregions": subregions,
-                "legal_dongs": legal_dongs,
-                "landmarks": landmarks,
-            })
-        return build_collection_queries(city, district_selections, keyword)
+        jobs = build_legal_dong_query_plan(sido, sigungu, self.get_selected_legal_dongs(), keyword, per_query_limit)
+
+        if self.auto_subdivide_var.get():
+            subregions = self.get_selected_subregions()
+            jobs = jobs + build_auxiliary_query_plan(
+                sido, sigungu, subregions["landmarks"], subregions["subcategory_keywords"], keyword, per_query_limit,
+            )
+
+        seen_queries: set = set()
+        deduped: list[dict] = []
+        for job in jobs:
+            if job["query"] in seen_queries:
+                continue
+            seen_queries.add(job["query"])
+            deduped.append(job)
+        return deduped
 
     def _estimate_query_count(self) -> int:
         return len(self._build_collection_queries())
 
     def _update_subdivision_summary(self):
-        selected_districts = self.get_selected_districts()
-        if not selected_districts:
-            self.subdivision_summary_var.set("선택된 구가 없습니다.")
-            return
-        query_count = self._estimate_query_count()
-        self.subdivision_summary_var.set(f"선택된 구: {len(selected_districts)}개\n예상 수집 쿼리: {query_count}개")
+        subregions = self.get_selected_subregions()
+        total = len(subregions["landmarks"]) + len(subregions["subcategory_keywords"])
+        if total == 0:
+            self.subdivision_summary_var.set("선택된 보조 검색 항목이 없습니다.")
+        else:
+            self.subdivision_summary_var.set(f"선택된 보조 검색 항목: {total}개")
+        self._recalculate_target_count()
 
     def _refresh_subdivision_view(self):
-        """자동 세분화 on/off에 따라 "수집할 동/상권 설정" 버튼 표시 여부만
-        갱신한다(선택 상태 자체는 건드리지 않음 - 그건
-        _ensure_subregion_data_loaded/_set_all_subregions 몫). 요약 문구(선택
-        구 수 + 예상 쿼리 수)는 자동 세분화 여부와 무관하게 항상 갱신한다.
-        데이터 없는 구만 선택된 경우에도 팝업에서 "준비 중" 안내를 보여줘야
-        하므로, 버튼은 선택된 구가 있으면 항상 표시한다(데이터 유무로
-        숨기지 않음 - UI-CLEANUP-1C까지는 데이터 없으면 버튼 자체를 숨겼지만,
-        여러 구 중 일부만 데이터가 없는 경우를 다루기 어려워 팝업 분리와
-        함께 정리했다)."""
-        if not self.auto_subdivide_var.get() or not self.get_selected_districts():
+        """"역·상권/세부업종 보조 검색 포함" on/off에 따라 팝업 버튼 표시만
+        갱신한다(선택 상태 자체는 건드리지 않음). 데이터 없는 지역에서도
+        팝업에서 "준비 중" 안내를 보여줘야 하므로 버튼은 항상 표시한다."""
+        if not self.auto_subdivide_var.get():
             self.subregion_popup_button.grid_remove()
         else:
             self.subregion_popup_button.grid()
@@ -1069,6 +1258,11 @@ class SalesDbCrawlerApp(ctk.CTk):
         # normal로 복구되어도 다시 활성화되지 않도록 항상 disabled를 유지한다.
         if hasattr(self, "new_open_checkbox"):
             self.new_open_checkbox.configure(state="disabled")
+        # LEGALDONG-UI-2: 전체 목표 저장 개수는 항상 자동 계산·읽기 전용이므로
+        # (§_build_global_target_count_section) 좌측 패널이 normal로 복구되어도
+        # 다시 입력 가능해지지 않도록 항상 disabled를 유지한다.
+        if hasattr(self, "target_count_entry"):
+            self.target_count_entry.configure(state="disabled")
 
     def _iter_children(self, parent):
         for child in parent.winfo_children():
@@ -1249,8 +1443,8 @@ class SalesDbCrawlerApp(ctk.CTk):
         review_min_raw = self.review_min_var.get().strip()
         review_max_raw = self.review_max_var.get().strip()
 
-        if not self.get_selected_districts():
-            self.log("[ui] 실패: 구를 1개 이상 선택하세요")
+        if not self.legal_dong_sido_var.get():
+            self.log("[ui] 실패: 지역 데이터를 불러오지 못해 지역을 선택할 수 없습니다")
             return
 
         # 다중 키워드 UI를 제거한 대신, 다중 키워드로 보이는 입력은 수집 시작
@@ -1283,14 +1477,12 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.log("[ui] 실패: 저장 경로가 비어 있습니다")
             return
 
-        # 선택된 구/세부구역 상태를 실제 쿼리로 변환한다(§_build_collection_queries).
-        # 세부구역 데이터가 있는 구에서 법정동/역상권을 전부 해제했거나, 선택된
-        # 구/세부구역이 전혀 없으면 쿼리가 0개가 되므로 여기서 차단한다.
+        # 선택된 지역 상태를 실제 쿼리로 변환한다(§_build_collection_queries).
         query_queue = self._build_collection_queries()
         if not query_queue:
-            message = "수집할 지역 또는 동/상권이 선택되지 않았습니다.\n최소 1개 이상의 구 또는 세부구역을 선택해주세요."
+            message = "수집할 지역이 선택되지 않았습니다.\n시도/시군구를 확인해주세요."
             self.log(f"[ui] 실패: {message}")
-            self.show_error("지역/세부구역 선택 오류", message)
+            self.show_error("지역 선택 오류", message)
             return
 
         first_job = query_queue[0]
@@ -1308,7 +1500,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.last_output_path = output_path
 
         self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
-        self.log(f"[ui] 선택 구={', '.join(self.get_selected_districts())}")
+        self.log(f"[ui] 선택 지역={self._current_region_description()}")
         self.log(f"[ui] 키워드={keyword}")
         self.log(f"[ui] 목표 수집 개수={limit}(검색 조합 1개당 상한, 쿼리 {len(query_queue)}개)")
         self.log(f"[ui] 저장 경로={output_path}")
@@ -1335,8 +1527,17 @@ class SalesDbCrawlerApp(ctk.CTk):
         raw_keyword = self.keyword_input_var.get()
         output_path = self.output_path_var.get().strip()
 
-        if not self.get_selected_districts():
-            self.log("[ui] 실패: 구를 1개 이상 선택하세요")
+        if not self.legal_dong_sido_var.get():
+            message = "지역 데이터를 불러오지 못해 지역을 선택할 수 없습니다."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("지역 선택 오류", message)
+            return
+
+        sido = self.legal_dong_sido_var.get()
+        if self._legal_dong_loader.list_sigungus(sido) and self.legal_dong_sigungu_var.get() == _LEGAL_DONG_NO_SIGUNGU:
+            message = "법정동을 선택하려면 먼저 시군구를 선택하세요."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("시군구 선택 오류", message)
             return
 
         keyword_error = self._validate_single_keyword(raw_keyword)
@@ -1357,23 +1558,28 @@ class SalesDbCrawlerApp(ctk.CTk):
             self.show_error("검색 조합당 수집 상한 오류", message)
             return
 
-        target_count = _parse_positive_int(self.target_count_var.get())
-        if target_count is None:
-            message = "전체 목표 저장 개수는 1 이상의 정수로 입력해 주세요."
-            self.log(f"[ui] 실패: {message}")
-            self.show_error("전체 목표 저장 개수 오류", message)
-            return
-
         if not output_path:
             self.log("[ui] 실패: 저장 경로가 비어 있습니다")
             return
 
         query_queue = self._build_collection_queries()
         if not query_queue:
-            message = "수집할 지역 또는 동/상권이 선택되지 않았습니다.\n최소 1개 이상의 구 또는 세부구역을 선택해주세요."
+            message = "수집할 지역 또는 보조 검색 항목이 선택되지 않았습니다.\n법정동 선택 또는 보조 검색 항목을 확인해주세요."
             self.log(f"[ui] 실패: {message}")
-            self.show_error("지역/세부구역 선택 오류", message)
+            self.show_error("지역 선택 오류", message)
             return
+
+        # LEGALDONG-UI-2: 전체 목표 저장 개수는 항상 자동 계산이다(§5) - 화면
+        # 표시값(target_count_var)이 아니라 방금 만든 query_queue 길이로 다시
+        # 계산해 검증한다(§_recalculate_target_count가 갱신한 표시값과 이 값이
+        # 다를 이유는 없지만, 시작 시점 계산을 신뢰의 근거로 삼는다).
+        target_count = calculate_legal_dong_target_count(per_query_limit, len(query_queue))
+        if target_count <= 0:
+            message = "전체 목표 저장 개수를 계산할 수 없습니다. 검색 조합당 수집 상한을 확인하세요."
+            self.log(f"[ui] 실패: {message}")
+            self.show_error("전체 목표 저장 개수 오류", message)
+            return
+        self.target_count_var.set(str(target_count))
 
         # 새로오픈 필터는 Network 기본 경로에서 신뢰성 있게 지원되지 않으므로
         # (§_build_filter_section) 체크박스 상태와 무관하게 항상 False로
@@ -1401,9 +1607,9 @@ class SalesDbCrawlerApp(ctk.CTk):
         collection_mode = self.collection_mode_var.get()
 
         self.log(f"[ui] Queue 생성 완료: {len(query_queue)}건")
-        self.log(f"[ui] 선택 구={', '.join(self.get_selected_districts())}")
+        self.log(f"[ui] 선택 지역={self._current_region_description()}")
         self.log(f"[ui] 키워드={keyword}")
-        self.log(f"[ui] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수={target_count}")
+        self.log(f"[ui] 검색 조합당 수집 상한={per_query_limit}, 전체 목표 저장 개수(자동 계산)={target_count}")
         self.log(f"[ui] 저장 경로={saved_output_path}")
         self.log(f"[ui] 수집 모드={collection_mode}")
 

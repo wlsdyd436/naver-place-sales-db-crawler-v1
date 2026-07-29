@@ -46,6 +46,13 @@ from src.pc.detail_scraper import (
     _extract_entry_sns,
     _title_matches,
 )
+from src.pc.naver_region_policy import (
+    OFFICIAL_EXACT,
+    OUT_OF_SCOPE,
+    PROVIDER_ALIAS_EXACT,
+    REGION_UNVERIFIED,
+    classify_region_match,
+)
 from src.pc.network_list_scraper import (
     GlobalPlaceAccumulator,
     _extract_list_items,
@@ -3018,6 +3025,53 @@ def _wait_for_apollo_list_ready(page, frame, expected_query: str, expected_start
         elapsed_ms += _POLL_INTERVAL_MS
 
 
+_REGION_REJECTION_REASON = {
+    OUT_OF_SCOPE: "선택 법정동/시군구 범위를 벗어난 주소",
+    REGION_UNVERIFIED: "주소로 공식 지역과의 일치를 확인할 수 없음(주소 공란 또는 인식되지 않은 시도 표기)",
+}
+
+
+def _split_region_valid_rows(rows: list, job: dict) -> tuple:
+    """법정동이 선택된 Query(source_layer="legal_dong")에만 지역 Exact
+    필터(naver_region_policy.classify_region_match)를 적용해 (유효 rows,
+    거부 진단 목록)을 반환한다. 시군구 단위 검색(법정동 미선택)/보조
+    역·상권·세부업종 Query는 비교할 특정 법정동이 없으므로 필터를 적용하지
+    않고 그대로 통과시킨다(기존 동작 유지) - §4 요구사항이 "법정동 Query"로
+    범위를 한정하고 있기 때문이다.
+
+    이 필터는 per_query_limit 도달 판정보다 앞에서 호출돼야 한다(호출자가
+    이 함수의 반환값 중 valid_rows만 unique_rows에 누적하고 카운트한다) -
+    OUT_OF_SCOPE/REGION_UNVERIFIED row가 상한을 소비하면 안 된다는 요구사항을
+    만족한다."""
+    if job.get("source_layer") != "legal_dong" or not job.get("source_subregion"):
+        return rows, []
+
+    expected_sido = job.get("source_city") or ""
+    expected_sigungu = job.get("source_district") or ""
+    expected_dong = job.get("source_subregion") or ""
+
+    valid_rows = []
+    rejected = []
+    for row in rows:
+        address = row.get("주소") or row.get("roadAddress") or ""
+        classification = classify_region_match(address, expected_sido, expected_sigungu, expected_dong)
+        if classification in (OFFICIAL_EXACT, PROVIDER_ALIAS_EXACT):
+            valid_rows.append(row)
+        else:
+            rejected.append({
+                "source_query": row.get("source_query"),
+                "업체명": row.get("업체명"),
+                "place_id": row.get("place_id"),
+                "판정_상태": classification,
+                "거부_이유": _REGION_REJECTION_REASON.get(classification, classification),
+                "주소": address,
+                "기대_시도": expected_sido,
+                "기대_시군구": expected_sigungu,
+                "기대_법정동": expected_dong,
+            })
+    return valid_rows, rejected
+
+
 def collect_apollo_first_list_query(page, job, target_count, *, collected_at, max_pages: int = 5) -> dict:
     """신규 Apollo/GraphQL-first 목록 수집. 1페이지는 메인 placeList(...)
     operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
@@ -3065,6 +3119,7 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             "navigation_error_message": message,
             "page_count": 0,
             "pagination_stop_reason": None,
+            "rejected_rows": [],
         }
 
     try:
@@ -3095,6 +3150,7 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
 
         local_seen: set = set()
         unique_rows = dedup_rows(mapped_rows, local_seen)
+        unique_rows, rejected_rows = _split_region_valid_rows(unique_rows, job)
 
         def _ensure_parsed_simple(index: int) -> dict:
             """collect_network_query의 _ensure_parsed와 달리 candidate당 재확인
@@ -3211,7 +3267,9 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
                     page_mapped_rows.append(row)
 
                 newly_unique = dedup_rows(page_mapped_rows, local_seen)
-                unique_rows.extend(newly_unique)
+                newly_valid, newly_rejected = _split_region_valid_rows(newly_unique, job)
+                unique_rows.extend(newly_valid)
+                rejected_rows.extend(newly_rejected)
                 current_page_number = target_page_number
 
                 if target_count and len(unique_rows) >= target_count:
@@ -3242,6 +3300,7 @@ def collect_apollo_first_list_query(page, job, target_count, *, collected_at, ma
             "navigation_error_message": "",
             "page_count": current_page_number,
             "pagination_stop_reason": pagination_stop_reason,
+            "rejected_rows": rejected_rows,
         }
     finally:
         for event, event_handler in (

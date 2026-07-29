@@ -589,6 +589,144 @@ def check_collector_closes_page_even_when_collect_raises(reporter: ValidationRep
         reporter.fail(f"13. 예외 시 page close 보장 실패: raised={raised}, pages={context.pages_created}")
 
 
+# --------------------------------------------------------------------------
+# 지역 Exact 필터(§4/§5, naver_region_policy 배선) - 2026-07-29 Live 감사에서
+# 실측된 전남광주통합특별시 서구 치평동 시나리오(치평동 6건 + 쌍촌동/마륵동
+# 4건)를 그대로 재현한다. JOB(위)은 source_layer="district"라 이 필터가
+# 적용되지 않으므로, 법정동이 선택된 별도 JOB을 이 섹션 전용으로 둔다.
+# --------------------------------------------------------------------------
+CHIPYEONGDONG_JOB = {
+    "region": "전남광주통합특별시 서구 치평동",
+    "keyword": "카페",
+    "query": "전남광주통합특별시 서구 치평동 카페",
+    "source_city": "전남광주통합특별시",
+    "source_district": "서구",
+    "source_subregion": "치평동",
+    "source_layer": "legal_dong",
+    "legal_code": "1224012000",
+}
+
+
+def _item_entity_with_address(place_id: str, name: str, road_address: str) -> dict:
+    return {
+        "id": place_id,
+        "name": name,
+        "category": "카페",
+        "visitorReviewsTotal": 10,
+        "cafeBlogReviewsTotal": 5,
+        "roadAddress": road_address,
+        "phone": "02-000-0000",
+    }
+
+
+def _apollo_state_with_addresses(query: str, items_with_address, start: int = 0) -> dict:
+    ref_key_of = lambda pid: f"PlaceListBusinessesItem:{pid}:{pid}"
+    state = {
+        ref_key_of(pid): _item_entity_with_address(pid, name, addr)
+        for pid, name, addr in items_with_address
+    }
+    state["ROOT_QUERY"] = {
+        _op_key({"query": query, "start": start, "display": 70}): {
+            "businesses": {"items": [{"__ref": ref_key_of(pid)} for pid, _, _ in items_with_address]}
+        },
+    }
+    return state
+
+
+_PAGE1_MIXED_ITEMS = [
+    ("1", "교집합", "전남광주 서구 쌍촌동 운천로172번길 10 2층"),
+    ("2", "우트롱", "전남광주 서구 치평동 운천로 261 어반피크 상무 2층 220호"),
+    ("3", "존제의존재", "전남광주 서구 마륵동 상무누리로 5 1층"),
+    ("4", "쏘쏘사라다", "전남광주 서구 치평동 치평로 76 1층"),
+    ("5", "머든 상무점", "전남광주 서구 치평동 상무중앙로34번길 6 1층"),
+    ("6", "부부더상록", "전남광주 서구 치평동 상무중앙로78번길 5-6 102호"),
+    ("7", "녹음", "전남광주 서구 쌍촌동 월드컵4강로181번길 34 1층"),
+    ("8", "화이트리에", "전남광주 서구 치평동 치평로 106 1층"),
+    ("9", "퍼니스", "전남광주 서구 치평동 천변좌하로 192"),
+    ("10", "무난", "전남광주 서구 쌍촌동 상무대로902번길 3 1층"),
+]  # 치평동(유효) 6건: 2/4/5/6/8/9, 쌍촌동/마륵동(제외) 4건: 1/3/7/10
+
+
+def check_region_filter_excludes_rows_and_does_not_consume_limit(reporter: ValidationReporter) -> None:
+    """15. 제외 row(쌍촌동/마륵동)가 per_query_limit을 소비하지 않는다 - 다음
+    페이지가 없어 소진되는 상황에서, 유효 6건만 rows에 남고 4건은
+    rejected_rows로 분리 보존되며(주소 원문 포함, Cookie/Authorization/
+    서비스키/응답 원문은 없음) per_query_limit=10에 못 미쳐도(6<10) 조기에
+    "충분하다"고 잘못 판단하지 않는다(제외 row가 상한을 채우지 못함)."""
+    state = _apollo_state_with_addresses(CHIPYEONGDONG_JOB["query"], _PAGE1_MIXED_ITEMS)
+    page = FakeApolloPage([_apollo_state_result(state)])  # click_plan 없음 -> 다음 페이지 없음
+    result = collect_apollo_first_list_query(page, CHIPYEONGDONG_JOB, 10, collected_at="2026-07-29")
+
+    valid_addresses = [row["주소"] for row in result["rows"]]
+    rejected = result["rejected_rows"]
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 6
+        and all("치평동" in addr for addr in valid_addresses)
+        and len(rejected) == 4
+        and all(r["판정_상태"] == "OUT_OF_SCOPE" for r in rejected)
+        and all("쌍촌동" in r["주소"] or "마륵동" in r["주소"] for r in rejected)
+        and all(r["기대_법정동"] == "치평동" for r in rejected)
+        and result["pagination_stop_reason"] == "pagination_exhausted"
+    )
+    if ok:
+        reporter.pass_("15. 지역 필터 제외 row는 per_query_limit을 소비하지 않고 rejected_rows로 분리 보존됨")
+    else:
+        reporter.fail(f"15. 지역 필터 제외 케이스 실패: rows={result['rows']}, rejected={rejected}, stop={result.get('pagination_stop_reason')}")
+
+
+def check_region_filter_backfills_valid_rows_from_next_page(reporter: ValidationReporter) -> None:
+    """16. 1페이지에서 유효 6건만 확보되면(목표 10건 미달) 다음 페이지로
+    이동해 유효 법정동 row로 보충하고, 목표(10건)에 도달하면 그때 멈춘다."""
+    state = _apollo_state_with_addresses(CHIPYEONGDONG_JOB["query"], _PAGE1_MIXED_ITEMS)
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+    page2_items = [
+        ("11", "치평동카페11", "전남광주 서구 치평동 치평로 200"),
+        ("12", "치평동카페12", "전남광주 서구 치평동 치평로 210"),
+        ("13", "치평동카페13", "전남광주 서구 치평동 치평로 220"),
+        ("14", "치평동카페14", "전남광주 서구 치평동 치평로 230"),
+    ]
+
+    original_get_by_role = page._frame.get_by_role
+
+    def _patched_get_by_role(role, name=None, exact=None):
+        locator = original_get_by_role(role, name=name, exact=exact)
+        if name == "2":
+            original_locator_click = locator.click
+
+            def _click_and_schedule():
+                original_locator_click()
+                body = json.dumps({
+                    "result": {"place": {"list": [
+                        {"id": pid, "name": name_, "roadAddress": addr}
+                        for pid, name_, addr in page2_items
+                    ]}}
+                }).encode("utf-8")
+                page.schedule_after_click(FakeResponse(CANDIDATE_URL, 200, "xhr", body=body))
+
+            locator.click = _click_and_schedule
+        return locator
+
+    page._frame.get_by_role = _patched_get_by_role
+    result = collect_apollo_first_list_query(page, CHIPYEONGDONG_JOB, 10, collected_at="2026-07-29")
+
+    ok = (
+        result["navigation_error"] is False
+        and len(result["rows"]) == 10
+        and all("치평동" in row["주소"] for row in result["rows"])
+        and len(result["rejected_rows"]) == 4
+        and result["pagination_stop_reason"] == "per_query_limit_reached"
+        and result["page_count"] == 2
+    )
+    if ok:
+        reporter.pass_("16. 1페이지 유효 6건 부족분을 2페이지 유효 법정동 row로 보충해 목표(10건) 도달")
+    else:
+        reporter.fail(f"16. 다음 페이지 보충 케이스 실패: rows={len(result['rows'])}, stop={result.get('pagination_stop_reason')}, page_count={result.get('page_count')}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -605,6 +743,8 @@ def main() -> bool:
         check_capture_session_cookies_returns_empty_on_exception,
         check_collector_opens_and_closes_one_page_per_query,
         check_collector_closes_page_even_when_collect_raises,
+        check_region_filter_excludes_rows_and_does_not_consume_limit,
+        check_region_filter_backfills_valid_rows_from_next_page,
     ]
     for check in checks:
         check(reporter)
