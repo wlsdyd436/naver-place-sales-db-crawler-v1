@@ -336,3 +336,25 @@ build.bat
 - **실패 진단 기록**: 모든 시도(1차+재시도)와 최종 실패 업체(업체명/place_id/HTTP/실패 사유/재시도 여부)를 `logs/diagnostics/home_enrichment_<실행시각>.json`에 저장합니다. 쿠키/Authorization/토큰/요청 헤더 원문/HTML 원문/Apollo State 원문은 저장하지 않습니다.
 - **진행 표시**: 목록 수집 진행률과는 별도로 "홈페이지/SNS 정보 수집 중 현재/전체(성공/실패)" 화면 상태 문구로 안내합니다.
 - 기존 카드 클릭 기반 상세 수집(`src/pc/detail_scraper.py`)은 삭제되지 않았으며 legacy 롤백 경로로 그대로 보존되어 있으나, 현재 홈페이지·SNS 보강 경로에서는 사용하지 않습니다.
+
+---
+
+## 10. 법정동 공식 데이터 갱신(개발자용, `scripts/update_legal_dong_snapshot.py`)
+
+**평소 프로그램(`app.py`) 실행은 행안부 API를 전혀 호출하지 않습니다.** 최종 사용자는 API 키가 필요 없으며, 이 스크립트는 개발자가 공식 법정동 데이터를 미리 갱신해두는 별도 도구입니다. 프로그램은 이 도구가 만든 로컬 Snapshot 파일을 사용하도록 연결될 예정이며(§8/§9의 UI 목록·보강 로직과는 아직 연결되지 않은 다음 단계 작업입니다), 현재 화면에서 전국 법정동을 선택하는 기능은 없습니다.
+
+- **개발자용 환경변수**: `.env`에 `DATA_GO_KR_SERVICE_KEY=<공공데이터포털에서 발급받은 키>`를 설정해야 합니다(`.env.example` 참고). 키가 없으면 스크립트는 네트워크 호출 없이 안내만 출력하고 종료합니다.
+- **Dry Run(기본, snapshot 미변경)**:
+  ```powershell
+  .venv\Scripts\python.exe scripts\update_legal_dong_snapshot.py
+  ```
+  행안부 API를 조회해 현재 `data/legal_dong_snapshot.json`과 비교한 변경 보고서만 만들고, 기존 Snapshot 파일은 수정하지 않습니다.
+- **Apply(검증된 결과로 Snapshot 교체)**:
+  ```powershell
+  .venv\Scripts\python.exe scripts\update_legal_dong_snapshot.py --apply
+  ```
+  검증을 통과한 경우에만 원자적으로 Snapshot을 교체합니다(기존 파일이 있으면 먼저 백업). Dry Run과 달리 실제로 파일을 씁니다.
+- **Snapshot 경로**: `data/legal_dong_snapshot.json`
+- **변경 보고서 경로**: `logs/diagnostics/legal_dong_snapshot_update_<실행시각>.json`(신규/명칭변경/삭제후보 요약만 포함, 인증키·전체 요청 URL은 저장하지 않음)
+- **서비스키를 Git에 올리지 마세요** - `.env`는 `.gitignore`에 포함되어 있으며, `.env.example`에는 실제 키 값을 채우지 않습니다.
+- 행안부 공식 데이터가 실제로 변경되면 Dry Run 보고서의 신규/명칭변경/삭제후보 내역을 검토한 뒤에만 `--apply`로 반영하세요 - 삭제후보(REMOVED_CANDIDATE)는 자동으로 삭제되거나 비활성 처리되지 않습니다.

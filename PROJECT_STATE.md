@@ -8046,3 +8046,193 @@ booking/order/talktalk 도메인 제외, 대표 3링크 외 채널(카카오채�
 파일: 루트 `stage_a.log`, `scratchpad/idle_test.pid`,
 `scratchpad/idle_test_stdout.log`(모두 미추적 파일, git 이력에 영향 없음).
 production 코드(`src/**`)와 테스트(`tests/**`)는 무수정.
+
+---
+
+# 2026-07-28 [LEGALDONG-1] 법정동 공식 데이터 확보 1단계 - 갱신 스크립트(스냅샷 미생성)
+
+## 배경
+법정동 production 통합(전국 법정동 코드 연결, UI 선택, query planner, 목표
+개수 자동계산, 지역 exact 필터)을 위해 먼저 공식 원본(행정안전부 법정동
+코드)을 자동으로 확보할 수 있는지 확인했다(기준 감사:
+`scratchpad/page300_legaldong_1_data_source_query_contract_audit/`).
+
+## 공식 원본 자동 확보 시도 결과
+- **1차 출처** `code.go.kr` 법정동 코드 전체자료: 실제 페이지를 직접 요청해
+  확인한 결과 `func_fullfileDown()` → `gPkiForm`(공동인증서 로그인, action
+  `/usrmng/loginok.do`) 뒤에 있어 자동 다운로드 불가.
+- **2차 출처** `data.go.kr` Open API(15077871): API 키 없이 받을 수 있는
+  파일은 기술문서(.docx)뿐이고, 실제 데이터는 "활용신청" 후 발급되는
+  서비스키가 있어야 API로만 조회 가능. 자동 발급 불가.
+- 결론: 두 출처 모두 사람이 직접 인증서 로그인 또는 API 키 발급 신청을 거쳐야
+  하는 구조라 AI가 자동으로 원본을 확보할 수 없다. 비공식 미러 데이터 사용,
+  강동구 9개 동 샘플 확대, 임의 스냅샷 생성은 전부 하지 않았다.
+
+## 사용자 결정 및 이번 라운드 구현 범위
+사용자가 "공공데이터포털 API + 개발자용 갱신 스크립트" 방식을 지정함 -
+`scripts/update_legal_dong_snapshot.py`를 신규 구현했다(공식 데이터 확보
+1단계). 이번 라운드는 **이 스크립트와 그 fixture 테스트까지만** 구현했고,
+`data/legal_dong_snapshot.json` 실제 생성, loader(`region_data.py` 확장),
+UI 연결, query planner, target 자동계산, 지역 exact 필터는 스냅샷이 없어
+아직 시작하지 않았다(다음 라운드).
+
+## 구현
+- 신규 `scripts/update_legal_dong_snapshot.py`:
+  - `DATA_GO_KR_SERVICE_KEY`를 `.env`에서만 읽음(`python-dotenv`, 이미
+    선언된 의존성 재사용) - 코드/로그/테스트/README 어디에도 키 값을 남기지
+    않음.
+  - 키가 없으면 네트워크 호출 0회, 기존 파일 수정 0건으로 안내만 출력하고
+    종료(기본 실행·`--apply` 둘 다 동일하게 안전).
+  - `fetch_all_records`: data.go.kr `StanReginCd/getStanReginCdList`를
+    `type=json`으로 페이지네이션 조회, 첫 응답 `totalCount` 고정 후 페이지마다
+    재검증, 중복 `region_cd`/HTTP 오류/JSON 파싱 오류/오류 `resultCode`/수량
+    불일치 중 하나라도 있으면 `SnapshotUpdateError`로 중단(snapshot 미수정).
+  - `normalize_records`: 법정리(ri, code[8:10] != "00")는 제외. 시/도·시/군/구
+    이름은 문자열 split이 아니라 **코드 조회**(`sido_seg+"0"*8`,
+    `sido_seg+sgg_seg+"0"*5`)로 얻는다 - "수원시 장안구"처럼 시군구 명칭 자체에
+    공백이 있는 경우도 정확히 처리됨(테스트로 확인). 세종특별자치시처럼
+    시군구 계층이 없는 지역은 `sigungu=""`. `region_cd`는 항상 `zfill(10)`
+    문자열로 보존.
+  - `is_active`는 `locat_rm`에 "폐지" 포함 여부로 판정 - **검증 필요**: 이
+    필드가 실제로 폐지 여부를 담는지는 문서 요약 기준이며, 첫 실제 API
+    응답으로 재확인해야 한다(코드 주석에도 명시).
+  - `abolished_date`/`last_modified_date`는 공식 응답에서 대응 필드를 찾지
+    못해 항상 빈 문자열(임의 추론 금지 원칙 준수).
+  - `build_diff_report`: 기존 snapshot과 비교해 신규/명칭변경/삭제후보
+    (`REMOVED_CANDIDATE`, 즉시 폐지 확정 아님)만 분류 - 보고서는
+    `logs/diagnostics/legal_dong_snapshot_update_<timestamp>.json`에 저장.
+  - `--apply`: 기존 파일이 있으면 `<이름>.backup_<timestamp>.json`으로 백업한
+    뒤에만 교체, 검증 실패 시 백업도 교체도 하지 않음(순서 보장, 테스트로
+    확인).
+- 신규 `tests/test_update_legal_dong_snapshot.py`: fake `fetch_fn` 주입으로
+  22개 시나리오(키 없음/정상 페이지네이션/법정리 제외/코드 기반 시군구
+  조회/세종 예외/폐지 판정/totalCount 불일치/중복 코드/HTTP 오류/JSON 오류/
+  오류 resultCode/diff 3분류/10자리 zfill/기본실행 무수정/--apply 백업+교체/
+  파일 없을 때 백업 생략/검증실패 시 apply여도 무수정) 전부 PASS.
+- `.env.example`에 `DATA_GO_KR_SERVICE_KEY` 안내 주석 추가(빈 값 기본, 런타임
+  앱에는 불필요함을 명시).
+
+## 남은 위험
+1. `is_active`(`locat_rm` "폐지" 포함 여부) 및 날짜 필드 매핑은 실제 API
+   응답을 한 번도 보지 못한 상태에서 문서 요약만으로 작성했다 - 사용자가
+   실제 서비스키를 `.env`에 넣고 처음 실행했을 때 이 매핑이 틀리면 즉시
+   드러나도록(조용히 잘못된 값으로 넘어가지 않도록) 예외 처리는 해뒤었지만,
+   실제 검증은 다음 라운드(Live 실행)에서만 가능하다.
+2. `region_exact_filter_contract.md`(기존 감사)와 이번 라운드가 참조한
+   최초 legaldong 프롬프트 사이에 "천호동=천호1동(행정동) 관용 처리" 여부가
+   충돌한다 - 이번 라운드는 스냅샷/loader/필터를 구현하지 않았으므로 아직
+   결정하지 않았다. 다음 라운드(exact 필터 구현) 전에 확정 필요.
+
+## 남은 작업
+1. 사용자가 `.env`에 `DATA_GO_KR_SERVICE_KEY` 설정 후
+   `update_legal_dong_snapshot.py --apply` 실행 → 실제 전국 `data/legal_dong_snapshot.json` 생성
+2. 실제 응답으로 `is_active`/날짜 필드 매핑 재검증
+3. `src/pc/region_data.py` 확장 또는 신규 loader(snapshot 읽기 전용 서비스)
+4. `src/ui.py` 법정동 UI 연결 + target_count readonly 전환
+5. query planner + target 자동계산(`per_query_limit × query_count`)
+6. 지역 exact 필터(위 §2 미확정 규칙 확정 후 구현)
+7. 기본모드/홈페이지·SNS 모드 동일 지역 계약 연결
+8. README/PROJECT_STATE에 법정동 기능 자체를 사용자 대상으로 문서화(위
+   1~7이 실제로 동작한 뒤에만 - 아직 사용자 체감 기능이 없어 이번 라운드는
+   README 사용자 섹션을 수정하지 않았다)
+
+## 테스트 결과
+`tests/test_update_legal_dong_snapshot.py` 22/22 PASS(exit 0). 전체
+`tests/test_*.py` 40개 파일 중 39개 exit 0, 1개(`test_excel_validation.py`)는
+2026-07-23부터 동일하게 문서화된 기존 환경 의존 실패(무관). `test_final_validation.py`는
+live 브라우저 스모크 테스트라 실행마다 PASS 수가 변동될 수 있음(오늘도
+PASS 8/WARN 5/FAIL 0 - 기존에도 non-deterministic이었음, 이번 변경과 무관).
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 신규 파일: `scripts/update_legal_dong_snapshot.py`,
+`tests/test_update_legal_dong_snapshot.py`. 수정 파일: `.env.example`,
+`PROJECT_STATE.md`(이번 절). 기존 production 코드(`src/**`)와 기존 테스트는
+무수정. 네이버 Live 수집·GraphQL 직접 요청·공식 API 실제 호출(서비스키
+없음) 전부 실행하지 않았다.
+
+---
+
+# 2026-07-29 [LEGALDONG-2] requests 전환·전국 정규화·최초 Snapshot 생성 완료
+
+## 배경
+[LEGALDONG-1] 이후 여러 라운드에 걸쳐 실제 서비스키로 공식 API를 호출하며
+`update_legal_dong_snapshot.py`를 검증·수정했다. 상세 증거는 각 라운드의
+`scratchpad/legaldong_*` 하위 디렉터리(gitignore 대상, 커밋에는 포함되지
+않음)에 남아있다.
+
+## 이번 구간에서 확정된 사실
+- **HTTP 클라이언트**: urllib 기반 호출은 이 API 게이트웨이와 호환되지 않아
+  (반복적으로 HTTP 500) `requests==2.34.2`로 전면 교체했다(`requirements.txt`
+  1줄 추가). 동일 파라미터로 requests는 즉시 성공했다.
+- **세종특별자치시 parent 문제 해소**: 초기에는 법정동 코드 구간 산술로
+  상위(sido/sigungu) 행의 존재를 가정했으나, 세종시는 실제로 상위 sido
+  요약 행 자체가 API 응답에 없어 코드 기반 조회가 항상 실패했다. 코드 구간
+  기반 부모 조회를 완전히 제거하고, `locatadd_nm`(행안부 공식 전체 명칭
+  원문)을 토큰화해 sido/sigungu/eup_myeon_dong을 구조적으로 분리하는
+  방식으로 교체했다 - 특정 지역명을 조건문에 하드코딩하지 않는다.
+- **광역단위 15개 vs 17개**: 전국 실측 결과 sido 요약 행이 15개뿐인 이유를
+  완전히 규명했다 - 세종특별자치시는 요약 행 자체가 없고(dong 행은
+  `locathigh_cd` 기준 100% 정상 연결), 광주광역시·전라남도는 별도 요약 행
+  없이 `전남광주통합특별시`라는 통합 역사 명칭 하나로 존재한다(정규화
+  결과의 고유 sido는 16개).
+- **locat_rm은 폐지 플래그가 아님**: 전국 298건 비공란 표본 전수 확인 결과
+  "폐지"/"말소" 문자열이 0건이었다 - 전부 명칭/관할구역 변경 조례를 인용하는
+  비고였다. `is_active`는 API가 반환하는 모든 행에 대해 무조건 `true`로
+  변경했고, 폐지 감지는 `build_diff_report`의 `removed_candidates`(기존
+  snapshot에는 있었으나 신규 조회에 없는 코드)에 맡긴다 - 자동 삭제나
+  `is_active=false` 확정은 하지 않는다.
+- **locallow_nm 명칭 불일치**: 전국 5,067건 dong 레벨 전수조사 결과
+  `exact_match` 5,066건, `sigungu_prefix_concatenation`(청주시 상당구
+  영동, locallow_nm='상당구영동' = sigungu 마지막 토큰 접두 결합) 1건,
+  설명 불가능한 불일치 0건. `eup_myeon_dong`은 항상 `locatadd_nm` 마지막
+  토큰을 권위값으로 쓰고, `locallow_nm`은 알려진 변형이면 통과·아니면
+  즉시 차단하는 보조 감사 필드로 재정의했다.
+- **정규화 레코드 스키마 변경**: `created_date`/`abolished_date`/
+  `last_modified_date` → `effective_date`/`source_name`/`source_version`
+  으로 교체(레코드별로 출처와 조회 시각을 남김).
+
+## 최초 Snapshot 생성
+`--apply` 1회 실행으로 `data/legal_dong_snapshot.json`을 최초 생성했다.
+- 레코드 5,067건, 신규(ADDED) 5,067 / 명칭변경 0 / 삭제후보 0(첫 생성이라
+  전부 신규가 정상).
+- SHA256: `eacf8307d7ffd363f03b84ceac7470dba7c555768c1362c04f6e5cd6194af65c`
+  (파일 크기 2,279,792 bytes).
+- 중복·비정상 legal_code 0건, sido/eup_myeon_dong/full_name 공란 0건
+  (sigungu 공란 33건은 전부 세종특별자치시 정상 특례).
+- 이후 동일 데이터로 기본 Dry Run을 재실행해 ADDED/RENAMED_CANDIDATE/
+  REMOVED_CANDIDATE 전부 0건, Snapshot 파일의 SHA256·크기·수정 시각이
+  실행 전후 완전히 동일함을 확인했다(멱등성 검증 완료).
+
+## 테스트 결과
+`tests/test_update_legal_dong_snapshot.py` 74 PASS. 전체 `pytest -q` 78
+passed(경고 4건은 기존 return-value 경고, 이번 변경과 무관). Snapshot
+파일이 실제로 존재하는 상태에서도 회귀 없음(autouse fixture가 테스트마다
+SNAPSHOT_PATH를 임시 경로로 격리하므로 실제 파일과 무관하게 동작).
+
+## 남은 위험
+1. `전남광주통합특별시`라는 역사적 통합 명칭이 사용자 관점에서는
+   "광주광역시"/"전라남도"로 기대될 수 있어, 향후 UI 노출 시 표시명 매핑이
+   필요할 수 있다 - 이번 라운드는 원문 그대로 저장하는 것이 목표였으므로
+   임의 변환하지 않았다.
+2. 세종특별자치시 33건은 `sigungu=""`으로 저장된다 - 향후 UI 필터가 빈
+   sigungu를 "시군구 없음"으로 올바르게 처리하는지 로더/UI 연결 라운드에서
+   별도 확인이 필요하다.
+3. [LEGALDONG-1]에서 남겼던 "천호동=천호1동(행정동) 관용 처리" 여부 충돌은
+   여전히 미확정이다 - exact 필터 구현 전에 확정 필요.
+
+## 남은 작업 (갱신)
+1. `src/pc/region_data.py` 확장 또는 신규 loader(snapshot 읽기 전용 서비스)
+2. `src/ui.py` 법정동 UI 연결 + target_count readonly 전환
+3. query planner + target 자동계산(`per_query_limit × query_count`)
+4. 지역 exact 필터(§남은 위험 3 확정 후 구현) - Naver 주소 명칭과의 호환성
+   검증 필요
+5. 기본모드/홈페이지·SNS 모드 동일 지역 계약 연결
+
+## Git 확인
+`git add`/`commit`/`push`/`reset`/`checkout`/`restore`/`clean`/`stash` 전부
+수행하지 않았다. 수정 파일: `requirements.txt`(requests==2.34.2 추가),
+`scripts/update_legal_dong_snapshot.py`, `tests/test_update_legal_dong_snapshot.py`,
+`README.md`(§10 신규 절 추가), `PROJECT_STATE.md`(이번 절). 신규 파일:
+`data/legal_dong_snapshot.json`(최초 생성, git 추적 여부는 사용자가 직접
+`git add` 시점에 결정). UI 코드(`src/ui.py`)와 수집 엔진은 무수정.
