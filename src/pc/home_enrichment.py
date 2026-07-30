@@ -34,7 +34,7 @@ from pathlib import Path
 from playwright.async_api import TimeoutError as PlaywrightAsyncTimeoutError
 from playwright.async_api import async_playwright
 
-from src.pc.browser_session import (
+from src.browser.session import (
     _acquire_profile_lock,
     _build_native_browser_args,
     _pick_free_port,
@@ -43,7 +43,7 @@ from src.pc.browser_session import (
     _terminate_owned_process,
     _wait_for_cdp_ready,
 )
-from src.pc.config import BrowserBackendConfig
+from src.browser.config import BrowserBackendConfig
 from src.pc.network_browser_collector import (
     _SSR_REQUEST_HEADERS,
     _SSR_REQUEST_TIMEOUT_MS,
@@ -282,7 +282,7 @@ async def _connect_native_edge_context(backend_config: BrowserBackendConfig):
     """5Z가 검증한 방식 그대로: 같은 persistent profile을 가리키는 새 Native
     Edge/Chrome 프로세스를 시작하고, `connect_over_cdp`로 연결해 실제
     BrowserContext를 반환한다(NativeCdpBrowserSession._connect_over_cdp와
-    동일한 절차를 async로 재구현 - browser_session.py 자체는 무수정 재사용,
+    동일한 절차를 async로 재구현 - src/browser/session.py 자체는 무수정 재사용,
     private helper만 import한다).
 
     반환: (playwright_cm, browser, context, process, lock_path). 실패 시

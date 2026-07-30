@@ -3,12 +3,12 @@ from pathlib import Path
 import sys
 
 
-# Stage 1 청크1: src/pc/config.py DiagnosticConfig 검증용 standalone 스크립트입니다.
+# Stage 1 청크1: src/browser/config.py DiagnosticConfig 검증용 standalone 스크립트입니다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.config import DiagnosticConfig
+from src.browser.config import DiagnosticConfig
 
 
 ENV_KEYS = [

@@ -21,7 +21,7 @@ from src.pc.apollo_list_adapter import (
     extract_main_place_list_from_apollo,
     extract_new_opening_place_list_from_apollo,
 )
-from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
+from src.browser.session import _CAPTCHA_PROBE_SELECTORS
 from src.region.naver_region_policy import (
     OFFICIAL_EXACT,
     OUT_OF_SCOPE,
@@ -417,11 +417,11 @@ def _probe_captcha_state(page) -> dict:
 
 
 def _find_search_frame(page):
-    """PAGE-300-2B-1: src/pc/browser_session.py의 BrowserSession.find_search_frame
+    """PAGE-300-2B-1: src/browser/session.py의 BrowserSession.find_search_frame
     과 동일한 폴백 순서(name -> frame_locator+body wait -> frames 스캔)를
     이 모듈 전용으로 재구현한다 - 이 함수는 BrowserSession
     인스턴스가 아니라 bare page만 받으므로 그 메서드를 직접 호출할 수 없다
-    (browser_session.py는 이번 단계 수정 금지 범위).
+    (src/browser/session.py는 이번 단계 수정 금지 범위).
 
     이 함수는 어떤 예외도 밖으로 내보내지 않는다 - frame API를 전혀 구현하지
     않은 기존 FakePage(단일 페이지 no-live 테스트 전용)에서도 안전하게 None을
@@ -767,8 +767,8 @@ def _default_session_factory():
     DiagnosticConfig는 safe_default()를 사용한다(브라우저 backend 선택과
     진단 플래그는 독립된 설정 축).
     """
-    from src.pc.browser_session import BrowserSession, NativeCdpBrowserSession
-    from src.pc.config import BrowserBackendConfig, DiagnosticConfig
+    from src.browser.session import BrowserSession, NativeCdpBrowserSession
+    from src.browser.config import BrowserBackendConfig, DiagnosticConfig
 
     diagnostic_config = DiagnosticConfig.safe_default()
     backend_config = BrowserBackendConfig.from_env()

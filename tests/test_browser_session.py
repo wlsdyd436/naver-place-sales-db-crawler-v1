@@ -3,14 +3,14 @@ import shutil
 import sys
 
 
-# Stage 2 청크1: src/pc/browser_session.py 검증용 standalone 스크립트입니다.
+# Stage 2 청크1: src/browser/session.py 검증용 standalone 스크립트입니다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.config import DiagnosticConfig
+from src.browser.config import DiagnosticConfig
 from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT
-from src.pc.browser_session import BrowserSession, _select_launch_args
+from src.browser.session import BrowserSession, _select_launch_args
 
 
 class ValidationReporter:

@@ -19,7 +19,7 @@ from pathlib import Path
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from src.pc.config import BrowserBackendConfig
+from src.browser.config import BrowserBackendConfig
 from src.pc.diagnostics import (
     DEFAULT_DIAGNOSTICS_ROOT,
     capture_page_diagnostics,

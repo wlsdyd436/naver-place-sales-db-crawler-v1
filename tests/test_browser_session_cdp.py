@@ -4,8 +4,8 @@ import urllib.error
 from pathlib import Path
 
 
-# 2026-07-21 Native Edge/Chrome + CDP Attach 통합: src/pc/browser_session.py의
-# NativeCdpBrowserSession 검증용 standalone 스크립트입니다(기존 test_pc_browser_session.py와
+# 2026-07-21 Native Edge/Chrome + CDP Attach 통합: src/browser/session.py의
+# NativeCdpBrowserSession 검증용 standalone 스크립트입니다(기존 test_browser_session.py와
 # 동일한 패턴 - pytest가 아니라 python으로 직접 실행). 실제 브라우저/네트워크는 절대
 # 실행하지 않으며, subprocess.Popen/urllib.request.urlopen/sync_playwright/tasklist를
 # 전부 fake로 주입해 검증한다.
@@ -13,8 +13,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import src.pc.browser_session as browser_session
-from src.pc.browser_session import (
+import src.browser.session as browser_session
+from src.browser.session import (
     BrowserExecutableNotFoundError,
     BrowserSession,
     CdpConnectionError,
@@ -29,7 +29,7 @@ from src.pc.browser_session import (
     _terminate_owned_process,
     _wait_for_cdp_ready,
 )
-from src.pc.config import BrowserBackendConfig, DiagnosticConfig
+from src.browser.config import BrowserBackendConfig, DiagnosticConfig
 
 
 class ValidationReporter:
