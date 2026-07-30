@@ -128,8 +128,8 @@ def _blank_home_fetch_result(place_id: str) -> dict:
 
 
 async def _fetch_place_home_async(request_context, row: dict) -> dict:
-    """`_fetch_place_detail_ssr`(sync, network_browser_collector.py)의 async
-    대응. I/O만 async로 바뀌고 판정 로직(_classify_ssr_block_signal,
+    """`_fetch_place_detail_ssr`(기존 동기식 상세 보강 경로, 현재는 삭제됨)의
+    async 대응. I/O만 async로 바뀌고 판정 로직(_classify_ssr_block_signal,
     _parse_apollo_state_from_html, extract_normalized_apollo_detail,
     _map_item_to_row, build_place_url_from_id)은 전부 순수 함수라 그대로
     재사용한다(재구현 없음). request_context는 실제 Native Edge

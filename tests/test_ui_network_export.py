@@ -101,7 +101,7 @@ def _base_result(**overrides) -> dict:
 
 
 def _fake_row(i: int) -> dict:
-    # 실제 network_browser_collector.collect_apollo_first_list_query가 만드는
+    # 실제 apollo_list_collector.collect_apollo_first_list_query가 만드는
     # row와 동일한 형태(제품 13컬럼 + 내부 place_id/source_* 메타)를 흉내낸다.
     return {
         "업체명": f"업체{i}",

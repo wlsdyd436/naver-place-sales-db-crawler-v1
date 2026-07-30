@@ -687,7 +687,7 @@ def check_backend_config_frozen_ignores_env(reporter: ValidationReporter, monkey
 
 
 def check_default_session_factory_dispatches_by_backend(reporter: ValidationReporter, monkeypatch_env) -> None:
-    from src.pc.network_browser_collector import _default_session_factory
+    from src.collection.apollo_list_collector import _default_session_factory
 
     monkeypatch_env["PCCRAWLER_BROWSER_BACKEND"] = "launch"
     launch_session = _default_session_factory()
@@ -704,7 +704,7 @@ def check_default_session_factory_dispatches_by_backend(reporter: ValidationRepo
 
 
 def check_default_session_factory_defaults_native_cdp_without_env(reporter: ValidationReporter, monkeypatch_env) -> None:
-    from src.pc.network_browser_collector import _default_session_factory
+    from src.collection.apollo_list_collector import _default_session_factory
 
     monkeypatch_env.pop("PCCRAWLER_BROWSER_BACKEND", None)
     session = _default_session_factory()

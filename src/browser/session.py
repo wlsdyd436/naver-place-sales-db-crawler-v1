@@ -1,5 +1,5 @@
 # Playwright 브라우저 생명주기(launch/context/page)와 진단 캡처 트리거를 소유합니다.
-# 이 모듈은 목록 탐색/페이지네이션/파싱 로직을 갖지 않으며(network_browser_collector.py/
+# 이 모듈은 목록 탐색/페이지네이션/파싱 로직을 갖지 않으며(apollo_list_collector.py/
 # place_mapper.py 책임), CAPTCHA 우회/자동 해결을 시도하지 않습니다. 진단 캡처는
 # page가 살아있는 이 계층에서 호출자가 명시적으로 수행해야 합니다(teardown 이후에는
 # 캡처가 불가능하기 때문).
@@ -235,12 +235,12 @@ class BrowserSession:
 # 환경과 검증 검색에서 Playwright launch 환경과 다른 결과를 보였다"는
 # 의미이며, 특정 fingerprint 항목이 차단 원인이라거나 CDP가 CAPTCHA를
 # 영구적으로 우회한다는 의미가 아니다. CAPTCHA/HTTP 403·405·429 감지와
-# 안전 중단(network_browser_collector.py/network_pipeline.py)은 이
+# 안전 중단(apollo_list_collector.py/network_pipeline.py)은 이
 # backend 교체와 무관하게 그대로 유지된다.
 #
 # 이 클래스는 BrowserSession과 동일한 context manager 계약(.context/.page,
 # __enter__/__exit__)만 제공한다 - 실제 production 소비자인
-# ApolloFirstListCollector(network_browser_collector.py)는 session의
+# ApolloFirstListCollector(apollo_list_collector.py)는 session의
 # .context/.page만 사용하므로 그 외 메서드는 추가하지 않는다(요청 범위 외
 # 기능 추가 금지).
 

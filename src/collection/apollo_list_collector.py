@@ -1,10 +1,12 @@
-# 목록 수집 엔진(ApolloFirstListCollector/collect_apollo_first_list_query,
-# 파일 하단)이 쓰는 Network 응답 관찰 인프라(_QueryObservationContext와
-# response/requestfinished/requestfailed 핸들러, candidate 안전 진단,
-# CAPTCHA probe, 페이지네이션 대기)를 담는다. is_candidate_response/
-# _extract_list_items/_map_item_to_row/dedup_rows/classify_captcha_signal은
-# src/collection/place_mapper.py에서 읽기 전용으로 재사용하며 재구현하지
-# 않는다.
+# Apollo/GraphQL 목록 Network 응답을 관찰해 Place row를 수집하는 Collector
+# 모듈(ApolloFirstListCollector/collect_apollo_first_list_query, 파일
+# 하단)과 그 인프라(_QueryObservationContext, response/requestfinished/
+# requestfailed 핸들러, candidate 안전 진단, CAPTCHA probe, 페이지네이션
+# 대기)를 담는다. BrowserSession(Native Edge CDP 세션)은 src/browser가
+# 제공하고, Apollo 목록 선택(extract_main_place_list_from_apollo 등)·Place
+# row 매핑·중복 제거는 src/collection의 apollo_list_adapter/place_mapper를,
+# 지역 Exact 판정은 src/region.naver_region_policy를, 일시정지·중지
+# 게이트는 src/pc.run_control을 그대로 재사용한다(재구현 없음).
 #
 # page.goto()에서 발생 가능한 예외는 성격이 다르다. 실제 Playwright
 # TimeoutError(느린 로드)만 timeout=True로 분류하고, "page/context/browser가

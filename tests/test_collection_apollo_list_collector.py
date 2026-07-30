@@ -6,7 +6,7 @@ import time
 
 
 # 신규 Apollo/GraphQL-first 목록 수집(collect_apollo_first_list_query/
-# ApolloFirstListCollector, src/pc/network_browser_collector.py) 검증용
+# ApolloFirstListCollector, src/collection/apollo_list_collector.py) 검증용
 # standalone 스크립트(실제 Playwright/네이버 접속 없음). 기존
 # tests/test_pc_network_pagination.py의 FakePaginationPage/FakeSearchFrame/
 # FakePaginationButtonLocator 패턴을 이 파일 안에서 독립적으로 재구현하고,
@@ -16,12 +16,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.network_browser_collector import (
+from src.collection.apollo_list_collector import (
     _APOLLO_FULL_STATE_JS,
     ApolloFirstListCollector,
     collect_apollo_first_list_query,
 )
-import src.pc.network_browser_collector as network_browser_collector
+import src.collection.apollo_list_collector as apollo_list_collector
 
 
 class ValidationReporter:
@@ -534,7 +534,7 @@ def check_collector_opens_and_closes_one_page_per_query(reporter: ValidationRepo
     collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
 
     calls: list = []
-    original = network_browser_collector.collect_apollo_first_list_query
+    original = apollo_list_collector.collect_apollo_first_list_query
 
     def fake_collect(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
         calls.append(page)
@@ -542,13 +542,13 @@ def check_collector_opens_and_closes_one_page_per_query(reporter: ValidationRepo
                 "navigation_error": False, "navigation_error_message": "", "page_count": 1,
                 "pagination_stop_reason": "pagination_exhausted"}
 
-    network_browser_collector.collect_apollo_first_list_query = fake_collect
+    apollo_list_collector.collect_apollo_first_list_query = fake_collect
     try:
         with collector:
             collector.collect_query(JOB, 30)
             collector.collect_query(JOB, 30)
     finally:
-        network_browser_collector.collect_apollo_first_list_query = original
+        apollo_list_collector.collect_apollo_first_list_query = original
 
     ok = (
         context.new_page_call_count == 2
@@ -566,12 +566,12 @@ def check_collector_closes_page_even_when_collect_raises(reporter: ValidationRep
     session = FakeLifecycleSession(context)
     collector = ApolloFirstListCollector(collected_at="2026-07-24", session_factory=lambda: session)
 
-    original = network_browser_collector.collect_apollo_first_list_query
+    original = apollo_list_collector.collect_apollo_first_list_query
 
     def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
         raise RuntimeError("boom")
 
-    network_browser_collector.collect_apollo_first_list_query = fake_collect_raises
+    apollo_list_collector.collect_apollo_first_list_query = fake_collect_raises
     raised = False
     try:
         with collector:
@@ -580,7 +580,7 @@ def check_collector_closes_page_even_when_collect_raises(reporter: ValidationRep
             except RuntimeError:
                 raised = True
     finally:
-        network_browser_collector.collect_apollo_first_list_query = original
+        apollo_list_collector.collect_apollo_first_list_query = original
 
     ok = raised and len(context.pages_created) == 1 and context.pages_created[0].close_call_count == 1
     if ok:
@@ -1130,11 +1130,11 @@ def check_stop_event_aborts_pagination_before_next_page(reporter: ValidationRepo
 
 def check_default_session_factory_used_when_not_injected(reporter: ValidationReporter) -> None:
     """session_factory를 주입하지 않으면 ApolloFirstListCollector가
-    network_browser_collector._default_session_factory를 그대로 쓴다(production
+    apollo_list_collector._default_session_factory를 그대로 쓴다(production
     배선) - 이전 대청소에서 이 함수를 실수로 삭제했다가 복구한 이력이 있어
     이 기본 배선 자체를 회귀 가드로 남긴다."""
     collector = ApolloFirstListCollector(collected_at="2026-07-30")
-    if collector._session_factory is network_browser_collector._default_session_factory:
+    if collector._session_factory is apollo_list_collector._default_session_factory:
         reporter.pass_("session_factory 미주입 시 _default_session_factory가 기본값으로 쓰임")
     else:
         reporter.fail(f"기본 session_factory 배선 이상: {collector._session_factory!r}")
@@ -1145,7 +1145,7 @@ def check_default_session_factory_builds_session_without_launching_browser(repor
     전까지) 실제 브라우저를 띄우지 않는다(함수 자체의 계약) - 반환 객체가
     NativeCdpBrowserSession 계약(context manager + collect_query 상위에서
     쓰는 __enter__/__exit__)을 만족하는지만 라이브 브라우저 없이 확인한다."""
-    session = network_browser_collector._default_session_factory()
+    session = apollo_list_collector._default_session_factory()
     ok = hasattr(session, "__enter__") and hasattr(session, "__exit__") and type(session).__name__ in (
         "NativeCdpBrowserSession", "BrowserSession",
     )

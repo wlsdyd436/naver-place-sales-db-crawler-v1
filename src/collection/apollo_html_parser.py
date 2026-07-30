@@ -1,6 +1,6 @@
 """Naver Place HTML에서 Apollo State를 읽는 순수 파서와, HTML/응답 문자열의
 차단 신호를 분류하는 순수 함수를 담는다. 브라우저 실행·네트워크 요청을
-전혀 수행하지 않으며, 목록 수집(network_browser_collector)과 홈페이지
+전혀 수행하지 않으며, 목록 수집(apollo_list_collector)과 홈페이지
 보강(home_enrichment) 양쪽이 공동 사용한다."""
 import json
 

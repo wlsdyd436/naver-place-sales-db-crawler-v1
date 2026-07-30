@@ -13,7 +13,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from src import ui
 from src.collection.home_enrichment import enrich_home_details
-from src.pc.network_browser_collector import ApolloFirstListCollector
+from src.collection.apollo_list_collector import ApolloFirstListCollector
 
 
 class ValidationReporter:

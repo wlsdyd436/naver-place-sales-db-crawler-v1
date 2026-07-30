@@ -3,7 +3,7 @@
 # placeList(...) operation" 하나만 선택하고 businesses.items의 __ref만 따라간다.
 #
 # 이 모듈은 사용자가 명시적으로 승인한 Apollo/GraphQL-first 목록 수집 경로
-# (ApolloFirstListCollector, network_browser_collector.py)만을 위해 존재한다.
+# (ApolloFirstListCollector, apollo_list_collector.py)만을 위해 존재한다.
 #
 # 알려진 미검증 가정(Live 검증 전까지 문서로만 남김 - 이번 구현 단계는 Live 요청을
 # 실행하지 않는다): placeList(...) 키의 정확한 input 필드명(query/filterOpening/
@@ -121,7 +121,7 @@ def extract_main_place_list_from_apollo(apollo_state, expected_query: str, expec
     반환에 신규 "selection_diagnostics" 키를 추가한다(각 후보의 key/size/
     query_score/start_score/unique_id_count + 최종 선택 key, 요청서 §7
     "선택 근거를 diagnostics에 기록") - 기존 키는 전부 그대로 유지되므로
-    호출부(network_browser_collector._wait_for_apollo_list_ready)는 무수정
+    호출부(apollo_list_collector._wait_for_apollo_list_ready)는 무수정
     호환된다."""
     if not isinstance(apollo_state, dict):
         return _empty_result("apollo_state_missing")
