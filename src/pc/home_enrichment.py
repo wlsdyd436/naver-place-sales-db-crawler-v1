@@ -47,6 +47,8 @@ from src.browser.config import BrowserBackendConfig
 from src.pc.network_browser_collector import (
     _SSR_REQUEST_HEADERS,
     _SSR_REQUEST_TIMEOUT_MS,
+)
+from src.collection.apollo_html_parser import (
     _classify_ssr_block_signal,
     _parse_apollo_state_from_html,
 )

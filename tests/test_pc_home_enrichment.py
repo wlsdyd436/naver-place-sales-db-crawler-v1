@@ -31,7 +31,7 @@ from src.pc.home_enrichment import (
     enrich_home_details,
     merge_home_result_into_row,
 )
-from src.pc.network_browser_collector import (
+from src.collection.apollo_html_parser import (
     _classify_ssr_block_signal,
     _parse_apollo_state_from_html,
 )
@@ -896,7 +896,7 @@ def check_diagnostics_report_structure_and_no_sensitive_data(reporter: Validatio
 
 # ============================================================================
 # _parse_apollo_state_from_html / _classify_ssr_block_signal 직접 단위 검증
-# (src/pc/network_browser_collector.py 소속, 이 모듈이 SSR 상세 GET 응답
+# (src/collection/apollo_html_parser.py 소속, 이 모듈이 SSR 상세 GET 응답
 # 처리에 그대로 재사용하는 순수 함수 - _fetch_place_detail_ssr 삭제 이후
 # 직접 테스트가 끊겨 있었던 것을 복구)
 # ============================================================================
