@@ -397,5 +397,9 @@ def main() -> int:
     return 1 if reporter.fail_count else 0
 
 
+def test_standalone_suite():
+    assert main() == 0
+
+
 if __name__ == "__main__":
     sys.exit(main())

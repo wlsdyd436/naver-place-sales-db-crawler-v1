@@ -63,7 +63,7 @@ def _parent_entity(base_ref="PlaceDetailBase:2014880028", **overrides):
     return entity
 
 
-def test_apollo_detail_adapter_suite():
+def _run_apollo_detail_adapter_suite() -> bool:
     reporter = SimpleReporter()
 
     # ------------------------------------------------------------------
@@ -337,6 +337,10 @@ def test_apollo_detail_adapter_suite():
     return reporter.fails == 0
 
 
+def test_apollo_detail_adapter_suite():
+    assert _run_apollo_detail_adapter_suite() is True
+
+
 if __name__ == "__main__":
-    success = test_apollo_detail_adapter_suite()
+    success = _run_apollo_detail_adapter_suite()
     sys.exit(0 if success else 1)

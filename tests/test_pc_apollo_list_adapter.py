@@ -59,7 +59,7 @@ def _ref(key: str) -> dict:
     return {"__ref": key}
 
 
-def test_apollo_list_adapter_suite() -> bool:
+def _run_apollo_list_adapter_suite() -> bool:
     reporter = SimpleReporter()
     query = "강남구 카페"
     start = 0
@@ -358,6 +358,10 @@ def test_apollo_list_adapter_suite() -> bool:
     return reporter.fails == 0
 
 
+def test_apollo_list_adapter_suite():
+    assert _run_apollo_list_adapter_suite() is True
+
+
 if __name__ == "__main__":
-    success = test_apollo_list_adapter_suite()
+    success = _run_apollo_list_adapter_suite()
     sys.exit(0 if success else 1)

@@ -40,7 +40,7 @@ class SimpleReporter:
         print(f"[FAIL] {msg}")
 
 
-def test_field_policy_suite():
+def _run_field_policy_suite() -> bool:
     reporter = SimpleReporter()
 
     # ------------------------------------------------------------------
@@ -306,6 +306,10 @@ def test_field_policy_suite():
     return reporter.fails == 0
 
 
+def test_field_policy_suite():
+    assert _run_field_policy_suite() is True
+
+
 if __name__ == "__main__":
-    success = test_field_policy_suite()
+    success = _run_field_policy_suite()
     sys.exit(0 if success else 1)
