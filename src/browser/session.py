@@ -1,6 +1,6 @@
 # Playwright 브라우저 생명주기(launch/context/page)와 진단 캡처 트리거를 소유합니다.
 # 이 모듈은 목록 탐색/페이지네이션/파싱 로직을 갖지 않으며(network_browser_collector.py/
-# network_list_scraper.py 책임), CAPTCHA 우회/자동 해결을 시도하지 않습니다. 진단 캡처는
+# place_mapper.py 책임), CAPTCHA 우회/자동 해결을 시도하지 않습니다. 진단 캡처는
 # page가 살아있는 이 계층에서 호출자가 명시적으로 수행해야 합니다(teardown 이후에는
 # 캡처가 불가능하기 때문).
 #

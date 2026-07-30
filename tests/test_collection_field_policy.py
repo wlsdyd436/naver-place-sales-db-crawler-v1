@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.pc.network_list_scraper import (
+from src.collection.place_mapper import (
     _compute_total_review_count,
     _extract_external_urls,
     _is_personal_mobile_phone,

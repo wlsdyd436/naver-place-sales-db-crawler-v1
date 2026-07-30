@@ -1,5 +1,5 @@
 """
-Unit tests for src/pc/apollo_list_adapter.py - 신규 Apollo/GraphQL-first 목록
+Unit tests for src/collection/apollo_list_adapter.py - 신규 Apollo/GraphQL-first 목록
 수집 경로의 1페이지 파서(ROOT_QUERY의 메인 placeList(...) operation 선택).
 
 합성/익명화된 최소 fixture만 사용한다(실제 네이버 raw JSON을 그대로 복사하지
@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.pc.apollo_list_adapter import (
+from src.collection.apollo_list_adapter import (
     build_rows_from_apollo_list_result,
     extract_main_place_list_from_apollo,
 )

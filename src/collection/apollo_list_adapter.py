@@ -9,13 +9,13 @@
 # 실행하지 않는다): placeList(...) 키의 정확한 input 필드명(query/filterOpening/
 # start/display)은 이 저장소에 이미 증명된 유일한 유사 패턴인
 # placeDetail({"input":{"deviceType":"mobile","id":"...","isNx":false}})
-# (extract_normalized_apollo_detail, network_list_scraper.py)의 "fieldName(JSON)"
+# (extract_normalized_apollo_detail, place_mapper.py)의 "fieldName(JSON)"
 # 키 형태와 사용자 요청서 문구에서 추론한 것이다. 실제 리스트 페이지의
 # window.__APOLLO_STATE__ 원본 fixture로 아직 검증되지 않았다.
 import json
 import re
 
-from src.pc.network_list_scraper import _map_item_to_row
+from src.collection.place_mapper import _map_item_to_row
 
 _ROOT_QUERY_KEY = "ROOT_QUERY"
 _PLACE_LIST_PREFIX = "placeList("
@@ -37,7 +37,7 @@ def _parse_operation_args(key, prefix: str):
 def _resolve_ref(apollo_state: dict, value):
     """value가 {"__ref": key} 형태면 apollo_state[key]를 1단계만 해석해 반환한다.
     이미 dict(inline)이면 그대로 반환한다. 그 외(None/list/스칼라 등)는 None.
-    무제한 재귀를 하지 않는다(network_list_scraper._select_apollo_parent와 동일한
+    무제한 재귀를 하지 않는다(place_mapper._select_apollo_parent와 동일한
     '1단계만 해석' 원칙)."""
     if not isinstance(value, dict):
         return None
@@ -412,7 +412,7 @@ def extract_new_opening_place_list_from_apollo(apollo_state, expected_query: str
 
 
 def build_rows_from_apollo_list_result(list_result: dict, collected_at: str, *, source_query: str = None) -> list:
-    """extract_main_place_list_from_apollo의 items를 network_list_scraper._map_item_to_row로
+    """extract_main_place_list_from_apollo의 items를 place_mapper._map_item_to_row로
     순서 보존 매핑한다(순수 함수 - source_page/source_city 등은 호출자가 이후 붙인다)."""
     rows = []
     for item in list_result.get("items") or []:

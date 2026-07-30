@@ -1,4 +1,4 @@
-"""단위 테스트: src/pc/apollo_list_adapter.extract_new_opening_place_list_from_apollo
+"""단위 테스트: src/collection/apollo_list_adapter.extract_new_opening_place_list_from_apollo
 (NEW-OPENING-1 §9-C operation 선택 규칙). 2026-07-30 Live 실측
 (scratchpad/new_opening_filter_implementation)에서 확인된 실제 필드 형태
 (filterOpening="true" 문자열, display=9)를 그대로 반영한 합성 fixture만
@@ -11,7 +11,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.apollo_list_adapter import (  # noqa: E402
+from src.collection.apollo_list_adapter import (  # noqa: E402
     extract_main_place_list_from_apollo,
     extract_new_opening_place_list_from_apollo,
 )

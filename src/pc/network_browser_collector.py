@@ -3,7 +3,7 @@
 # response/requestfinished/requestfailed 핸들러, candidate 안전 진단,
 # CAPTCHA probe, 페이지네이션 대기)를 담는다. is_candidate_response/
 # _extract_list_items/_map_item_to_row/dedup_rows/classify_captcha_signal은
-# src/pc/network_list_scraper.py에서 읽기 전용으로 재사용하며 재구현하지
+# src/collection/place_mapper.py에서 읽기 전용으로 재사용하며 재구현하지
 # 않는다.
 #
 # page.goto()에서 발생 가능한 예외는 성격이 다르다. 실제 Playwright
@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from src.pc.apollo_list_adapter import (
+from src.collection.apollo_list_adapter import (
     build_rows_from_apollo_list_result,
     extract_main_place_list_from_apollo,
     extract_new_opening_place_list_from_apollo,
@@ -29,7 +29,7 @@ from src.region.naver_region_policy import (
     REGION_UNVERIFIED,
     classify_region_match,
 )
-from src.pc.network_list_scraper import (
+from src.collection.place_mapper import (
     _extract_list_items,
     _map_item_to_row,
     classify_captcha_signal,
@@ -669,7 +669,7 @@ def _split_new_opening_valid_rows(rows: list) -> tuple:
     """job["new_opening_only"]=True인 Query에서 newOpening이 명시적으로
     true인 row만 유효로 남긴다(§6) - false/null/필드 누락은 rejected_rows로
     분리해 per_query_limit을 소비하지 않게 한다. row의 "새로오픈여부"는
-    이미 network_list_scraper._resolve_new_open_tristate가
+    이미 place_mapper._resolve_new_open_tristate가
     True->"O"/False->"X"/미확인->""로 매핑해둔 값이므로 "O"만 통과시킨다
     (추측으로 false/null을 새로오픈으로 저장하지 않는다)."""
     valid_rows = []

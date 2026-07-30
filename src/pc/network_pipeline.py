@@ -12,7 +12,7 @@
 # 중단하고 그때까지의 부분 결과만 반환한다.
 from types import SimpleNamespace
 
-from src.pc.network_list_scraper import dedup_rows, should_stop_for_target
+from src.collection.place_mapper import dedup_rows, should_stop_for_target
 from src.pc.safety import SafetyReason
 
 _SECURITY_BLOCK_MESSAGE = "보안 확인 또는 요청 제한이 감지되었습니다."
@@ -41,7 +41,7 @@ def run_collection_plan(
        "navigation_error": bool, "navigation_error_message": str}
     navigation_error/navigation_error_message는 없어도 된다(WIRE-2A-B 이전
     collect_query와의 하위 호환 - 없으면 False/빈 문자열로 취급). rows의 각
-    항목은 network_list_scraper.dedup_rows가 기대하는 형태(place_id 또는
+    항목은 place_mapper.dedup_rows가 기대하는 형태(place_id 또는
     업체명 키를 가진 dict)여야 한다.
 
     seen은 여러 jobs에 걸쳐 공유되는 dedup 집합이다(호출자가 재사용하고

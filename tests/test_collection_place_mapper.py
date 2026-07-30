@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 
-# ARCH-300 PoC-1: src/pc/network_list_scraper.py 검증용 standalone 스크립트(live 없음,
+# ARCH-300 PoC-1: src/collection/place_mapper.py 검증용 standalone 스크립트(live 없음,
 # 샘플 fixture dict 기반). 이 모듈은 UI/pipeline에 연결되지 않으므로, 순수 함수 단위로만
 # 검증한다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -10,7 +10,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.exporter import MERGED_COLUMNS
-from src.pc.network_list_scraper import (
+from src.collection.place_mapper import (
     _classify_single_url,
     _extract_external_urls,
     _extract_list_items,
