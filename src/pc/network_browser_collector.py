@@ -22,7 +22,7 @@ from src.pc.apollo_list_adapter import (
     extract_new_opening_place_list_from_apollo,
 )
 from src.pc.browser_session import _CAPTCHA_PROBE_SELECTORS
-from src.pc.naver_region_policy import (
+from src.region.naver_region_policy import (
     OFFICIAL_EXACT,
     OUT_OF_SCOPE,
     PROVIDER_ALIAS_EXACT,

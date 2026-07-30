@@ -8,7 +8,7 @@ tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # LEGALDONG-UI-1: 공식 법정동 Snapshot을 EXE 내부(sys._MEIPASS)에 번들한다 -
-# src/pc/legal_dong_loader.default_snapshot_path()가 frozen 환경에서
+# src/region/legal_dong_loader.default_snapshot_path()가 frozen 환경에서
 # _MEIPASS/data/legal_dong_snapshot.json을 찾는다.
 datas += [('data/legal_dong_snapshot.json', 'data')]
 

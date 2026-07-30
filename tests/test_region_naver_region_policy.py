@@ -5,7 +5,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.naver_region_policy import (  # noqa: E402
+from src.region.naver_region_policy import (  # noqa: E402
     NAVER_SIDO_ALIASES,
     OFFICIAL_EXACT,
     OUT_OF_SCOPE,

@@ -9,7 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.legal_dong_loader import (  # noqa: E402
+from src.region.legal_dong_loader import (  # noqa: E402
     LegalDongSnapshotError,
     LegalDongSnapshotLoader,
     default_snapshot_path,

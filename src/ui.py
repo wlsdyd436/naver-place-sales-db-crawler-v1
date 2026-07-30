@@ -18,7 +18,7 @@ from src.exporter import export_places_to_excel
 from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
 from src.pc.home_enrichment import enrich_home_details
 from src.pc.network_browser_collector import ApolloFirstListCollector
-from src.pc.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
+from src.region.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
 from src.pc.network_pipeline import run_collection_plan
 from src.pc.run_control import wait_while_paused
 
