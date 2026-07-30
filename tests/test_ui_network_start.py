@@ -141,7 +141,7 @@ def _make_app(*, districts=("강동구",), query_queue=None):
     app.mode_var = FakeVar("premium")
     app.collection_mode_var = FakeVar("basic")
 
-    # LEGALDONG-UI-2: _start_network_crawl/_start_legacy_crawl이 참조하는
+    # LEGALDONG-UI-2: _start_network_crawl이 참조하는
     # 공식 법정동 상태 - 이 fake app은 지역 자체는 검증하지 않고 per_query_limit
     # /target_count/thread 배선만 확인하므로, 시군구가 없는 시도를 고른 것으로
     # 고정해 시군구 필수 검사를 자연스럽게 통과시킨다.
@@ -194,14 +194,13 @@ def check_default_constants(reporter: ValidationReporter) -> None:
     ok = (
         ui._DEFAULT_PER_QUERY_LIMIT == "30"
         and ui._DEFAULT_TARGET_COUNT == "300"
-        and ui._DEFAULT_COLLECTION_ENGINE == "network"
     )
     if ok:
-        reporter.pass_("기본 상수: per_query_limit=30, target_count=300, 기본 엔진=network")
+        reporter.pass_("기본 상수: per_query_limit=30, target_count=300")
     else:
         reporter.fail(
             f"기본 상수 결과가 예상과 다름: PER_QUERY_LIMIT={ui._DEFAULT_PER_QUERY_LIMIT}, "
-            f"TARGET_COUNT={ui._DEFAULT_TARGET_COUNT}, ENGINE={ui._DEFAULT_COLLECTION_ENGINE}"
+            f"TARGET_COUNT={ui._DEFAULT_TARGET_COUNT}"
         )
 
 
@@ -258,10 +257,9 @@ def check_normal_start_crawl_selects_network_worker(reporter: ValidationReporter
         and thread.args[3] == expected_output_path
         and thread.daemon is True
         and thread.start_called is True
-        and app._run_queue_pipeline != thread.target
     )
     if ok:
-        reporter.pass_(f"정상 start_crawl: Network worker thread가 선택되고 query_queue/per_query_limit=30/target_count(자동계산)={expected_target_count}/output_path가 정확히 전달되며 legacy worker는 호출되지 않음")
+        reporter.pass_(f"정상 start_crawl: Network worker thread가 선택되고 query_queue/per_query_limit=30/target_count(자동계산)={expected_target_count}/output_path가 정확히 전달됨")
     else:
         reporter.fail(f"정상 start_crawl 결과가 예상과 다름: target={thread.target}, args={thread.args}, expected_queue={expected_queue}, expected_output_path={expected_output_path}")
 
@@ -526,38 +524,6 @@ def check_new_open_filter_enabled_and_threaded_into_jobs(reporter: ValidationRep
         reporter.fail(f"새로오픈 필터 wiring 결과가 예상과 다름: instances={len(instances)}, new_open_only_var={app.new_open_only_var.get()}, query_queue={query_queue}")
 
 
-# ---------------------------------------------------------------------------
-# 12. legacy 보존(내부 롤백)
-# ---------------------------------------------------------------------------
-
-
-def check_legacy_rollback_path_reachable_via_internal_constant(reporter: ValidationReporter) -> None:
-    has_methods = (
-        hasattr(ui.SalesDbCrawlerApp, "_run_queue_pipeline")
-        and hasattr(ui.SalesDbCrawlerApp, "_collect_premium_query")
-    )
-    if not has_methods:
-        reporter.fail("legacy 메서드(_run_queue_pipeline/_collect_premium_query)가 보존되지 않음")
-        return
-
-    app, logs, statuses, running_calls = _make_app()
-    fake_threading, instances = _make_fake_threading()
-
-    with _Saved(["_DEFAULT_COLLECTION_ENGINE", "threading"]) as saved:
-        saved.set("_DEFAULT_COLLECTION_ENGINE", "legacy")
-        saved.set("threading", fake_threading)
-        app.start_crawl()
-
-    if not instances:
-        reporter.fail("_DEFAULT_COLLECTION_ENGINE='legacy'로 전환해도 thread가 생성되지 않음")
-        return
-    thread = instances[0]
-    ok = thread.target == app._run_queue_pipeline and thread.start_called is True
-    if ok:
-        reporter.pass_("legacy 롤백 경로: 내부 상수를 legacy로 바꾸면 _run_queue_pipeline이 선택됨(실제 legacy crawler는 fake thread라 실행되지 않음)")
-    else:
-        reporter.fail(f"legacy 롤백 경로 결과가 예상과 다름: target={thread.target}")
-
 
 def main() -> int:
     reporter = ValidationReporter()
@@ -575,7 +541,6 @@ def main() -> int:
     check_worker_normal_completion_restores_ui(reporter)
     check_worker_unexpected_exception_restores_ui_without_success_wording(reporter)
     check_new_open_filter_enabled_and_threaded_into_jobs(reporter)
-    check_legacy_rollback_path_reachable_via_internal_constant(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

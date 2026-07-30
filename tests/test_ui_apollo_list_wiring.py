@@ -13,11 +13,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from src import ui
 from src.pc.home_enrichment import enrich_home_details
-from src.pc.network_browser_collector import (
-    ApolloFirstListCollector,
-    DomMembershipCollector,
-    NetworkBrowserCollector,
-)
+from src.pc.network_browser_collector import ApolloFirstListCollector
 
 
 class ValidationReporter:
@@ -49,27 +45,6 @@ def check_default_collector_factory_is_apollo_first_list_collector(reporter: Val
         reporter.pass_("_run_network_pipeline 기본 collector_factory가 ApolloFirstListCollector(신규 GraphQL-first 경로)임을 확인")
     else:
         reporter.fail(f"_run_network_pipeline 기본 collector_factory가 예상과 다름: {default!r}")
-
-
-def check_default_collector_factory_is_not_legacy_collectors(reporter: ValidationReporter) -> None:
-    signature = inspect.signature(ui.SalesDbCrawlerApp._run_network_pipeline)
-    default = signature.parameters["collector_factory"].default
-    if default is not DomMembershipCollector and default is not NetworkBrowserCollector:
-        reporter.pass_("기본 collector_factory가 더 이상 DomMembershipCollector/NetworkBrowserCollector가 아님(명시 주입 시에만 사용 가능)")
-    else:
-        reporter.fail(f"기본 collector_factory가 여전히 legacy collector임: {default!r}")
-
-
-def check_legacy_collectors_still_importable_for_rollback(reporter: ValidationReporter) -> None:
-    """DomMembershipCollector/NetworkBrowserCollector는 이번 변경으로 전혀
-    수정되지 않았고 비활성 fallback capability로 그대로 보존되어야 한다."""
-    if (
-        hasattr(DomMembershipCollector, "collect_query")
-        and hasattr(NetworkBrowserCollector, "collect_query")
-    ):
-        reporter.pass_("DomMembershipCollector/NetworkBrowserCollector 모두 보존되어 명시적 opt-out(비상 복구)이 가능함")
-    else:
-        reporter.fail("legacy collector가 손상되었거나 collect_query 계약이 없음")
 
 
 def check_run_network_pipeline_has_collection_mode_param_default_basic(reporter: ValidationReporter) -> None:
@@ -146,8 +121,6 @@ def main() -> int:
     reporter = ValidationReporter()
     checks = [
         check_default_collector_factory_is_apollo_first_list_collector,
-        check_default_collector_factory_is_not_legacy_collectors,
-        check_legacy_collectors_still_importable_for_rollback,
         check_run_network_pipeline_has_collection_mode_param_default_basic,
         check_run_network_pipeline_has_home_enrichment_fn_default,
         check_run_network_pipeline_worker_accepts_collection_mode,

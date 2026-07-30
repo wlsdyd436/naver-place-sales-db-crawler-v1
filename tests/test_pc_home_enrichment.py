@@ -31,6 +31,10 @@ from src.pc.home_enrichment import (
     enrich_home_details,
     merge_home_result_into_row,
 )
+from src.pc.network_browser_collector import (
+    _classify_ssr_block_signal,
+    _parse_apollo_state_from_html,
+)
 
 # PAGE300-6G-R1: 운영 안정화 대기(3초)를 테스트에서는 0으로 낮춘다 - 이
 # 모듈 상수는 _enrich_home_batch_async 안에서 매 호출 시 전역으로 참조되므로
@@ -367,6 +371,75 @@ def check_merge_home_result_into_row_unit_cases(reporter: ValidationReporter) ->
             f"7. merge_home_result_into_row 단위 케이스 실패: none={merged_none is row}, "
             f"failed={merged_failed is row}, success={merged_success}, fill={merged_fill}"
         )
+
+
+def _home_result_with_phone(phone: str) -> dict:
+    return {
+        "detail_success": True, "place_id": "1", "홈페이지": "", "인스타": "", "블로그": "",
+        "주소": "", "플레이스 URL": "", "업종": "", "새로오픈여부": "", "방문자리뷰수": "",
+        "블로그리뷰수": "", "대표전화": phone,
+    }
+
+
+def check_merge_blocks_personal_mobile_010(reporter: ValidationReporter) -> None:
+    """merge_home_result_into_row(production 함수): 기본 row 대표전화가
+    공란이고 home detail이 010 번호를 반환해도 개인 휴대전화이므로 채택하지
+    않고 공란을 유지한다(§_is_personal_mobile_phone)."""
+    row = _row("1", phone="")
+    merged = merge_home_result_into_row(row, _home_result_with_phone("010-1234-5678"))
+    if merged["대표전화"] == "":
+        reporter.pass_("010 개인 휴대전화: home detail 값을 채택하지 않고 공란 유지")
+    else:
+        reporter.fail(f"010 개인 휴대전화가 잘못 채택됨: {merged['대표전화']!r}")
+
+
+def check_merge_blocks_personal_mobile_variants(reporter: ValidationReporter) -> None:
+    """011/016/017/018/019 전부 010과 동일하게 차단되어야 한다."""
+    failures = []
+    for prefix in ("011", "016", "017", "018", "019"):
+        row = _row("1", phone="")
+        merged = merge_home_result_into_row(row, _home_result_with_phone(f"{prefix}-123-4567"))
+        if merged["대표전화"] != "":
+            failures.append((prefix, merged["대표전화"]))
+    if not failures:
+        reporter.pass_("011/016/017/018/019 개인 휴대전화 전부 차단됨")
+    else:
+        reporter.fail(f"일부 개인 휴대전화 prefix가 잘못 채택됨: {failures}")
+
+
+def check_merge_blocks_international_format_mobile(reporter: ValidationReporter) -> None:
+    """+82-10-... 국제 형식 개인 휴대전화도 국내 010과 동일하게 차단되어야
+    한다(§_is_personal_mobile_phone의 82+10/11/16~19 판정)."""
+    row = _row("1", phone="")
+    merged = merge_home_result_into_row(row, _home_result_with_phone("+82-10-1234-5678"))
+    if merged["대표전화"] == "":
+        reporter.pass_("국제 형식(+82-10-...) 개인 휴대전화도 차단됨")
+    else:
+        reporter.fail(f"국제 형식 개인 휴대전화가 잘못 채택됨: {merged['대표전화']!r}")
+
+
+def check_merge_allows_landline_phone(reporter: ValidationReporter) -> None:
+    """02(서울 지역번호) 등 유선전화는 개인 휴대전화가 아니므로 대표전화가
+    공란일 때 정상적으로 채워진다."""
+    row = _row("1", phone="")
+    merged = merge_home_result_into_row(row, _home_result_with_phone("02-1234-5678"))
+    if merged["대표전화"] == "02-1234-5678":
+        reporter.pass_("02 지역번호(유선전화)는 정상적으로 대표전화에 채택됨")
+    else:
+        reporter.fail(f"유선전화 보강 실패: {merged['대표전화']!r}")
+
+
+def check_merge_does_not_overwrite_existing_safe_phone_with_personal_mobile(reporter: ValidationReporter) -> None:
+    """기존 목록 단계에 이미 안전한 대표전화가 있으면, home detail이 개인
+    휴대전화를 반환하더라도(또는 다른 유효한 번호라도) 덮어쓰지 않는다
+    (대표전화가 공란일 때만 채택하는 정책, merge_home_result_into_row 자체의
+    `if not row.get("대표전화")` 게이트)."""
+    row = _row("1", phone="02-9999-9999")
+    merged = merge_home_result_into_row(row, _home_result_with_phone("010-0000-1111"))
+    if merged["대표전화"] == "02-9999-9999":
+        reporter.pass_("기존 안전한 대표전화는 home detail 값(개인 휴대전화 포함)으로 덮어써지지 않음")
+    else:
+        reporter.fail(f"기존 대표전화가 잘못 덮어써짐: {merged['대표전화']!r}")
 
 
 def check_core_fields_never_overwritten_by_home_result(reporter: ValidationReporter) -> None:
@@ -821,6 +894,54 @@ def check_diagnostics_report_structure_and_no_sensitive_data(reporter: Validatio
         reporter.fail(f"H. 진단 JSON 구조/민감정보 검증 실패: report={report}")
 
 
+# ============================================================================
+# _parse_apollo_state_from_html / _classify_ssr_block_signal 직접 단위 검증
+# (src/pc/network_browser_collector.py 소속, 이 모듈이 SSR 상세 GET 응답
+# 처리에 그대로 재사용하는 순수 함수 - _fetch_place_detail_ssr 삭제 이후
+# 직접 테스트가 끊겨 있었던 것을 복구)
+# ============================================================================
+
+
+def check_parse_apollo_state_from_html_extracts_state(reporter: ValidationReporter) -> None:
+    html = _apollo_html("2014880028")
+    state = _parse_apollo_state_from_html(html.decode("utf-8"))
+    base = state.get("PlaceDetailBase:2014880028") if state else None
+    if state is not None and base is not None and base.get("id") == "2014880028":
+        reporter.pass_("_parse_apollo_state_from_html: window.__APOLLO_STATE__ JSON을 정확히 추출")
+    else:
+        reporter.fail(f"_parse_apollo_state_from_html 추출 실패: state={state}")
+
+
+def check_parse_apollo_state_from_html_missing_marker_returns_none(reporter: ValidationReporter) -> None:
+    result = _parse_apollo_state_from_html("<html>no apollo state here</html>")
+    if result is None:
+        reporter.pass_("_parse_apollo_state_from_html: __APOLLO_STATE__ 마커가 없으면 None 반환(예외 없음)")
+    else:
+        reporter.fail(f"__APOLLO_STATE__ 없는 HTML에서 잘못된 값 반환: {result}")
+
+
+def check_classify_ssr_block_signal_detects_blocking_http_status(reporter: ValidationReporter) -> None:
+    blocked_403 = _classify_ssr_block_signal(403, "")
+    blocked_429 = _classify_ssr_block_signal(429, "")
+    not_blocked_200 = _classify_ssr_block_signal(200, "<html>ok</html>")
+    if (
+        blocked_403 == {"blocked": True, "block_type": "HTTP_403"}
+        and blocked_429 == {"blocked": True, "block_type": "HTTP_429"}
+        and not_blocked_200 == {"blocked": False, "block_type": ""}
+    ):
+        reporter.pass_("_classify_ssr_block_signal: HTTP 403/405/429는 차단으로, 200은 정상으로 분류")
+    else:
+        reporter.fail(f"_classify_ssr_block_signal HTTP 상태 분류 이상: 403={blocked_403} 429={blocked_429} 200={not_blocked_200}")
+
+
+def check_classify_ssr_block_signal_detects_captcha_text_marker(reporter: ValidationReporter) -> None:
+    result = _classify_ssr_block_signal(200, "<html>보안 확인이 필요합니다</html>")
+    if result == {"blocked": True, "block_type": "CAPTCHA_CHALLENGE"}:
+        reporter.pass_("_classify_ssr_block_signal: HTTP 200이어도 CAPTCHA 텍스트 마커('보안 확인')가 있으면 차단으로 분류")
+    else:
+        reporter.fail(f"CAPTCHA 텍스트 마커 판정 이상: {result}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -832,6 +953,11 @@ def main() -> bool:
         check_pause_event_blocks_new_requests_until_resumed,
         check_duplicate_place_id_fetched_once,
         check_merge_home_result_into_row_unit_cases,
+        check_merge_blocks_personal_mobile_010,
+        check_merge_blocks_personal_mobile_variants,
+        check_merge_blocks_international_format_mobile,
+        check_merge_allows_landline_phone,
+        check_merge_does_not_overwrite_existing_safe_phone_with_personal_mobile,
         check_core_fields_never_overwritten_by_home_result,
         check_basic_and_home_sns_share_core_fields_given_same_list_rows,
         check_enrich_home_details_sync_wrapper_bypasses_native_cdp_when_injected,
@@ -848,6 +974,10 @@ def main() -> bool:
         check_retry_pass_concurrency_capped_at_one,
         check_user_stop_before_retry_pass_skips_retry,
         check_diagnostics_report_structure_and_no_sensitive_data,
+        check_parse_apollo_state_from_html_extracts_state,
+        check_parse_apollo_state_from_html_missing_marker_returns_none,
+        check_classify_ssr_block_signal_detects_blocking_http_status,
+        check_classify_ssr_block_signal_detects_captcha_text_marker,
     ]
     for check in checks:
         check(reporter)

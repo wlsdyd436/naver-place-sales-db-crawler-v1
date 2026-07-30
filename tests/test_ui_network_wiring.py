@@ -59,7 +59,7 @@ def _make_app():
 
 
 class FakeNetworkCollector:
-    """NetworkBrowserCollector와 동일한 계약(컨텍스트 매니저 + collect_query)만
+    """ApolloFirstListCollector와 동일한 계약(컨텍스트 매니저 + collect_query)만
     흉내내는 fake. 실제 Playwright/브라우저는 전혀 다루지 않는다."""
 
     def __init__(self, collected_at):
@@ -529,36 +529,6 @@ def check_parse_positive_int_validation(reporter: ValidationReporter) -> None:
         reporter.fail(f"입력 검증 helper 결과가 예상과 다름: valid_ok={valid_ok}, invalid_ok={invalid_ok}")
 
 
-def check_legacy_path_untouched(reporter: ValidationReporter) -> None:
-    """ARCH-300C WIRE-2C-2: start_crawl은 이제 _DEFAULT_COLLECTION_ENGINE에
-    따라 _start_network_crawl(기본값)/_start_legacy_crawl(내부 롤백)로만
-    위임하는 얇은 dispatcher다. legacy 메서드(_run_queue_pipeline 등)는
-    전부 보존되고, _start_legacy_crawl은 여전히 _run_queue_pipeline만
-    호출하며 _run_network_pipeline은 호출하지 않는다."""
-    import inspect
-
-    has_methods = (
-        hasattr(ui.SalesDbCrawlerApp, "_run_queue_pipeline")
-        and hasattr(ui.SalesDbCrawlerApp, "_collect_premium_query")
-        and hasattr(ui.SalesDbCrawlerApp, "_collect_basic_query")
-        and hasattr(ui.SalesDbCrawlerApp, "_collect_premium_query_legacy")
-        and hasattr(ui.SalesDbCrawlerApp, "_run_network_pipeline")
-        and hasattr(ui.SalesDbCrawlerApp, "_start_legacy_crawl")
-        and hasattr(ui.SalesDbCrawlerApp, "_start_network_crawl")
-    )
-    legacy_source = inspect.getsource(ui.SalesDbCrawlerApp._start_legacy_crawl)
-    legacy_preserved = (
-        "self._run_queue_pipeline" in legacy_source
-        and "self._run_network_pipeline" not in legacy_source
-    )
-    network_is_default = ui._DEFAULT_COLLECTION_ENGINE == "network"
-
-    if has_methods and legacy_preserved and network_is_default:
-        reporter.pass_("legacy 경로 보존 + 기본 엔진 전환: _run_queue_pipeline 등 legacy 메서드 보존, _start_legacy_crawl은 여전히 _run_queue_pipeline만 호출, 기본 엔진은 network")
-    else:
-        reporter.fail(f"legacy 경로 보존 결과가 예상과 다름: has_methods={has_methods}, legacy_preserved={legacy_preserved}, network_is_default={network_is_default}")
-
-
 def check_default_values_for_network_engine(reporter: ValidationReporter) -> None:
     """ARCH-300C WIRE-2C-2: Network/List가 기본 실행 경로가 되면서
     per_query_limit 기본값이 30으로 다시 바뀌어야 한다(target_count는
@@ -614,6 +584,135 @@ def check_run_network_pipeline_passes_target_count_through(reporter: ValidationR
         reporter.fail(f"Network worker 결과가 예상과 다름: calls={calls}")
 
 
+# ============================================================================
+# collection_mode에 따른 home_enrichment_fn 호출 여부(§_run_network_pipeline
+# 1542행의 `if collection_mode == "home_sns" and rows and not security_blocked`
+# 게이트를 실제 production 메서드 호출로 직접 검증 - 수동 dict 비교가 아님)
+# ============================================================================
+
+
+def _core_field_rows(n: int) -> list:
+    return [
+        {
+            "업체명": f"업체{i}", "업종": "카페", "새로오픈여부": "", "방문자리뷰수": 10,
+            "블로그리뷰수": 0, "총리뷰수": 10, "주소": f"서울특별시 강동구 천호동 {i}",
+            "대표전화": "", "플레이스 URL": f"https://pcmap.place.naver.com/place/{i}/home",
+            "수집일": "2026-07-30", "홈페이지": "", "인스타": "", "블로그": "", "추가 링크": "",
+            "place_id": str(i),
+        }
+        for i in range(n)
+    ]
+
+
+_CORE_FIELDS = ("업체명", "업종", "새로오픈여부", "방문자리뷰수", "블로그리뷰수", "총리뷰수", "주소", "대표전화", "플레이스 URL", "수집일")
+_LINK_FIELDS = ("홈페이지", "인스타", "블로그", "추가 링크")
+
+
+def _home_enrichment_fn_must_not_be_called(rows, **kwargs):
+    raise AssertionError("home_enrichment_fn이 호출되면 안 되는 경로(collection_mode!='home_sns')에서 호출됨")
+
+
+class SpyHomeEnrichmentFn:
+    """실제 enrich_home_details와 동일한 반환 계약(요청서 §_run_network_pipeline
+    1552-1557행이 참조하는 키)만 흉내낸다. 허용된 링크 필드(홈페이지/인스타/
+    블로그/추가 링크)만 채우고 core 필드는 절대 건드리지 않는다(실제
+    merge_home_result_into_row의 core-field 불변 정책과 동일한 계약)."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    def __call__(self, rows, **kwargs):
+        self.calls.append({"rows": rows, **kwargs})
+        enriched = []
+        for row in rows:
+            new_row = dict(row)
+            new_row["홈페이지"] = f"https://example-{row['place_id']}.test"
+            new_row["인스타"] = f"https://instagram.com/example{row['place_id']}"
+            enriched.append(new_row)
+        return {
+            "rows": enriched,
+            "stop_reason": None,
+            "security_blocked": False,
+            "home_success_count": len(rows),
+            "failure_count": 0,
+            "not_attempted_count": 0,
+        }
+
+
+def check_basic_mode_never_calls_home_enrichment_fn(reporter: ValidationReporter) -> None:
+    """collection_mode="basic"(기본값)이면 rows가 있어도 home_enrichment_fn을
+    전혀 호출하지 않는다 - 실제 _run_network_pipeline을 호출하고, 호출되면
+    바로 실패하는 home_enrichment_fn을 주입해 증명한다(수동 dict 비교가 아님,
+    실제 네트워크 호출 없음)."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _core_field_rows(3)
+    result = _base_result(stop_reason="queue_exhausted", final_count=3, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "output/naver_place_network_db.xlsx",
+        collection_mode="basic",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        home_enrichment_fn=_home_enrichment_fn_must_not_be_called,
+    )
+
+    ok = (
+        returned["rows"] == rows
+        and all(row["홈페이지"] == "" and row["인스타"] == "" and row["블로그"] == "" and row["추가 링크"] == "" for row in returned["rows"])
+        and len(exporter.calls) == 1
+        and exporter.calls[0]["merged_data"] == rows
+    )
+    if ok:
+        reporter.pass_("기본모드(basic): home_enrichment_fn 호출 0회, rows 보존, 홈페이지/인스타/블로그/추가 링크 공란 유지, exporter에 원본 rows 전달")
+    else:
+        reporter.fail(f"기본모드 결과가 예상과 다름: returned={returned}, exporter.calls={exporter.calls}")
+
+
+def check_home_sns_mode_calls_home_enrichment_fn_once_and_preserves_core_fields(reporter: ValidationReporter) -> None:
+    """collection_mode="home_sns"면 home_enrichment_fn이 정확히 1회 호출되고,
+    그 결과가 result["rows"]에 반영된다 - 같은 입력 row로 기본모드와 비교해
+    core 필드(업체명/업종/새로오픈여부/리뷰수/주소/대표전화/플레이스 URL/
+    수집일)는 동일하게 유지되고 허용된 링크 필드만 달라지는지 확인한다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _core_field_rows(3)
+    result = _base_result(stop_reason="queue_exhausted", final_count=3, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+    home_fn = SpyHomeEnrichmentFn()
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "output/naver_place_network_db.xlsx",
+        collection_mode="home_sns",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        home_enrichment_fn=home_fn,
+    )
+
+    basic_rows = _core_field_rows(3)  # 기본모드 대조군(home 보강 없이 그대로)
+    core_fields_match = all(
+        all(returned["rows"][i][field] == basic_rows[i][field] for field in _CORE_FIELDS)
+        for i in range(3)
+    )
+    only_allowed_links_changed = all(
+        returned["rows"][i]["홈페이지"] != "" and returned["rows"][i]["인스타"] != ""
+        and returned["rows"][i]["블로그"] == basic_rows[i]["블로그"]
+        and returned["rows"][i]["추가 링크"] == basic_rows[i]["추가 링크"]
+        for i in range(3)
+    )
+    ok = (
+        len(home_fn.calls) == 1
+        and home_fn.calls[0]["rows"] == rows
+        and core_fields_match
+        and only_allowed_links_changed
+    )
+    if ok:
+        reporter.pass_("home_sns모드: home_enrichment_fn 정확히 1회 호출, core 필드는 기본모드와 동일 유지, 허용된 링크 필드(홈페이지/인스타)만 변경")
+    else:
+        reporter.fail(f"home_sns모드 결과가 예상과 다름: calls={len(home_fn.calls)}, returned={returned}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -632,10 +731,11 @@ def main() -> int:
     check_exporter_exception_marks_export_error(reporter)
     check_should_continue_reflects_stop_event(reporter)
     check_parse_positive_int_validation(reporter)
-    check_legacy_path_untouched(reporter)
     check_default_values_for_network_engine(reporter)
     check_target_count_input_enabled_no_stale_guidance(reporter)
     check_run_network_pipeline_passes_target_count_through(reporter)
+    check_basic_mode_never_calls_home_enrichment_fn(reporter)
+    check_home_sns_mode_calls_home_enrichment_fn_once_and_preserves_core_fields(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

@@ -18,7 +18,6 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.pc.network_browser_collector import (
     _APOLLO_FULL_STATE_JS,
-    _DOM_SCROLL_JS,
     ApolloFirstListCollector,
     collect_apollo_first_list_query,
 )
@@ -317,20 +316,19 @@ def check_page1_ambiguous_is_navigation_error(reporter: ValidationReporter) -> N
         reporter.fail(f"3. ambiguous 케이스 실패: {result}")
 
 
-def check_dom_scroll_js_never_evaluated(reporter: ValidationReporter) -> None:
+def check_only_apollo_state_js_evaluated(reporter: ValidationReporter) -> None:
     state = _apollo_state(JOB["query"], [("111", "카페 A")])
     page = FakeApolloPage([_apollo_state_result(state)])
     result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-24")
     evaluated = page._frame.evaluated_scripts
     ok = (
         result["navigation_error"] is False
-        and _DOM_SCROLL_JS not in evaluated
         and all(script == _APOLLO_FULL_STATE_JS for script in evaluated)
     )
     if ok:
-        reporter.pass_("4. _DOM_SCROLL_JS 미호출 확인(신규 경로는 DOM 풀스크롤을 전혀 실행하지 않음)")
+        reporter.pass_("4. Apollo state 폴링(_APOLLO_FULL_STATE_JS) 외 다른 스크립트는 평가되지 않음")
     else:
-        reporter.fail(f"4. DOM_SCROLL_JS 호출 스파이 실패: evaluated={evaluated}")
+        reporter.fail(f"4. 평가된 스크립트 확인 실패: evaluated={evaluated}")
 
 
 def check_page2_graphql_harvest_and_dedup(reporter: ValidationReporter) -> None:
@@ -1130,13 +1128,40 @@ def check_stop_event_aborts_pagination_before_next_page(reporter: ValidationRepo
         reporter.fail(f"NC-6. 중지 케이스 실패: rows={len(result['rows'])}, stop={result.get('pagination_stop_reason')}, calls={page._frame.get_by_role_calls}")
 
 
+def check_default_session_factory_used_when_not_injected(reporter: ValidationReporter) -> None:
+    """session_factory를 주입하지 않으면 ApolloFirstListCollector가
+    network_browser_collector._default_session_factory를 그대로 쓴다(production
+    배선) - 이전 대청소에서 이 함수를 실수로 삭제했다가 복구한 이력이 있어
+    이 기본 배선 자체를 회귀 가드로 남긴다."""
+    collector = ApolloFirstListCollector(collected_at="2026-07-30")
+    if collector._session_factory is network_browser_collector._default_session_factory:
+        reporter.pass_("session_factory 미주입 시 _default_session_factory가 기본값으로 쓰임")
+    else:
+        reporter.fail(f"기본 session_factory 배선 이상: {collector._session_factory!r}")
+
+
+def check_default_session_factory_builds_session_without_launching_browser(reporter: ValidationReporter) -> None:
+    """_default_session_factory()는 세션 객체를 생성만 할 뿐(__enter__ 호출
+    전까지) 실제 브라우저를 띄우지 않는다(함수 자체의 계약) - 반환 객체가
+    NativeCdpBrowserSession 계약(context manager + collect_query 상위에서
+    쓰는 __enter__/__exit__)을 만족하는지만 라이브 브라우저 없이 확인한다."""
+    session = network_browser_collector._default_session_factory()
+    ok = hasattr(session, "__enter__") and hasattr(session, "__exit__") and type(session).__name__ in (
+        "NativeCdpBrowserSession", "BrowserSession",
+    )
+    if ok:
+        reporter.pass_(f"_default_session_factory(): 브라우저를 실행하지 않고 세션 객체({type(session).__name__})만 생성")
+    else:
+        reporter.fail(f"_default_session_factory() 반환값 이상: {session!r}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
         check_page1_success_builds_tagged_rows,
         check_page1_apollo_never_ready_is_navigation_error,
         check_page1_ambiguous_is_navigation_error,
-        check_dom_scroll_js_never_evaluated,
+        check_only_apollo_state_js_evaluated,
         check_page2_graphql_harvest_and_dedup,
         check_captcha_mid_pagination_stops_with_partial_rows,
         check_status_429_stops_with_partial_rows,
@@ -1159,6 +1184,8 @@ def main() -> bool:
         check_review_filter_disabled_when_both_bounds_none,
         check_pause_event_blocks_next_page_until_resumed,
         check_stop_event_aborts_pagination_before_next_page,
+        check_default_session_factory_used_when_not_injected,
+        check_default_session_factory_builds_session_without_launching_browser,
     ]
     for check in checks:
         check(reporter)

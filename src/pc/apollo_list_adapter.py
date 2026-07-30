@@ -2,10 +2,8 @@
 # 파서. window.__APOLLO_STATE__의 ROOT_QUERY에서 "현재 검색어와 일치하는 메인
 # placeList(...) operation" 하나만 선택하고 businesses.items의 __ref만 따라간다.
 #
-# 이 모듈은 기존 DomMembershipCollector/collect_dom_membership_query(DOM 풀스크롤 +
-# Apollo + Network 3중 병합, network_browser_collector.py)를 대체하지 않는다 -
-# 그 경로는 무수정으로 보존되며, 이 모듈은 사용자가 명시적으로 승인한 신규
-# Apollo/GraphQL-first 경로(ApolloFirstListCollector)만을 위해 존재한다.
+# 이 모듈은 사용자가 명시적으로 승인한 Apollo/GraphQL-first 목록 수집 경로
+# (ApolloFirstListCollector, network_browser_collector.py)만을 위해 존재한다.
 #
 # 알려진 미검증 가정(Live 검증 전까지 문서로만 남김 - 이번 구현 단계는 Live 요청을
 # 실행하지 않는다): placeList(...) 키의 정확한 input 필드명(query/filterOpening/
@@ -415,8 +413,7 @@ def extract_new_opening_place_list_from_apollo(apollo_state, expected_query: str
 
 def build_rows_from_apollo_list_result(list_result: dict, collected_at: str, *, source_query: str = None) -> list:
     """extract_main_place_list_from_apollo의 items를 network_list_scraper._map_item_to_row로
-    순서 보존 매핑한다(순수 함수 - source_page/source_city 등은 호출자가 이후 붙인다,
-    collect_network_query가 이미 쓰는 패턴과 동일)."""
+    순서 보존 매핑한다(순수 함수 - source_page/source_city 등은 호출자가 이후 붙인다)."""
     rows = []
     for item in list_result.get("items") or []:
         if not isinstance(item, dict):

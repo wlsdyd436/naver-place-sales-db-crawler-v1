@@ -15,11 +15,8 @@ from src.pc.network_list_scraper import (
     _extract_external_urls,
     _extract_list_items,
     _map_item_to_row,
-    build_candidate_record,
+    build_place_url_from_id,
     classify_captcha_signal,
-    classify_query_efficiency,
-    count_rows_by_field,
-    count_rows_by_source_page,
     dedup_rows,
     format_common_address,
     is_candidate_response,
@@ -603,32 +600,6 @@ def check_source_page_internal_meta_not_in_excel_columns(reporter: ValidationRep
         reporter.fail(f"source_page 미전달인데 키가 생김: {row_without_source_page}")
 
 
-def check_build_candidate_record_shape(reporter: ValidationReporter) -> None:
-    record = build_candidate_record(
-        "https://map.naver.com/p/api/search/allSearch?query=x",
-        200,
-        "xhr",
-        top_level_keys=["result"],
-    )
-    ok = (
-        record["url"] == "https://map.naver.com/p/api/search/allSearch?query=x"
-        and record["status"] == 200
-        and record["resource_type"] == "xhr"
-        and record["top_level_keys"] == ["result"]
-        and record["parse_error"] is None
-    )
-    if ok:
-        reporter.pass_("build_candidate_record가 후보 응답 메타를 예상 형태로 조립")
-    else:
-        reporter.fail(f"build_candidate_record 결과가 예상과 다름: {record}")
-
-    error_record = build_candidate_record("https://x", 500, "fetch", parse_error="ValueError: bad json")
-    if error_record["top_level_keys"] == [] and error_record["parse_error"] == "ValueError: bad json":
-        reporter.pass_("build_candidate_record가 파싱 실패(parse_error)도 예외 없이 기록")
-    else:
-        reporter.fail(f"build_candidate_record 실패 케이스 결과가 예상과 다름: {error_record}")
-
-
 # ---------------------------------------------------------------------------
 # PoC-2R: CAPTCHA 감지 오탐 보정(classify_captcha_signal) 검증
 # ---------------------------------------------------------------------------
@@ -688,39 +659,6 @@ def check_captcha_signal_click_exception_is_strong_signal(reporter: ValidationRe
 # ---------------------------------------------------------------------------
 
 
-def check_count_rows_by_source_page_three_pages(reporter: ValidationReporter) -> None:
-    """page=1/2/3에서 온 row를 병합했을 때 source_page별 건수가 정확히 집계되는지 확인한다."""
-    seen: set = set()
-    page1_rows = dedup_rows(
-        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=1) for i in range(1, 21)],
-        seen,
-    )
-    page2_rows = dedup_rows(
-        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=2) for i in range(21, 91)],
-        seen,
-    )
-    page3_rows = dedup_rows(
-        [_map_item_to_row({"id": str(i), "name": f"카페{i}"}, "2026-07-09", source_page=3) for i in range(91, 141)],
-        seen,
-    )
-    merged = page1_rows + page2_rows + page3_rows
-    counts = count_rows_by_source_page(merged)
-
-    ok = counts == {1: 20, 2: 70, 3: 50}
-    if ok:
-        reporter.pass_("page=1/2/3 병합 후 source_page별 건수가 각각 20/70/50건으로 정확히 집계됨")
-    else:
-        reporter.fail(f"source_page별 집계 결과가 예상과 다름: {counts}")
-
-    # source_page를 채우지 않은 행(예: PoC-1 스타일 호출)은 "unknown"으로 묶여야 한다.
-    legacy_row = _map_item_to_row({"id": "9999", "name": "레거시카페"}, "2026-07-09")
-    counts_with_unknown = count_rows_by_source_page(merged + [legacy_row])
-    if counts_with_unknown.get("unknown") == 1 and counts_with_unknown.get(1) == 20:
-        reporter.pass_("source_page 미지정(레거시) 행은 'unknown'으로 별도 집계됨")
-    else:
-        reporter.fail(f"unknown 집계 결과가 예상과 다름: {counts_with_unknown}")
-
-
 def check_total_dedup_after_three_page_merge(reporter: ValidationReporter) -> None:
     """page=1/2/3 응답 중 일부가 겹치더라도(같은 place_id 재등장) 3페이지 병합 후
     총 dedup row 수가 정확한지 확인한다(PoC-3: 중복 있는 실전 시나리오 모사)."""
@@ -774,43 +712,6 @@ def check_source_dong_and_query_internal_meta_not_in_excel_columns(reporter: Val
         reporter.fail(f"source_dong/source_query 미전달인데 키가 생김: {row_without_meta}")
 
 
-def check_count_rows_by_field_generic_aggregation(reporter: ValidationReporter) -> None:
-    """count_rows_by_field가 source_page뿐 아니라 임의 필드(source_dong)로도
-    동일하게 집계할 수 있는지 확인한다(count_rows_by_source_page의 일반화 검증)."""
-    rows = [
-        _map_item_to_row({"id": "1", "name": "A"}, "2026-07-09", source_dong="천호동"),
-        _map_item_to_row({"id": "2", "name": "B"}, "2026-07-09", source_dong="천호동"),
-        _map_item_to_row({"id": "3", "name": "C"}, "2026-07-09", source_dong="성내동"),
-        _map_item_to_row({"id": "4", "name": "D"}, "2026-07-09"),  # source_dong 없음 -> unknown
-    ]
-    counts = count_rows_by_field(rows, "source_dong")
-    if counts == {"천호동": 2, "성내동": 1, "unknown": 1}:
-        reporter.pass_("count_rows_by_field가 source_dong 기준으로 정확히 집계(미지정 행은 unknown)")
-    else:
-        reporter.fail(f"count_rows_by_field(source_dong) 결과가 예상과 다름: {counts}")
-
-    # count_rows_by_source_page와 동일한 결과를 내는지(일반화가 기존 동작을 보존하는지) 교차 확인.
-    page_rows = [
-        _map_item_to_row({"id": "1", "name": "A"}, "2026-07-09", source_page=1),
-        _map_item_to_row({"id": "2", "name": "B"}, "2026-07-09", source_page=2),
-    ]
-    if count_rows_by_field(page_rows, "source_page") == count_rows_by_source_page(page_rows):
-        reporter.pass_("count_rows_by_field(source_page)가 기존 count_rows_by_source_page와 동일한 결과를 냄")
-    else:
-        reporter.fail(
-            f"count_rows_by_field/source_page 교차 검증 실패: "
-            f"{count_rows_by_field(page_rows, 'source_page')} vs {count_rows_by_source_page(page_rows)}"
-        )
-
-    custom_label = count_rows_by_field(
-        [_map_item_to_row({"id": "9", "name": "E"}, "2026-07-09")], "source_dong", unknown_label="미지정"
-    )
-    if custom_label == {"미지정": 1}:
-        reporter.pass_("unknown_label을 커스텀 문자열로 지정할 수 있음")
-    else:
-        reporter.fail(f"custom unknown_label 결과가 예상과 다름: {custom_label}")
-
-
 def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) -> None:
     cases = {
         "allsearch xhr": (True, "https://map.naver.com/p/api/search/allSearch?query=x", "xhr"),
@@ -833,46 +734,8 @@ def check_is_candidate_response_filters_correctly(reporter: ValidationReporter) 
 
 
 # ---------------------------------------------------------------------------
-# PoC-6: classify_query_efficiency / should_stop_for_target 검증
+# should_stop_for_target 검증
 # ---------------------------------------------------------------------------
-
-
-def check_classify_query_efficiency_high_ratio_not_low(reporter: ValidationReporter) -> None:
-    """PoC-4/PoC-5의 '깨끗한 동'(raw=20, unique_added=20)처럼 비율이 높으면
-    low_efficiency=False가 되어야 한다."""
-    result = classify_query_efficiency(20, 20)
-    if result["efficiency_ratio"] == 1.0 and result["low_efficiency"] is False:
-        reporter.pass_("raw=20/unique_added=20이면 efficiency_ratio=1.0, low_efficiency=False")
-    else:
-        reporter.fail(f"높은 비율 처리 결과가 예상과 다름: {result}")
-
-
-def check_classify_query_efficiency_zero_unique_is_low(reporter: ValidationReporter) -> None:
-    """PoC-5의 성내제1~3동(raw=20, unique_added=0)처럼 신규 기여가 0이면
-    low_efficiency=True가 되어야 한다."""
-    result = classify_query_efficiency(20, 0)
-    if result["efficiency_ratio"] == 0.0 and result["low_efficiency"] is True:
-        reporter.pass_("raw=20/unique_added=0이면 efficiency_ratio=0.0, low_efficiency=True(PoC-5 성내제N동 재현)")
-    else:
-        reporter.fail(f"zero unique_added 처리 결과가 예상과 다름: {result}")
-
-
-def check_classify_query_efficiency_zero_raw_items_no_crash(reporter: ValidationReporter) -> None:
-    """raw_items가 0이면(응답 자체가 없음) 0으로 나누지 않고 ratio=0.0을 반환한다."""
-    result = classify_query_efficiency(0, 0)
-    if result["efficiency_ratio"] == 0.0 and result["low_efficiency"] is True:
-        reporter.pass_("raw_items=0이어도 예외 없이 efficiency_ratio=0.0으로 처리됨")
-    else:
-        reporter.fail(f"raw_items=0 처리 결과가 예상과 다름: {result}")
-
-
-def check_classify_query_efficiency_boundary_values(reporter: ValidationReporter) -> None:
-    """비율이 임계값(0.15) 이상이어도 unique_added가 절대 하한(3) 미만이면 low_efficiency다."""
-    result = classify_query_efficiency(10, 2)  # ratio=0.2 (>=0.15) 이지만 unique_added=2 (<3)
-    if abs(result["efficiency_ratio"] - 0.2) < 1e-9 and result["low_efficiency"] is True:
-        reporter.pass_("비율은 임계값 이상이어도 unique_added 절대 하한 미만이면 low_efficiency=True")
-    else:
-        reporter.fail(f"경계값 처리 결과가 예상과 다름: {result}")
 
 
 def check_should_stop_for_target_reaches_and_below(reporter: ValidationReporter) -> None:
@@ -1134,6 +997,24 @@ def check_format_common_address_preserves_building_style_dong_tokens(reporter: V
         reporter.fail(f"건물 의미 동 보존 결과가 예상과 다름: r1={r1!r}, r2={r2!r}, r3={r3!r}")
 
 
+def check_build_place_url_from_id_valid(reporter: ValidationReporter) -> None:
+    url = build_place_url_from_id("2014880028")
+    if url == "https://pcmap.place.naver.com/place/2014880028/home":
+        reporter.pass_("build_place_url_from_id: 유효한 숫자 ID로 범용 place URL 생성")
+    else:
+        reporter.fail(f"build_place_url_from_id 결과 이상: {url}")
+
+
+def check_build_place_url_from_id_rejects_malformed(reporter: ValidationReporter) -> None:
+    empty = build_place_url_from_id("")
+    non_numeric = build_place_url_from_id("abc123")
+    none_value = build_place_url_from_id(None)
+    if empty == "" and non_numeric == "" and none_value == "":
+        reporter.pass_("build_place_url_from_id: 빈 값/비숫자 ID는 URL을 만들지 않고 거부")
+    else:
+        reporter.fail(f"malformed ID 처리 이상: empty={empty!r} non_numeric={non_numeric!r} none={none_value!r}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -1167,19 +1048,12 @@ def main() -> int:
     check_multi_page_merge_dedup_by_place_id(reporter)
     check_multi_page_merge_grows_when_no_duplicates(reporter)
     check_source_page_internal_meta_not_in_excel_columns(reporter)
-    check_build_candidate_record_shape(reporter)
     check_captcha_signal_passive_marker_does_not_halt(reporter)
     check_captcha_signal_visible_indicator_is_active(reporter)
     check_captcha_signal_click_exception_is_strong_signal(reporter)
-    check_count_rows_by_source_page_three_pages(reporter)
     check_total_dedup_after_three_page_merge(reporter)
     check_source_dong_and_query_internal_meta_not_in_excel_columns(reporter)
-    check_count_rows_by_field_generic_aggregation(reporter)
     check_is_candidate_response_filters_correctly(reporter)
-    check_classify_query_efficiency_high_ratio_not_low(reporter)
-    check_classify_query_efficiency_zero_unique_is_low(reporter)
-    check_classify_query_efficiency_zero_raw_items_no_crash(reporter)
-    check_classify_query_efficiency_boundary_values(reporter)
     check_should_stop_for_target_reaches_and_below(reporter)
     check_should_stop_for_target_non_positive_target_is_false(reporter)
     check_butteron_instagram_type_mismatch_fixture(reporter)
@@ -1193,6 +1067,8 @@ def main() -> int:
     check_classify_single_url_hostname_overrides_unknown_type_label(reporter)
     check_format_common_address_removes_duplicate_dong_paren_suffix(reporter)
     check_format_common_address_preserves_building_style_dong_tokens(reporter)
+    check_build_place_url_from_id_valid(reporter)
+    check_build_place_url_from_id_rejects_malformed(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

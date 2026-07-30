@@ -1,8 +1,8 @@
-# 정식 출시 전 PC 단일 엔진 전환 - Stage 2 (browser_session/list_scraper 경계) 청크1.
 # Playwright 브라우저 생명주기(launch/context/page)와 진단 캡처 트리거를 소유합니다.
-# 이 모듈은 카드 탐색/스크롤/페이지네이션/파싱 로직을 갖지 않으며(list_scraper.py 책임),
-# CAPTCHA 우회/자동 해결을 시도하지 않습니다. 진단 캡처는 page가 살아있는 이 계층에서
-# 호출자가 명시적으로 수행해야 합니다(teardown 이후에는 캡처가 불가능하기 때문).
+# 이 모듈은 목록 탐색/페이지네이션/파싱 로직을 갖지 않으며(network_browser_collector.py/
+# network_list_scraper.py 책임), CAPTCHA 우회/자동 해결을 시도하지 않습니다. 진단 캡처는
+# page가 살아있는 이 계층에서 호출자가 명시적으로 수행해야 합니다(teardown 이후에는
+# 캡처가 불가능하기 때문).
 #
 # 2026-07-21 Native Edge/Chrome + CDP Attach 통합: 이 파일 하단의 NativeCdpBrowserSession은
 # 별도 클래스로 추가됐으며, 위 BrowserSession(launch 방식)은 수정하지 않고 그대로
@@ -139,9 +139,9 @@ class BrowserSession:
     def find_entry_frame(self):
         """entryIframe(상세 패널)을 우선 찾고, 실패 시 frames fallback을 사용합니다.
 
-        find_search_frame과 동일한 패턴이며, Stage 3 상세 수집(detail_scraper.py)에서
-        업체 상세(대표전화/전체주소) 추출을 위해 사용합니다. 이 메서드는 프레임을
-        찾기만 하고 클릭/네비게이션/대기는 호출자(detail_scraper)가 담당합니다.
+        find_search_frame과 동일한 패턴이며, 업체 상세(대표전화/전체주소) 추출을
+        위해 사용합니다. 이 메서드는 프레임을 찾기만 하고 클릭/네비게이션/대기는
+        호출자가 담당합니다.
         """
         page = self.page
         try:
@@ -191,8 +191,8 @@ class BrowserSession:
     def keep_open_if_configured(self) -> None:
         """keep_open_on_error=True이면 keep_open_timeout_sec만큼 브라우저를 유지합니다(bounded).
 
-        호출자(list_scraper의 collector)가 진단 캡처 이후, teardown 직전에
-        명시적으로 호출해야 합니다. capture_artifacts 여부와 무관하게 동작합니다.
+        호출자가 진단 캡처 이후, teardown 직전에 명시적으로 호출해야 합니다.
+        capture_artifacts 여부와 무관하게 동작합니다.
         """
         if not self.diagnostic_config.keep_open_on_error:
             return
@@ -240,7 +240,7 @@ class BrowserSession:
 #
 # 이 클래스는 BrowserSession과 동일한 context manager 계약(.context/.page,
 # __enter__/__exit__)만 제공한다 - 실제 production 소비자인
-# NetworkBrowserCollector(network_browser_collector.py)는 session의
+# ApolloFirstListCollector(network_browser_collector.py)는 session의
 # .context/.page만 사용하므로 그 외 메서드는 추가하지 않는다(요청 범위 외
 # 기능 추가 금지).
 

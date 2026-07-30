@@ -1,5 +1,4 @@
-# 정식 출시 전 PC 단일 엔진 전환 - Stage 1 (safety 분리) 청크1.
-# 진단 모드 설정 객체입니다. 기존 pc_crawler.py는 참조하지 않으며 프로덕션 경로에 연결되지 않습니다.
+# 진단 모드/브라우저 backend 설정 객체입니다.
 import os
 import sys
 from dataclasses import dataclass

@@ -23,7 +23,6 @@ from src.pc.network_list_scraper import (
     _normalize_review_count,
     _resolve_new_open_tristate,
     _resolve_official_phone,
-    merge_dom_row_fields,
 )
 
 
@@ -190,18 +189,6 @@ def test_field_policy_suite():
     else:
         reporter.fail("20. 개인 모바일 원문이 결과에 노출됨")
 
-    # 21. 빈 전화가 기존 유효 번호를 덮어쓰지 않음 (merge_dom_row_fields 레벨,
-    # detail_row가 개인 모바일을 반환해도 network_row의 유효 값을 지키지 않고
-    # 안전하게 공란 처리되는지 확인 - 상세 경로 안전망 검증)
-    dom_row21 = {"place_id": "21", "normalized_name": "G", "category": "카페", "address_text": "천호동 21"}
-    network_match21 = {"row": {"place_id": "21", "대표전화": "02-999-9999"}}
-    detail_result21 = {"detail_success": True, "place_id": "21", "대표전화": "010-0000-8888"}
-    merged21 = merge_dom_row_fields(dom_row21, network_match21, None, "2026-07-23", detail_result21)
-    if merged21["대표전화"] == "":
-        reporter.pass_("21. 상세 경로의 개인 모바일도 최종 병합에서 필터링됨")
-    else:
-        reporter.fail(f"21. 상세 경로 개인 모바일 안전망 실패: {merged21['대표전화']!r}")
-
     # ------------------------------------------------------------------
     # C. 외부 URL
     # ------------------------------------------------------------------
@@ -311,16 +298,6 @@ def test_field_policy_suite():
         reporter.pass_("35. newOpening null -> 공란 성공")
     else:
         reporter.fail("35. null이 공란으로 처리되지 않음")
-
-    # 36. 상세 미확인이 목록 O를 덮어쓰지 않음 (merge_dom_row_fields 레벨:
-    # DOM raw_text 뱃지가 "O"를 확정했으면 network/detail이 미확인이어도 유지)
-    dom_row36 = {"place_id": "36", "normalized_name": "새로오픈카페", "category": "카페", "raw_text": "새로오픈카페 새로오픈 카페", "address_text": ""}
-    network_match36 = {"row": {"place_id": "36", "새로오픈여부": ""}}
-    merged36 = merge_dom_row_fields(dom_row36, network_match36, None, "2026-07-23", {"새로오픈여부": ""})
-    if merged36["새로오픈여부"] == "O":
-        reporter.pass_("36. 상세/네트워크 미확인이 목록 O를 덮어쓰지 않음")
-    else:
-        reporter.fail(f"36. 목록 O가 덮어써짐: {merged36['새로오픈여부']!r}")
 
     print("\n====================")
     print(f"PASS: {reporter.passes}")
