@@ -14,10 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.collection.apollo_detail_adapter import extract_normalized_apollo_detail
 from src.collection.place_mapper import (
     _compute_total_review_count,
     _map_item_to_row,
-    extract_normalized_apollo_detail,
 )
 
 

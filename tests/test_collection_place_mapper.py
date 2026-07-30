@@ -911,7 +911,7 @@ def check_dedup_www_and_tracking_params_and_fragment(reporter: ValidationReporte
 def check_multiple_responses_repeated_merge_no_extra_growth(reporter: ValidationReporter) -> None:
     """동일 item을 여러 번(반복 response) _map_item_to_row로 다시 매핑해도
     개별 매핑 결과 자체는 항상 동일하다(idempotent 매핑 - accumulator 수준의
-    누적 idempotent 검증은 test_pc_network_accumulator.py에서 별도 확인)."""
+    누적 idempotent 검증은 이 파일에서 다루지 않는다)."""
     item = {
         "id": "5006",
         "name": "반복 매핑 업체",

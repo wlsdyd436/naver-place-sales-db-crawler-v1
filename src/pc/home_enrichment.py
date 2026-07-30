@@ -50,11 +50,11 @@ from src.pc.network_browser_collector import (
     _classify_ssr_block_signal,
     _parse_apollo_state_from_html,
 )
+from src.collection.apollo_detail_adapter import extract_normalized_apollo_detail
 from src.collection.place_mapper import (
     _is_personal_mobile_phone,
     _map_item_to_row,
     build_place_url_from_id,
-    extract_normalized_apollo_detail,
 )
 from src.pc.run_control import wait_while_paused_async
 
