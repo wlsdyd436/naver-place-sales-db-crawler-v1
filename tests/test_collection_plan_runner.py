@@ -2,14 +2,14 @@ from pathlib import Path
 import sys
 
 
-# ARCH-300C WIRE-1: src/pc/network_pipeline.py 검증용 standalone 스크립트
+# src/collection/plan_runner.py 검증용 standalone 스크립트
 # (live/Playwright 없음, fake collect_query 기반). run_collection_plan은 순수
 # orchestrator이므로 이 테스트도 순수 함수 단위로만 검증한다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.network_pipeline import run_collection_plan
+from src.collection.plan_runner import run_collection_plan
 
 
 class ValidationReporter:
@@ -423,7 +423,7 @@ def check_duplicate_removed_count_across_queries(reporter: ValidationReporter) -
 
 def check_review_filter_stats_aggregated_across_jobs(reporter: ValidationReporter) -> None:
     """collect_query가 반환하는 review_filter_stats를 job 여러 개에 걸쳐
-    정확히 합산해야 한다(network_pipeline은 판정 로직 없이 집계만 함)."""
+    정확히 합산해야 한다(plan_runner는 판정 로직 없이 집계만 함)."""
     jobs = [{"query": "q1"}, {"query": "q2"}]
 
     def fake_collect(job, per_query_limit):

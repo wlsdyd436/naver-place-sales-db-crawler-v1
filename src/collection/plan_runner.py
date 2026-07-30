@@ -1,11 +1,10 @@
-# ARCH-300C WIRE-1: Network/List 관찰 기반 수집을 위한 순수 orchestrator.
+# 이미 생성된 Collection Query Plan(jobs)을 실행하는 순수 orchestrator다.
 #
-# 이 모듈은 실제 Playwright/브라우저를 다루지 않는다. collect_query(job,
-# per_query_limit)를 주입받아 호출만 하고, 그 결과(rows/보안 신호)를 바탕으로
-# dedup·target 도달·per-query 상한·CAPTCHA·429 안전 중단을 판단하는 계약만
-# 담당한다(src/pc/pipeline.py의 collect_pc_full과 동일한 "오케스트레이션
-# 계약" 원칙). WIRE-1 단계에서는 fake collector로만 검증하며, 실제 제품
-# 경로(collect_pc_full/app.py/ui.py 수집 버튼)에는 아직 연결되지 않는다.
+# 이 모듈은 실제 Playwright/브라우저를 다루지 않는다. Query별 Collector가
+# 제공하는 collect_query(job, per_query_limit) callback을 호출만 하고, 그
+# 결과(rows/보안 신호)를 바탕으로 place_id 전역 중복 제거·target_count
+# 도달·per-query 상한·필터 제외 통계 합산·CAPTCHA/429 안전 중단을 판단하는
+# 계약만 담당한다(브라우저 구현 세부사항은 전달받은 Collector에 위임).
 #
 # CAPTCHA 우회/자동 해결/stealth/proxy는 이 모듈의 목적이 아니며 시도하지
 # 않는다 - active_captcha_detected/status_429_seen 신호를 받으면 즉시
@@ -71,7 +70,7 @@ def run_collection_plan(
     dedup_rows가 실제로 걸러낸 행 수 누적), "review_filter_stats"(리뷰
     필터가 적용된 job이 하나라도 있으면 candidate/accepted/rejected_by_min/
     rejected_by_max/unknown을 job 간 합산한 dict, 없으면 None) - 둘 다
-    collect_query가 반환하는 값을 그대로 신뢰하고 집계만 한다(network_pipeline
+    collect_query가 반환하는 값을 그대로 신뢰하고 집계만 한다(plan_runner
     자체는 dedup/리뷰 판정 로직을 갖지 않는다).
     """
     if seen is None:
@@ -178,7 +177,7 @@ def run_collection_plan(
 
 
 def _try_notify_security_block(on_security_block) -> None:
-    """CAPTCHA/429 감지를 best-effort로 호출자에게 알린다(pipeline.collect_pc_full과 동일 패턴)."""
+    """CAPTCHA/429 감지를 best-effort로 호출자에게 알린다."""
     if on_security_block is None:
         return
     decision = SimpleNamespace(

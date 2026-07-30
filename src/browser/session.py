@@ -235,7 +235,7 @@ class BrowserSession:
 # 환경과 검증 검색에서 Playwright launch 환경과 다른 결과를 보였다"는
 # 의미이며, 특정 fingerprint 항목이 차단 원인이라거나 CDP가 CAPTCHA를
 # 영구적으로 우회한다는 의미가 아니다. CAPTCHA/HTTP 403·405·429 감지와
-# 안전 중단(apollo_list_collector.py/network_pipeline.py)은 이
+# 안전 중단(apollo_list_collector.py/plan_runner.py)은 이
 # backend 교체와 무관하게 그대로 유지된다.
 #
 # 이 클래스는 BrowserSession과 동일한 context manager 계약(.context/.page,

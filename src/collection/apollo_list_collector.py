@@ -728,7 +728,7 @@ def collect_apollo_first_list_query(
     operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
     response를 harvest한다. run_collection_plan이 기대하는 최소 계약
     {"rows", "active_captcha_detected", "status_429_seen", "navigation_error",
-    "navigation_error_message"}을 그대로 만족해 network_pipeline.py는 무수정
+    "navigation_error_message"}을 그대로 만족해 plan_runner.py는 무수정
     으로 재사용된다.
 
     실패 시맨틱: 1페이지 Apollo 구조 파싱 실패(search frame 없음/apollo_state
