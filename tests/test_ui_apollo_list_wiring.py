@@ -12,7 +12,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src import ui
-from src.pc.home_enrichment import enrich_home_details
+from src.collection.home_enrichment import enrich_home_details
 from src.pc.network_browser_collector import ApolloFirstListCollector
 
 

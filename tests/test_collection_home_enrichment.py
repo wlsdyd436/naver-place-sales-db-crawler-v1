@@ -6,7 +6,7 @@ import re
 import sys
 
 
-# 홈페이지·SNS 포함 모드 전용 신규 모듈(src/pc/home_enrichment.py) 검증용
+# 홈페이지·SNS 포함 모드 전용 신규 모듈(src/collection/home_enrichment.py) 검증용
 # standalone 스크립트(실제 Playwright/네이버/Native Edge 프로세스 실행 없음).
 # 이 저장소는 pytest-asyncio 등 별도 async 테스트 인프라를 쓰지 않으므로,
 # async 로직은 평범한 sync 함수 안에서 asyncio.run(...)으로 호출해 검증한다.
@@ -25,8 +25,8 @@ if str(ROOT_DIR) not in sys.path:
 
 from playwright.async_api import TimeoutError as PlaywrightAsyncTimeoutError
 
-import src.pc.home_enrichment as home_enrichment
-from src.pc.home_enrichment import (
+import src.collection.home_enrichment as home_enrichment
+from src.collection.home_enrichment import (
     _enrich_home_batch_async,
     enrich_home_details,
     merge_home_result_into_row,

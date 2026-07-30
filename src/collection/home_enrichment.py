@@ -44,10 +44,6 @@ from src.browser.session import (
     _wait_for_cdp_ready,
 )
 from src.browser.config import BrowserBackendConfig
-from src.pc.network_browser_collector import (
-    _SSR_REQUEST_HEADERS,
-    _SSR_REQUEST_TIMEOUT_MS,
-)
 from src.collection.apollo_html_parser import (
     _classify_ssr_block_signal,
     _parse_apollo_state_from_html,
@@ -59,6 +55,13 @@ from src.collection.place_mapper import (
     build_place_url_from_id,
 )
 from src.pc.run_control import wait_while_paused_async
+
+_SSR_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://m.place.naver.com/",
+}
+_SSR_REQUEST_TIMEOUT_MS = 15000
 
 _HOME_ENRICHMENT_CONCURRENCY = 2
 _HOME_RETRY_CONCURRENCY = 1

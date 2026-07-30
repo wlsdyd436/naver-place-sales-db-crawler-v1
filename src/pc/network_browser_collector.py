@@ -512,14 +512,6 @@ def _wait_for_next_page_settle(page, ctx: "_QueryObservationContext", ensure_par
     }
 
 
-_SSR_REQUEST_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://m.place.naver.com/",
-}
-_SSR_REQUEST_TIMEOUT_MS = 15000
-
-
 _APOLLO_FULL_STATE_JS = """() => {
     const state = window.__APOLLO_STATE__;
     if (!state || typeof state !== 'object') return {available: false, apollo_state: null, oversized: false};
@@ -1027,7 +1019,7 @@ class ApolloFirstListCollector:
     컨텍스트 매니저 + `collect_query(job, per_query_limit)` 생명주기 계약을
     만족해 `run_collection_plan`이 그대로 재사용한다. `enrich_detail`/
     `enrich_detail_ssr`은 의도적으로 정의하지 않는다 - 홈페이지·SNS 포함
-    모드의 home 보강은 이 클래스가 아니라 `src/pc/home_enrichment.py`가,
+    모드의 home 보강은 이 클래스가 아니라 `src/collection/home_enrichment.py`가,
     이 컨텍스트가 닫힌(브라우저 세션이 종료된) 뒤 별도로 담당한다.
     """
 
