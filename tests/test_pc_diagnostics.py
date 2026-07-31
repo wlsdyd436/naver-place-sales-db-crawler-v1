@@ -17,7 +17,7 @@ from src.pc.diagnostics import (
     save_json_artifact,
     save_text_artifact,
 )
-from src.pc.safety import SafetyReason, classify_exception
+from src.collection.safety import SafetyReason, classify_exception
 
 
 class ValidationReporter:

@@ -12,7 +12,7 @@
 from types import SimpleNamespace
 
 from src.collection.place_mapper import dedup_rows, should_stop_for_target
-from src.pc.safety import SafetyReason
+from src.collection.safety import SafetyReason
 
 _SECURITY_BLOCK_MESSAGE = "보안 확인 또는 요청 제한이 감지되었습니다."
 

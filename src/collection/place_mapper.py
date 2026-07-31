@@ -16,13 +16,13 @@
 # 따라서 모든 파싱은 방어적으로 작성한다: 알려진 경로를 우선 시도하고, 실패하면
 # 휴리스틱으로 재귀 탐색하며, 그래도 실패하면 예외를 던지지 않고 빈 값을 반환한다.
 #
-# safety.is_captcha_or_security_message는 읽기 전용으로 재사용한다(src/pc/safety.py는
+# safety.is_captcha_or_security_message는 읽기 전용으로 재사용한다(src/collection/safety.py는
 # 수정하지 않는다) - 클릭 예외 메시지의 CAPTCHA/보안 차단 키워드 판정 로직을
 # 중복 구현하지 않기 위함이다.
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from src.pc.safety import is_captcha_or_security_message
+from src.collection.safety import is_captcha_or_security_message
 
 _CANDIDATE_RESOURCE_TYPES = ("xhr", "fetch")
 

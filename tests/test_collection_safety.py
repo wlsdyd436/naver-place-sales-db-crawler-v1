@@ -2,12 +2,12 @@ from pathlib import Path
 import sys
 
 
-# Stage 1 청크2: src/pc/safety.py 분류 로직 검증용 standalone 스크립트입니다.
+# Stage 1 청크2: src/collection/safety.py 분류 로직 검증용 standalone 스크립트입니다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.safety import (
+from src.collection.safety import (
     SafetyReason,
     classify_exception,
     is_captcha_or_security_message,
