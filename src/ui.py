@@ -274,7 +274,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 비활성화하게 한다.
         self.legal_dong_sido_var = ctk.StringVar(value="")
         self.legal_dong_sigungu_var = ctk.StringVar(value=_LEGAL_DONG_NO_SIGUNGU)
-        self.legal_dong_selected_count_var = ctk.StringVar(value="선택한 법정동: 0개")
+        self.legal_dong_selected_count_var = ctk.StringVar(value="선택 0개 / 전체 0개")
         self.legal_dong_query_count_var = ctk.StringVar(value="검색 조합 수: 0개")
         self.legal_dong_load_error_var = ctk.StringVar(value="")
         # {legal_code: BooleanVar} - 현재 렌더링된 법정동 체크박스 상태.
@@ -620,7 +620,7 @@ class SalesDbCrawlerApp(ctk.CTk):
         items = self._legal_dong_loader.list_legal_dongs(sido, self._current_legal_dong_sigungu()) if self._legal_dong_loader else []
         items = _sort_legal_dong_items(items)
         self._legal_dong_current_items = items
-        self.legal_dong_selection_vars = {item["legal_code"]: ctk.BooleanVar(value=False) for item in items}
+        self.legal_dong_selection_vars = {item["legal_code"]: ctk.BooleanVar(value=True) for item in items}
         self._render_legal_dong_checkboxes()
         self._update_legal_dong_summary()
 
@@ -639,8 +639,8 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         popup = ctk.CTkToplevel(self)
         popup.title("법정동 선택")
-        popup.geometry("420x560")
-        popup.minsize(360, 400)
+        popup.geometry("420x600")
+        popup.minsize(360, 440)
         popup.transient(self)
         popup.grab_set()
         popup.grid_rowconfigure(0, weight=1)
@@ -651,16 +651,23 @@ class SalesDbCrawlerApp(ctk.CTk):
         container.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
         container.grid_columnconfigure(0, weight=1)
 
+        # 선택 개수 레이블: 체크박스 목록 아래, 버튼 행 위에 배치
+        ctk.CTkLabel(
+            popup, textvariable=self.legal_dong_selected_count_var,
+            anchor="w", text_color="gray",
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(4, 4))
+
         button_row = ctk.CTkFrame(popup, fg_color="transparent")
-        button_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
-        ctk.CTkButton(button_row, text="전체 선택", width=100, command=self._select_all_legal_dongs).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=self._deselect_all_legal_dongs).pack(side="left")
-        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_legal_dong_popup).pack(side="right")
-        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_legal_dong_popup).pack(side="right", padx=(0, 6))
+        button_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ctk.CTkButton(button_row, text="전체 선택", width=100, command=self._select_all_legal_dongs).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=self._deselect_all_legal_dongs).pack(side="left", padx=(4, 8))
+        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_legal_dong_popup).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_legal_dong_popup).pack(side="right", padx=(8, 4))
 
         self._legal_dong_popup = popup
         self._legal_dong_popup_container = container
         self._render_legal_dong_checkboxes()
+
 
     def _close_legal_dong_popup(self):
         self._update_legal_dong_summary()
@@ -715,7 +722,9 @@ class SalesDbCrawlerApp(ctk.CTk):
         ]
 
     def _update_legal_dong_summary(self):
-        self.legal_dong_selected_count_var.set(f"선택한 법정동: {len(self.get_selected_legal_dongs())}개")
+        selected = len(self.get_selected_legal_dongs())
+        total = len(self._legal_dong_current_items)
+        self.legal_dong_selected_count_var.set(f"선택 {selected}개 / 전체 {total}개")
         self._recalculate_target_count()
 
     def _recalculate_target_count(self):
