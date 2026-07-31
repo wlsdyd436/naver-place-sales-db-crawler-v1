@@ -639,8 +639,8 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         popup = ctk.CTkToplevel(self)
         popup.title("법정동 선택")
-        popup.geometry("420x600")
-        popup.minsize(360, 440)
+        popup.geometry("480x630")
+        popup.minsize(420, 480)
         popup.transient(self)
         popup.grab_set()
         popup.grid_rowconfigure(0, weight=1)
@@ -659,10 +659,18 @@ class SalesDbCrawlerApp(ctk.CTk):
 
         button_row = ctk.CTkFrame(popup, fg_color="transparent")
         button_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
-        ctk.CTkButton(button_row, text="전체 선택", width=100, command=self._select_all_legal_dongs).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=self._deselect_all_legal_dongs).pack(side="left", padx=(4, 8))
-        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_legal_dong_popup).pack(side="right", padx=(4, 0))
-        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_legal_dong_popup).pack(side="right", padx=(8, 4))
+        # col 0,1: 왼쪽 그룹(전체선택/전체해제) — 건드리지 않음
+        button_row.grid_columnconfigure(0, weight=0)
+        button_row.grid_columnconfigure(1, weight=0)
+        # col 2: spacer — 두 그룹 사이 여백을 자동 흡수
+        button_row.grid_columnconfigure(2, weight=1)
+        # col 3,4: 오른쪽 그룹(적용/닫기) — weight=0 고정, 둘 다 width=100
+        button_row.grid_columnconfigure(3, weight=0)
+        button_row.grid_columnconfigure(4, weight=0)
+        ctk.CTkButton(button_row, text="전체 선택", width=100, command=self._select_all_legal_dongs).grid(row=0, column=0, padx=(0, 4))
+        ctk.CTkButton(button_row, text="전체 해제", width=100, fg_color="gray", command=self._deselect_all_legal_dongs).grid(row=0, column=1, padx=(4, 0))
+        ctk.CTkButton(button_row, text="적용", width=100, command=self._close_legal_dong_popup).grid(row=0, column=3, padx=(0, 4))
+        ctk.CTkButton(button_row, text="닫기", width=100, fg_color="gray", command=self._close_legal_dong_popup).grid(row=0, column=4, padx=(4, 0))
 
         self._legal_dong_popup = popup
         self._legal_dong_popup_container = container
