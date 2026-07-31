@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 
-# Apollo 목록 Network 응답 관찰 인프라(src/collection/apollo_list_collector.py의
+# Apollo 목록 Network 응답 관찰 인프라(src/collection/apollo_response_observer.py의
 # _classify_candidate_http_status/_QueryObservationContext/_make_response_handler/
 # _make_request_finished_handler/_make_request_failed_handler) 계약 고정용
 # standalone 스크립트. 이 파일은 다음 모듈 이동(Response Observer 분리) 전에
@@ -16,7 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.collection.apollo_list_collector import (
+from src.collection.apollo_response_observer import (
     _MAX_CANDIDATE_BODY_BYTES,
     _classify_candidate_http_status,
     _QueryObservationContext,
