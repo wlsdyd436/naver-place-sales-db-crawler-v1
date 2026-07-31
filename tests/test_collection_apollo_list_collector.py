@@ -459,6 +459,127 @@ def check_max_pages_reached_is_normal_stop(reporter: ValidationReporter) -> None
         reporter.fail(f"9. max_pages 케이스 실패: {result}")
 
 
+# --------------------------------------------------------------------------
+# NAV-1~NAV-4: Apollo 페이지 탐색·페이지네이션 최종 실패 경계(첫 페이지 search
+# frame 미발견, ambiguous_page_button, pagination_click_error,
+# next_page_response_timeout) 보호. src/collection/apollo_page_navigator.py
+# 분리 시 이 최종 stop reason들이 우연히 깨지지 않도록 Collector 레벨에서
+# 고정한다(개별 Navigator 함수 계약은 test_collection_apollo_page_navigator.py가
+# 이미 보호함 - 이 4개는 Collector orchestration이 그 결과를 어떻게 stop
+# reason으로 번역하는지만 검증).
+# --------------------------------------------------------------------------
+def check_nav1_first_page_search_frame_not_found(reporter: ValidationReporter) -> None:
+    page = FakeApolloPage([], frame_missing=True)
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-31")
+    handlers_cleared = all(len(v) == 0 for v in page._handlers.values())
+    ok = (
+        result["navigation_error"] is True
+        and result["navigation_error_message"] == "ApolloListParseError:search_frame_not_found"
+        and result["page_count"] == 0
+        and result["rows"] == []
+        and result["pagination_stop_reason"] is None
+        and handlers_cleared
+    )
+    if ok:
+        reporter.pass_("NAV-1. 첫 페이지 search frame 미발견: navigation_error=True + ApolloListParseError:search_frame_not_found, listener 해제")
+    else:
+        reporter.fail(f"NAV-1. 첫 페이지 frame 미발견 케이스 실패: {result}, handlers={page._handlers}")
+
+
+def check_nav2_ambiguous_page_button(reporter: ValidationReporter) -> None:
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])  # 1건만 - target(30)보다 부족
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 2, "visible": True, "enabled": True}},
+    )
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-31")
+    click_calls = page._frame._click_plan["2"].get("click_calls", 0)
+    handlers_cleared = all(len(v) == 0 for v in page._handlers.values())
+    ok = (
+        result["pagination_stop_reason"] == "ambiguous_page_button"
+        and click_calls == 0
+        and len(result["rows"]) == 1
+        and result["navigation_error"] is False
+        and result["page_count"] == 1
+        and handlers_cleared
+    )
+    if ok:
+        reporter.pass_("NAV-2. ambiguous_page_button: 페이지 버튼 locator.count()>=2면 click 없이 중단하고 1페이지 rows 보존")
+    else:
+        reporter.fail(f"NAV-2. ambiguous_page_button 케이스 실패: {result}, click_calls={click_calls}")
+
+
+def check_nav3_pagination_click_error(reporter: ValidationReporter) -> None:
+    # A. 페이지 버튼이 존재하지만 is_visible()이 False -> is_ready=False -> pagination_click_error
+    state_a = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page_a = FakeApolloPage(
+        [_apollo_state_result(state_a)],
+        click_plan={"2": {"count": 1, "visible": False, "enabled": True}},
+    )
+    result_a = collect_apollo_first_list_query(page_a, JOB, 30, collected_at="2026-07-31")
+    click_calls_a = page_a._frame._click_plan["2"].get("click_calls", 0)
+    handlers_cleared_a = all(len(v) == 0 for v in page_a._handlers.values())
+    subcase_a_ok = (
+        result_a["pagination_stop_reason"] == "pagination_click_error"
+        and click_calls_a == 0
+        and len(result_a["rows"]) == 1
+        and result_a["navigation_error"] is False
+        and result_a["page_count"] == 1
+        and handlers_cleared_a
+    )
+
+    # B. click() 자체가 예외를 던짐
+    state_b = _apollo_state(JOB["query"], [("222", "카페 B")])
+    click_error = RuntimeError("click intercepted")
+    page_b = FakeApolloPage(
+        [_apollo_state_result(state_b)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True, "click_error": click_error}},
+    )
+    result_b = collect_apollo_first_list_query(page_b, JOB, 30, collected_at="2026-07-31")
+    click_calls_b = page_b._frame._click_plan["2"].get("click_calls", 0)
+    handlers_cleared_b = all(len(v) == 0 for v in page_b._handlers.values())
+    subcase_b_ok = (
+        result_b["pagination_stop_reason"] == "pagination_click_error"
+        and click_calls_b == 1
+        and len(result_b["rows"]) == 1
+        and result_b["navigation_error"] is False
+        and result_b["page_count"] == 1
+        and handlers_cleared_b
+    )
+
+    ok = subcase_a_ok and subcase_b_ok
+    if ok:
+        reporter.pass_("NAV-3. pagination_click_error: locator 상태 확인 실패(A)와 click() 예외(B) 모두 부분 rows를 보존한 채 중단, listener 해제")
+    else:
+        reporter.fail(f"NAV-3. pagination_click_error 케이스 실패: A={result_a}(click={click_calls_a}), B={result_b}(click={click_calls_b})")
+
+
+def check_nav4_next_page_response_timeout(reporter: ValidationReporter) -> None:
+    """다음 페이지 버튼은 정상적으로 1회 클릭되지만 page.schedule_after_click(...)로
+    candidate response를 예약하지 않아, 클릭 후에도 새 candidate가 전혀
+    도착하지 않는 상황을 재현한다."""
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True}},
+    )
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-07-31")
+    click_calls = page._frame._click_plan["2"].get("click_calls", 0)
+    handlers_cleared = all(len(v) == 0 for v in page._handlers.values())
+    ok = (
+        result["pagination_stop_reason"] == "next_page_response_timeout"
+        and click_calls == 1
+        and len(result["rows"]) == 1
+        and result["navigation_error"] is False
+        and result["page_count"] == 1
+        and handlers_cleared
+    )
+    if ok:
+        reporter.pass_("NAV-4. next_page_response_timeout: 클릭 1회 후에도 새 candidate response가 없으면 hard cap까지 대기 후 부분 1페이지 rows를 보존한 채 중단, listener 해제")
+    else:
+        reporter.fail(f"NAV-4. next_page_response_timeout 케이스 실패: {result}, click_calls={click_calls}")
+
+
 class FakeLifecyclePage:
     def __init__(self):
         self.close_call_count = 0
@@ -1167,6 +1288,10 @@ def main() -> bool:
         check_status_429_stops_with_partial_rows,
         check_pagination_exhausted_is_normal_stop,
         check_max_pages_reached_is_normal_stop,
+        check_nav1_first_page_search_frame_not_found,
+        check_nav2_ambiguous_page_button,
+        check_nav3_pagination_click_error,
+        check_nav4_next_page_response_timeout,
         check_capture_session_cookies_returns_context_cookies,
         check_capture_session_cookies_returns_empty_on_exception,
         check_collector_opens_and_closes_one_page_per_query,
