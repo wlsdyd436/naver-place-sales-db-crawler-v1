@@ -34,7 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT  # noqa: E402
+from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT  # noqa: E402
 
 SNAPSHOT_PATH = ROOT_DIR / "data" / "legal_dong_snapshot.json"
 ENV_PATH = ROOT_DIR / ".env"

@@ -5,12 +5,12 @@ import sys
 import tempfile
 
 
-# Stage 1 청크3: src/pc/diagnostics.py 저장 유틸리티 검증용 standalone 스크립트입니다.
+# Stage 1 청크3: src/diagnostics.py 저장 유틸리티 검증용 standalone 스크립트입니다.
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.diagnostics import (
+from src.diagnostics import (
     capture_page_diagnostics,
     create_diagnostic_run_dir,
     sanitize_label,
@@ -221,7 +221,7 @@ def check_exception_and_safety_decision_metadata(reporter: ValidationReporter) -
 
 
 def check_not_wired_to_production_paths(reporter: ValidationReporter) -> None:
-    source = (ROOT_DIR / "src" / "pc" / "diagnostics.py").read_text(encoding="utf-8")
+    source = (ROOT_DIR / "src" / "diagnostics.py").read_text(encoding="utf-8")
     forbidden_tokens = ["pc_crawler", "src.ui", "src.exporter", "src.crawler", "src.parser"]
     found = [token for token in forbidden_tokens if token in source]
     if not found:

@@ -15,7 +15,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from src.exporter import export_places_to_excel
-from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
+from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
 from src.collection.home_enrichment import enrich_home_details
 from src.collection.apollo_list_collector import ApolloFirstListCollector
 from src.region.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader

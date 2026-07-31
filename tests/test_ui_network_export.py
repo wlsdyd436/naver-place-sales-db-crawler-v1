@@ -18,7 +18,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from src import ui
 from src.exporter import MERGED_COLUMNS, export_places_to_excel
-from src.pc.diagnostics import DiagnosticArtifact
+from src.diagnostics import DiagnosticArtifact
 
 
 class ValidationReporter:

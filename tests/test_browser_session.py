@@ -9,7 +9,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.browser.config import DiagnosticConfig
-from src.pc.diagnostics import DEFAULT_DIAGNOSTICS_ROOT
+from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT
 from src.browser.session import BrowserSession, _select_launch_args
 
 

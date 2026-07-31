@@ -6,7 +6,7 @@
 # CAPTCHA 우회/자동 해결/stealth/proxy/무단 반복 호출은 이 모듈의 목적이 아니며
 # 시도하지 않는다.
 #
-# 아직 PoC-1 단계이므로 이 모듈은 UI(src/ui.py)나 pipeline(src/pc/pipeline.py)에
+# 아직 PoC-1 단계이므로 이 모듈은 UI(src/ui.py)나 pipeline(src/collection/plan_runner.py)에
 # 연결되지 않는다. 순수 함수(파서/매퍼/필터/dedup)만 제공하며, 실제 Playwright
 # page/response 객체를 다루는 코드(리스너 등록 등)는 scratchpad의 PoC 스크립트가
 # 담당한다 - 이렇게 분리해야 이 모듈을 live 브라우저 없이 fixture만으로 테스트할
