@@ -17,10 +17,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.collection.apollo_list_collector import (
-    _APOLLO_FULL_STATE_JS,
     ApolloFirstListCollector,
     collect_apollo_first_list_query,
 )
+from src.collection.apollo_page_navigator import _APOLLO_FULL_STATE_JS
 import src.collection.apollo_list_collector as apollo_list_collector
 
 
