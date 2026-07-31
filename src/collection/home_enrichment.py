@@ -54,7 +54,7 @@ from src.collection.place_mapper import (
     _map_item_to_row,
     build_place_url_from_id,
 )
-from src.pc.run_control import wait_while_paused_async
+from src.run_control import wait_while_paused_async
 
 _SSR_REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

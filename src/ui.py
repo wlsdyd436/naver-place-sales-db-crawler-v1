@@ -20,7 +20,7 @@ from src.collection.home_enrichment import enrich_home_details
 from src.collection.apollo_list_collector import ApolloFirstListCollector
 from src.region.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
 from src.collection.plan_runner import run_collection_plan
-from src.pc.run_control import wait_while_paused
+from src.run_control import wait_while_paused
 
 
 # LEGALDONG-UI-2: 공식 법정동 Snapshot(§_build_region_section)이 시도/시군구/

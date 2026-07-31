@@ -1,4 +1,4 @@
-"""단위 테스트: src/pc/run_control.wait_while_paused/wait_while_paused_async
+"""단위 테스트: src/run_control.wait_while_paused/wait_while_paused_async
 (NETWORK-CONTROLS-1 - 일시정지 중 대기, 재개/중지 시 즉시 반환하는 공통
 게이트). 실제 Playwright/네이버 요청 없이 threading.Event/asyncio만으로
 검증한다."""
@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pc.run_control import wait_while_paused, wait_while_paused_async  # noqa: E402
+from src.run_control import wait_while_paused, wait_while_paused_async  # noqa: E402
 
 _POLL = 0.05
 

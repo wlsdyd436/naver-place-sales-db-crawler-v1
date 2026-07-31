@@ -6,7 +6,7 @@
 # 제공하고, Apollo 목록 선택(extract_main_place_list_from_apollo 등)·Place
 # row 매핑·중복 제거는 src/collection의 apollo_list_adapter/place_mapper를,
 # 지역 Exact 판정은 src/region.naver_region_policy를, 일시정지·중지
-# 게이트는 src/pc.run_control을 그대로 재사용한다(재구현 없음).
+# 게이트는 src/run_control을 그대로 재사용한다(재구현 없음).
 #
 # page.goto()에서 발생 가능한 예외는 성격이 다르다. 실제 Playwright
 # TimeoutError(느린 로드)만 timeout=True로 분류하고, "page/context/browser가
@@ -38,7 +38,7 @@ from src.collection.place_mapper import (
     dedup_rows,
     is_candidate_response,
 )
-from src.pc.run_control import wait_while_paused
+from src.run_control import wait_while_paused
 
 _SEARCH_URL_TEMPLATE = "https://map.naver.com/v5/search/{query}"
 
