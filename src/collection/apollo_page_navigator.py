@@ -7,8 +7,15 @@
 # 모듈은 검색 URL 생성, page.goto, locator.click, listener 등록·해제, stop
 # reason 판정, row 변환·필터, BrowserSession 수명 관리를 전혀 수행하지
 # 않는다 - 그 책임은 전부 apollo_list_collector.py에 남는다.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from src.browser.session import _CAPTCHA_PROBE_SELECTORS
 from src.collection.apollo_list_adapter import extract_main_place_list_from_apollo
+
+if TYPE_CHECKING:
+    from src.collection.apollo_response_observer import _QueryObservationContext
 
 # ARCH-300C PERF-1A: 적응형 settle 종료 상수(모듈 상수로만 고정 - 함수
 # 시그니처나 UI에는 노출하지 않는다). settle_ms(기존
@@ -130,7 +137,7 @@ def _find_page_button(frame, target_page_number: int):
         return None
 
 
-def _wait_for_next_page_settle(page, ctx: "_QueryObservationContext", ensure_parsed, count_before_click: int, hard_cap_ms: int) -> dict:
+def _wait_for_next_page_settle(page, ctx: _QueryObservationContext, ensure_parsed, count_before_click: int, hard_cap_ms: int) -> dict:
     """PAGE-300-2B-1 §12: 페이지 번호 클릭 직후 신규 candidate response가
     도착할 때까지 기다리고, 첫 신규 응답이 확인되면 기존 adaptive
     quiet-period 원칙(_QUIET_PERIOD_MS)으로 이 페이지의 candidate response
