@@ -306,6 +306,31 @@ def check_capture_diagnostics_noop_when_disabled(reporter: ValidationReporter) -
             shutil.rmtree(d, ignore_errors=True)
 
 
+def check_captcha_selector_no_broad_text_selectors(reporter: ValidationReporter) -> None:
+    """_CAPTCHA_PROBE_SELECTORS에 부분 문자열 기반 broad text selector가 없음을 보호.
+
+    'text=보안', 'text=사람', 'text=자동'은 정상 업체명/메뉴/콘텐츠와 충돌하는
+    광범위 한글 단어 selector로, 제거해야 합니다.
+    Production 수정 전: 이 세 selector가 목록에 있으므로 FAIL.
+    """
+    from src.browser.session import _CAPTCHA_PROBE_SELECTORS
+    broad_selectors = ["text=\ubcf4\uc548", "text=\uc0ac\ub78c", "text=\uc790\ub3d9"]
+    found = [s for s in broad_selectors if s in _CAPTCHA_PROBE_SELECTORS]
+    if not found:
+        reporter.pass_("선택자 보호: broad text selector(text=보안/사람/자동)가 _CAPTCHA_PROBE_SELECTORS에 없음")
+    else:
+        reporter.fail(f"선택자 보호 실패: broad text selector가 목록에 남아있음: {found}")
+
+
+def check_captcha_selector_structural_selector_present(reporter: ValidationReporter) -> None:
+    """_CAPTCHA_PROBE_SELECTORS에 구조적 selector(#wtm-captcha-root)가 유지됨을 보호."""
+    from src.browser.session import _CAPTCHA_PROBE_SELECTORS
+    if "#wtm-captcha-root" in _CAPTCHA_PROBE_SELECTORS:
+        reporter.pass_("선택자 보호: #wtm-captcha-root가 _CAPTCHA_PROBE_SELECTORS에 유지됨")
+    else:
+        reporter.fail("선택자 보호 실패: #wtm-captcha-root가 _CAPTCHA_PROBE_SELECTORS에서 제거됨")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -324,6 +349,8 @@ def main() -> int:
     check_keep_open_if_configured_noop_when_disabled(reporter)
     check_capture_diagnostics_writes_when_enabled(reporter)
     check_capture_diagnostics_noop_when_disabled(reporter)
+    check_captcha_selector_no_broad_text_selectors(reporter)
+    check_captcha_selector_structural_selector_present(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

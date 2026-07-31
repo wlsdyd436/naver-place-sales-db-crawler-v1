@@ -29,29 +29,54 @@ def _probe_captcha_state(page) -> dict:
     marker가 DOM에 존재한다는 사실만으로 active로 단정하지 않는다(오탐 방지 -
     classify_captcha_signal이 visible+면적까지 함께 봐야 active로 판정한다).
     클릭을 전혀 하지 않으므로 click_intercepted_message는 항상 빈 문자열이다.
+
+    2026-07-31 frame-aware 보강: main frame 외에 page.frames의 child frame을
+    순회해 #wtm-captcha-root가 iframe 안에 있어도 탐지한다. 첫 hidden match에서
+    종료하지 않고 전체를 집계해 visible 신호를 우선 채택한다.
     """
     marker_present = False
     visible = False
     area = 0.0
-    for selector in _CAPTCHA_PROBE_SELECTORS:
-        try:
-            locator = page.locator(selector).first
-            if locator.count() == 0:
+
+    # 탐색 대상: main frame(page 자체) + 접근 가능한 모든 child frame.
+    # page.frames가 예외를 던지거나 비어있어도 main frame 결과는 유지한다.
+    frames_to_scan = [page]
+    try:
+        child_frames = list(page.frames)
+        frames_to_scan.extend(child_frames)
+    except Exception:
+        pass  # child frame 접근 실패 시 main frame만 탐색
+
+    for target in frames_to_scan:
+        for selector in _CAPTCHA_PROBE_SELECTORS:
+            try:
+                locator = target.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                marker_present = True
+                try:
+                    if locator.is_visible(timeout=300):
+                        try:
+                            box = locator.bounding_box()
+                            if box:
+                                candidate_area = float(box.get("width", 0)) * float(box.get("height", 0))
+                                if candidate_area > 0:
+                                    visible = True
+                                    area = max(area, candidate_area)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
                 continue
-            marker_present = True
-            if locator.is_visible(timeout=300):
-                visible = True
-                box = locator.bounding_box()
-                if box:
-                    area = max(area, float(box.get("width", 0)) * float(box.get("height", 0)))
-        except Exception:
-            continue
+
     return {
         "marker_present": marker_present,
         "visible": visible,
         "bounding_box_area": area,
         "click_intercepted_message": "",
     }
+
 
 
 def _find_search_frame(page):

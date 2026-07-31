@@ -33,11 +33,12 @@ _ONSCREEN_ARGS = ["--window-size=1400,900"]
 # 진단 신호 전용 probe selector입니다. 2026-07-01 진단 기록에 따라 is_visible()
 # 단독 판정은 신뢰할 수 없으므로, 안전 종료 여부(주 판정)는 절대 이 값에 의존하지
 # 않고 safety.classify_exception(실제 발생한 예외 메시지)에 맡깁니다.
+#
+# 2026-07-31 CAPTCHA 오탐 수정: 'text=보안', 'text=사람', 'text=자동'은
+# 정상 업체명(왕광자동차공업사 등)·계정 메뉴(보안설정)·일반 콘텐츠와 충돌하는
+# 광범위 부분 문자열 selector로 제거함. CAPTCHA 고유 구조 ID만 유지.
 _CAPTCHA_PROBE_SELECTORS = [
     "#wtm-captcha-root",
-    "text=보안",
-    "text=사람",
-    "text=자동",
 ]
 
 
