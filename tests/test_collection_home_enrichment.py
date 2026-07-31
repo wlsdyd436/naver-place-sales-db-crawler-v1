@@ -2,8 +2,10 @@ from pathlib import Path
 import asyncio
 import inspect
 import json
+import os
 import re
 import sys
+import tempfile
 
 
 # 홈페이지·SNS 포함 모드 전용 신규 모듈(src/collection/home_enrichment.py) 검증용
@@ -35,6 +37,9 @@ from src.collection.apollo_html_parser import (
     _classify_ssr_block_signal,
     _parse_apollo_state_from_html,
 )
+from src.exporter import export_places_to_excel
+
+import pandas as pd
 
 # PAGE300-6G-R1: 운영 안정화 대기(3초)를 테스트에서는 0으로 낮춘다 - 이
 # 모듈 상수는 _enrich_home_batch_async 안에서 매 호출 시 전역으로 참조되므로
@@ -641,6 +646,83 @@ def check_extra_links_flow_through_ssr_fetch_and_merge(reporter: ValidationRepor
         reporter.fail(f"11. 추가 링크 SSR 흐름 검증 실패: {row0}")
 
 
+_LIVE_HOMEPAGES_ARGS_KEY = 'homepages({"source":["shopWindow","jto"]})'
+
+
+def _live_args_key_html(place_id: str) -> bytes:
+    """2026-07-31 Live 실측(1202361139 고유하우스) 구조 - parent가 homepages를
+    bare key가 아니라 GraphQL 인자 포함 key로 담는다."""
+    base_key = f"PlaceDetailBase:{place_id}"
+    op_key = f'placeDetail({{"input":{{"checkRedirect":true,"deviceType":"pcmap","id":"{place_id}","isNx":false}}}})'
+    parent = {
+        "base": {"__ref": base_key},
+        _LIVE_HOMEPAGES_ARGS_KEY: {
+            "__typename": "Homepage",
+            "etc": [
+                {"__typename": "HomepageRepr", "url": "https://www.koyuhaus.com",
+                 "landingUrl": "https://www.koyuhaus.com", "isDeadUrl": False,
+                 "type": "홈페이지", "typeI18n": "홈페이지"},
+                {"__typename": "HomepageRepr", "url": "https://smartstore.naver.com/koyuhaus",
+                 "landingUrl": "https://smartstore.naver.com/koyuhaus",
+                 "type": "스마트스토어", "typeI18n": "스마트스토어"},
+            ],
+            "repr": {"__typename": "HomepageRepr", "url": "https://www.instagram.com/koyuhaus",
+                     "landingUrl": "https://www.instagram.com/koyuhaus",
+                     "type": "인스타그램", "typeI18n": "인스타그램"},
+        },
+        "newOpening": False,
+        "phoneInfo": {"phone": "02-000-0000", "isVirtualPhone": False, "isPrivatePhone": False},
+    }
+    apollo_state = {base_key: _base_entity(place_id), "ROOT_QUERY": {op_key: parent}}
+    html = f"<html><script>window.__APOLLO_STATE__ = {json.dumps(apollo_state)};</script></html>"
+    return html.encode("utf-8")
+
+
+def check_args_key_homepages_flow_to_row_and_excel(reporter: ValidationReporter) -> None:
+    """2026-07-31 회귀 가드: 인자 포함 homepages key가 SSR fetch -> adapter ->
+    _extract_external_urls -> merge -> Excel K~N열까지 유실 없이 도달하는지
+    전체 경로로 확인한다(이 경로가 끊겨 실사용에서 4개 열이 항상 공란이었다).
+    Excel은 tempfile에만 생성하고 finally에서 삭제한다."""
+    rows = [_row("1202361139")]
+    ctx = FakeAsyncRequestContext({"1202361139": FakeAsyncResponse(200, _live_args_key_html("1202361139"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    row0 = result["rows"][0]
+
+    row_ok = (
+        row0["홈페이지"] == "https://www.koyuhaus.com"
+        and row0["인스타"] == "https://www.instagram.com/koyuhaus"
+        and row0["블로그"] == ""
+        and "smartstore.naver.com/koyuhaus" in (row0["추가 링크"] or "")
+        and result["home_success_count"] == 1
+    )
+
+    tmp_path = Path(tempfile.gettempdir()) / f"home_args_key_export_{os.getpid()}.xlsx"
+    excel_ok = False
+    excel_values = {}
+    try:
+        export_places_to_excel([dict(row0, 수집일="2026-07-31")], [], [], str(tmp_path))
+        frame = pd.read_excel(tmp_path, sheet_name="통합_결과")
+        excel_values = {column: frame.iloc[0][column] for column in ("홈페이지", "인스타", "블로그", "추가 링크")}
+        excel_ok = (
+            excel_values["홈페이지"] == "https://www.koyuhaus.com"
+            and excel_values["인스타"] == "https://www.instagram.com/koyuhaus"
+            and "smartstore.naver.com/koyuhaus" in str(excel_values["추가 링크"])
+        )
+    except Exception as exc:
+        excel_values = {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+    if row_ok and excel_ok:
+        reporter.pass_("인자 포함 homepages key가 SSR fetch->adapter->merge->Excel K~N열까지 유실 없이 전달됨")
+    else:
+        reporter.fail(f"args-key homepages 전체 흐름 실패: row={row0}, excel={excel_values}")
+
+
 def check_merge_home_result_into_row_fills_extra_links_field(reporter: ValidationReporter) -> None:
     row = _row("333")
     home_result = {
@@ -964,6 +1046,7 @@ def main() -> bool:
         check_production_path_uses_native_cdp_reconnect_not_cookie_copy,
         check_dispose_not_called_on_context_request,
         check_extra_links_flow_through_ssr_fetch_and_merge,
+        check_args_key_homepages_flow_to_row_and_excel,
         check_merge_home_result_into_row_fills_extra_links_field,
         check_basic_mode_leaves_extra_links_blank,
         check_zero_external_links_is_success_not_retried,

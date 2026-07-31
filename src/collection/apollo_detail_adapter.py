@@ -21,7 +21,40 @@ _APOLLO_BASE_FIELDS = (
     "id", "name", "category", "roadAddress", "address", "commonAddress", "phone", "virtualPhone",
     "visitorReviewsTotal", "cafeBlogReviewsTotal", "naverBlog",
 )
-_APOLLO_PARENT_FIELDS = ("homepages", "newOpening", "phoneInfo")
+# homepages는 bare key가 아닐 수 있어 _resolve_homepages로 따로 찾는다.
+_APOLLO_PARENT_FIELDS = ("newOpening", "phoneInfo")
+_APOLLO_HOMEPAGES_FIELD = "homepages"
+# 2026-07-31 Live 실측: parent entity는 homepages를 bare key가 아니라 GraphQL
+# 인자가 포함된 key로 담는다(같은 값의 사본이 parent["shopWindow"]["homepages"]
+# 에도 있다). bare key만 읽던 기존 구현은 URL이 실제로 존재하는 업체에서도
+# homepages를 통째로 놓쳐 홈페이지/인스타/블로그/추가 링크가 항상 공란이 됐다.
+_APOLLO_HOMEPAGES_CANONICAL_KEY = 'homepages({"source":["shopWindow","jto"]})'
+_APOLLO_HOMEPAGES_KEY_PREFIX = "homepages("
+
+
+def _resolve_homepages(parent: dict):
+    """parent에서 Apollo Homepage dict를 찾는다(없으면 None).
+
+    bare key -> 현재 canonical 인자 key -> 그 외 "homepages(" 인자 key ->
+    shopWindow 중첩 순으로 "먼저 찾은 하나"만 채택한다. 여러 source의 결과를
+    병합하지 않고 Apollo tree 전체를 재귀 탐색하지도 않는다(값 해석·URL 분류는
+    place_mapper._extract_external_urls의 책임 그대로). etc=[]/repr=None인
+    Homepage dict도 "링크가 없다"는 유효한 구조이므로 그대로 채택한다."""
+    for key in (_APOLLO_HOMEPAGES_FIELD, _APOLLO_HOMEPAGES_CANONICAL_KEY):
+        value = parent.get(key)
+        if isinstance(value, dict):
+            return value
+
+    for key, value in parent.items():
+        if isinstance(key, str) and key.startswith(_APOLLO_HOMEPAGES_KEY_PREFIX) and isinstance(value, dict):
+            return value
+
+    shop_window = parent.get("shopWindow")
+    if isinstance(shop_window, dict):
+        value = shop_window.get(_APOLLO_HOMEPAGES_FIELD)
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def _select_apollo_parent(apollo_state: dict, base_key: str, normalized_id: str):
@@ -69,7 +102,11 @@ def extract_normalized_apollo_detail(apollo_state, place_id) -> dict:
     없어도 base만 있으면 base 필드만 반환한다.
 
     반환값은 새 dict이며 원본 apollo_state/entity를 mutate하지 않는다(필요한
-    필드만 복사). Apollo State 전체나 무관한 entity를 반환하지 않는다."""
+    필드만 복사). Apollo State 전체나 무관한 entity를 반환하지 않는다.
+
+    homepages만 bare key가 아닐 수 있어 _resolve_homepages로 찾고, 찾은 값은
+    항상 bare "homepages" 키로 normalize해 담는다(호출부 place_mapper.
+    _extract_external_urls는 무수정 재사용)."""
     if not isinstance(apollo_state, dict):
         return {}
 
@@ -97,5 +134,8 @@ def extract_normalized_apollo_detail(apollo_state, place_id) -> dict:
         for field in _APOLLO_PARENT_FIELDS:
             if field in parent:
                 result[field] = parent[field]
+        homepages = _resolve_homepages(parent)
+        if homepages is not None:
+            result[_APOLLO_HOMEPAGES_FIELD] = homepages
 
     return result

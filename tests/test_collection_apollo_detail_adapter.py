@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.collection.apollo_detail_adapter import extract_normalized_apollo_detail
 from src.collection.place_mapper import (
     _compute_total_review_count,
+    _extract_external_urls,
     _map_item_to_row,
 )
 
@@ -61,6 +62,63 @@ def _parent_entity(base_ref="PlaceDetailBase:2014880028", **overrides):
     }
     entity.update(overrides)
     return entity
+
+
+# --------------------------------------------------------------------------
+# HP-1~HP-4: 2026-07-31 Live 실측(place_id=1202361139 고유하우스 등) 확인 -
+# 실제 pcmap 상세 응답의 parent entity는 bare "homepages"가 아니라 GraphQL
+# 인자가 포함된 key `homepages({"source":["shopWindow","jto"]})`로 값을
+# 담는다(같은 값의 사본이 parent["shopWindow"]["homepages"]에도 있다).
+# 기존 fixture는 bare key만 써서 이 구조 차이를 전혀 보호하지 못했고, 그
+# 결과 테스트는 전부 통과하는데 실제 수집에서는 홈페이지/인스타/블로그/
+# 추가 링크 4개 열이 항상 공란이 되는 결함이 드러나지 않았다.
+# --------------------------------------------------------------------------
+_LIVE_HOMEPAGES_ARGS_KEY = 'homepages({"source":["shopWindow","jto"]})'
+
+
+def _live_homepages_value():
+    """실측 구조 그대로(축소·익명화 없이 URL만 공개 표본 사용)."""
+    return {
+        "__typename": "Homepage",
+        "etc": [
+            {
+                "__typename": "HomepageRepr",
+                "url": "https://www.koyuhaus.com",
+                "landingUrl": "https://www.koyuhaus.com",
+                "isDeadUrl": False,
+                "type": "홈페이지",
+                "typeI18n": "홈페이지",
+            },
+            {
+                "__typename": "HomepageRepr",
+                "url": "https://smartstore.naver.com/koyuhaus",
+                "landingUrl": "https://smartstore.naver.com/koyuhaus",
+                "type": "스마트스토어",
+                "typeI18n": "스마트스토어",
+            },
+        ],
+        "repr": {
+            "__typename": "HomepageRepr",
+            "url": "https://www.instagram.com/koyuhaus",
+            "landingUrl": "https://www.instagram.com/koyuhaus",
+            "type": "인스타그램",
+            "typeI18n": "인스타그램",
+        },
+    }
+
+
+def _empty_homepages_value():
+    """실측 negative control(36721807 모던하우스 등) - 구조는 있으나 링크 0건."""
+    return {"__typename": "Homepage", "etc": [], "repr": None, "subLinks": None, "isSiteData": None}
+
+
+def _state_with_parent(parent: dict, place_id="2014880028") -> dict:
+    return {
+        f"PlaceDetailBase:{place_id}": _base_entity(place_id),
+        "ROOT_QUERY": {
+            f'placeDetail({{"input":{{"deviceType":"pcmap","id":"{place_id}","isNx":false}}}})': parent,
+        },
+    }
 
 
 def _run_apollo_detail_adapter_suite() -> bool:
@@ -329,6 +387,91 @@ def _run_apollo_detail_adapter_suite() -> bool:
         reporter.pass_("24. 반환 dict에 불필요한 Apollo entity 없음 성공")
     else:
         reporter.fail(f"24. 반환 dict에 불필요한 entity 포함됨: {result24}")
+
+    # ------------------------------------------------------------------
+    # HP-1~HP-4: 인자 포함 homepages key(2026-07-31 Live 실측 구조)
+    # ------------------------------------------------------------------
+
+    # HP-1. canonical args-key만 있는 실제 구조에서 URL이 추출된다
+    parent_hp1 = {
+        "base": {"__ref": "PlaceDetailBase:2014880028"},
+        _LIVE_HOMEPAGES_ARGS_KEY: _live_homepages_value(),
+        "newOpening": False,
+        "phoneInfo": {"phone": "02-488-5582", "isVirtualPhone": False, "isPrivatePhone": False},
+    }
+    result_hp1 = extract_normalized_apollo_detail(_state_with_parent(parent_hp1), "2014880028")
+    homepage_hp1, insta_hp1, blog_hp1, extra_hp1 = _extract_external_urls(result_hp1)
+    ok_hp1 = (
+        result_hp1.get("homepages") == _live_homepages_value()
+        and homepage_hp1 == "https://www.koyuhaus.com"
+        and insta_hp1 == "https://www.instagram.com/koyuhaus"
+        and blog_hp1 == ""
+        and "smartstore.naver.com/koyuhaus" in extra_hp1
+    )
+    if ok_hp1:
+        reporter.pass_("HP-1. 인자 포함 homepages key에서 홈페이지/인스타/스마트스토어 정상 추출")
+    else:
+        reporter.fail(
+            f"HP-1. args-key homepages 추출 실패: homepages_present={'homepages' in result_hp1}, "
+            f"홈페이지={homepage_hp1!r}, 인스타={insta_hp1!r}, 블로그={blog_hp1!r}, 추가링크={extra_hp1!r}"
+        )
+
+    # HP-2. bare key가 dict이면 args-key/shopWindow보다 우선한다(기존 계약 보존)
+    parent_hp2 = {
+        "base": {"__ref": "PlaceDetailBase:2014880028"},
+        "homepages": {"repr": {"url": "https://bare-key-wins.test", "type": "홈페이지"}, "etc": []},
+        _LIVE_HOMEPAGES_ARGS_KEY: _live_homepages_value(),
+        "shopWindow": {"homepages": {"repr": {"url": "https://shopwindow.test", "type": "홈페이지"}, "etc": []}},
+        "newOpening": False,
+    }
+    result_hp2 = extract_normalized_apollo_detail(_state_with_parent(parent_hp2), "2014880028")
+    homepage_hp2, _, _, _ = _extract_external_urls(result_hp2)
+    ok_hp2 = (
+        result_hp2.get("homepages", {}).get("repr", {}).get("url") == "https://bare-key-wins.test"
+        and homepage_hp2 == "https://bare-key-wins.test"
+    )
+    if ok_hp2:
+        reporter.pass_("HP-2. bare homepages key가 args-key/shopWindow보다 우선(기존 계약 보존)")
+    else:
+        reporter.fail(f"HP-2. bare key 우선순위 실패: {result_hp2.get('homepages')}")
+
+    # HP-3. bare/args-key 모두 없으면 shopWindow.homepages로 fallback
+    parent_hp3 = {
+        "base": {"__ref": "PlaceDetailBase:2014880028"},
+        "shopWindow": {"homepages": _live_homepages_value()},
+        "newOpening": False,
+    }
+    result_hp3 = extract_normalized_apollo_detail(_state_with_parent(parent_hp3), "2014880028")
+    homepage_hp3, insta_hp3, _, extra_hp3 = _extract_external_urls(result_hp3)
+    ok_hp3 = (
+        result_hp3.get("homepages") == _live_homepages_value()
+        and homepage_hp3 == "https://www.koyuhaus.com"
+        and insta_hp3 == "https://www.instagram.com/koyuhaus"
+        and "smartstore.naver.com/koyuhaus" in extra_hp3
+    )
+    if ok_hp3:
+        reporter.pass_("HP-3. bare/args-key 부재 시 shopWindow.homepages fallback 성공")
+    else:
+        reporter.fail(f"HP-3. shopWindow fallback 실패: homepages_present={'homepages' in result_hp3}, 홈페이지={homepage_hp3!r}")
+
+    # HP-4. 링크가 실제로 없는 구조(etc=[]/repr=None)도 유효 - 실패가 아니다
+    parent_hp4 = {
+        "base": {"__ref": "PlaceDetailBase:2014880028"},
+        _LIVE_HOMEPAGES_ARGS_KEY: _empty_homepages_value(),
+        "newOpening": False,
+        "phoneInfo": {"phone": "02-488-5582", "isVirtualPhone": False, "isPrivatePhone": False},
+    }
+    result_hp4 = extract_normalized_apollo_detail(_state_with_parent(parent_hp4), "2014880028")
+    ok_hp4 = (
+        result_hp4.get("homepages") == _empty_homepages_value()
+        and _extract_external_urls(result_hp4) == ("", "", "", "")
+        and result_hp4.get("id") == "2014880028"
+        and result_hp4 != {}
+    )
+    if ok_hp4:
+        reporter.pass_("HP-4. etc=[]/repr=None인 실제 '링크 없음' 구조도 homepages를 유지하고 URL만 공란(실패 아님)")
+    else:
+        reporter.fail(f"HP-4. 링크 없음 구조 처리 실패: homepages={result_hp4.get('homepages')!r}, urls={_extract_external_urls(result_hp4)}")
 
     print("\n====================")
     print(f"PASS: {reporter.passes}")
