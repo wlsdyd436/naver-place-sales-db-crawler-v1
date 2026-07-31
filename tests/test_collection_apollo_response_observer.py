@@ -1,12 +1,14 @@
 from pathlib import Path
+import json
 import sys
 
 
 # Apollo 목록 Network 응답 관찰 인프라(src/collection/apollo_response_observer.py의
 # _classify_candidate_http_status/_QueryObservationContext/_make_response_handler/
-# _make_request_finished_handler/_make_request_failed_handler) 계약 고정용
-# standalone 스크립트. 이 파일은 다음 모듈 이동(Response Observer 분리) 전에
-# 현재 동작(candidate 등록, body snapshot 성공/실패 경로, requestfailed 처리)을
+# _make_request_finished_handler/_make_request_failed_handler/
+# _make_candidate_parser) 계약 고정용 standalone 스크립트. 이 파일은 다음
+# 모듈 이동(Response Observer 분리) 전에 현재 동작(candidate 등록, body
+# snapshot 성공/실패 경로, requestfailed 처리, candidate body 지연 해석)을
 # characterization test로 고정하는 것이 유일한 목적이며, 실제 Playwright
 # page/response 객체는 전혀 다루지 않고 최소 Fake만 사용한다(실제 Playwright
 # 접속 없음). 기존 tests/test_collection_apollo_list_collector.py의
@@ -20,6 +22,7 @@ from src.collection.apollo_response_observer import (
     _MAX_CANDIDATE_BODY_BYTES,
     _classify_candidate_http_status,
     _QueryObservationContext,
+    _make_candidate_parser,
     _make_request_failed_handler,
     _make_request_finished_handler,
     _make_response_handler,
@@ -512,6 +515,158 @@ def check_request_failed_handler_contract(reporter: ValidationReporter) -> None:
         )
 
 
+# --------------------------------------------------------------------------
+# PARSE-1~PARSE-4: _make_candidate_parser(ctx)가 만드는 callback(candidate
+# body 지연 해석)의 계약 고정. 원래 apollo_list_collector.collect_apollo_
+# first_list_query 내부 nested function _ensure_parsed_simple이었던 로직을
+# 이 모듈로 이동한 뒤 이 파일에서 직접 보호한다.
+# --------------------------------------------------------------------------
+def check_parse_candidate_success_and_pending(reporter: ValidationReporter) -> None:
+    """PARSE-1. (A) body snapshot이 준비되고 유효한 JSON이면 json.loads +
+    _extract_list_items를 거쳐 {"items": [...], "error": False}를 반환하고,
+    동일 index를 재호출해도(memoize 없음) 같은 결과를 반환한다. (B) 아직
+    준비되지 않은 entry(ready=False, error_type 없음)는 {"items": [],
+    "error": False, "pending": True}를 반환한다. 두 경로 모두 entry를
+    변경하지 않는다."""
+    ctx = _QueryObservationContext()
+    parse_candidate = _make_candidate_parser(ctx)
+
+    request_a = FakeRequest()
+    entry_a = _make_placeholder_entry(request_a)
+    payload = {"result": {"place": {"list": [{"id": "1", "name": "카페A"}]}}}
+    entry_a["body_snapshot"] = json.dumps(payload).encode("utf-8")
+    entry_a["body_snapshot_ready"] = True
+    ctx.candidates.append(entry_a)
+    entry_a_before = dict(entry_a)
+
+    request_b = FakeRequest()
+    entry_b = _make_placeholder_entry(request_b)
+    ctx.candidates.append(entry_b)
+    entry_b_before = dict(entry_b)
+
+    try:
+        result_a = parse_candidate(0)
+        result_a_again = parse_candidate(0)
+        result_b = parse_candidate(1)
+    except Exception as exc:
+        reporter.fail(f"PARSE-1. 성공/pending 경로에서 예외가 밖으로 전파됨: {exc!r}")
+        return
+
+    ok = (
+        result_a == {"items": [{"id": "1", "name": "카페A"}], "error": False}
+        and result_a_again == result_a
+        and entry_a == entry_a_before
+        and result_b == {"items": [], "error": False, "pending": True}
+        and entry_b == entry_b_before
+    )
+    if ok:
+        reporter.pass_("PARSE-1. 성공 시 json.loads+_extract_list_items 결과 반환(재호출해도 동일 - memoize 없음), 미준비 entry는 pending=True 반환, 둘 다 entry 불변")
+    else:
+        reporter.fail(
+            f"PARSE-1. 성공/pending 계약 실패: result_a={result_a}, result_a_again={result_a_again}, "
+            f"entry_a_changed={entry_a != entry_a_before}, result_b={result_b}, entry_b_changed={entry_b != entry_b_before}"
+        )
+
+
+def check_parse_candidate_http_error(reporter: ValidationReporter) -> None:
+    """PARSE-2. candidate_error_type이 CandidateHttpError인 entry는 body를
+    전혀 해석하지 않고 즉시 {"items": [], "error": True}를 반환한다 -
+    body_snapshot을 poison 값(int)으로 채워, 실제로 해석을 시도하면
+    TypeError로 즉시 드러나게 한다."""
+    ctx = _QueryObservationContext()
+    parse_candidate = _make_candidate_parser(ctx)
+
+    request = FakeRequest()
+    entry = _make_placeholder_entry(request)
+    entry["body_snapshot_ready"] = True
+    entry["candidate_error_type"] = "CandidateHttpError"
+    entry["body_snapshot"] = 12345  # poison: json.loads(int) 시도 시 TypeError
+    ctx.candidates.append(entry)
+    entry_before = dict(entry)
+
+    try:
+        result = parse_candidate(0)
+    except Exception as exc:
+        reporter.fail(f"PARSE-2. CandidateHttpError 경로에서 예외가 밖으로 전파됨(body 해석을 시도했을 가능성): {exc!r}")
+        return
+
+    ok = result == {"items": [], "error": True} and "pending" not in result and entry == entry_before
+    if ok:
+        reporter.pass_("PARSE-2. CandidateHttpError entry: body를 해석하지 않고 즉시 {'items': [], 'error': True} 반환, entry 불변")
+    else:
+        reporter.fail(f"PARSE-2. CandidateHttpError 계약 실패: result={result}, entry_changed={entry != entry_before}")
+
+
+def check_parse_candidate_json_decode_failure(reporter: ValidationReporter) -> None:
+    """PARSE-3. body_snapshot_ready=True이고 body가 잘못된 JSON이면
+    json.loads 예외를 흡수하고 {"items": [], "error": True}를 반환한다 -
+    이 entry는 body_snapshot_error_type이 비어있으므로 그 분기와는 무관한
+    별개 경로임을 함께 확인한다."""
+    ctx = _QueryObservationContext()
+    parse_candidate = _make_candidate_parser(ctx)
+
+    request = FakeRequest()
+    entry = _make_placeholder_entry(request)
+    entry["body_snapshot_ready"] = True
+    entry["body_snapshot"] = b"{not valid json"
+    ctx.candidates.append(entry)
+    entry_before = dict(entry)
+
+    try:
+        result = parse_candidate(0)
+        result_again = parse_candidate(0)
+    except Exception as exc:
+        reporter.fail(f"PARSE-3. JSON decode 실패 경로에서 예외가 밖으로 전파됨: {exc!r}")
+        return
+
+    ok = (
+        result == {"items": [], "error": True}
+        and result_again == result
+        and entry["body_snapshot_error_type"] == ""
+        and entry == entry_before
+    )
+    if ok:
+        reporter.pass_("PARSE-3. json.loads 실패는 밖으로 전파되지 않고 {'items': [], 'error': True}로 흡수(body_snapshot_error_type과 무관한 별개 경로), 재호출도 동일, entry 불변")
+    else:
+        reporter.fail(f"PARSE-3. JSON decode 실패 계약 실패: result={result}, result_again={result_again}, entry={entry}")
+
+
+def check_parse_candidate_body_snapshot_error(reporter: ValidationReporter) -> None:
+    """PARSE-4. body_snapshot_ready=False이고 body_snapshot_error_type이
+    설정된 entry(예: EmptyBody)는 JSON 해석을 전혀 시도하지 않고
+    {"items": [], "error": True}를 반환하며, 오류 type/message는 그대로
+    보존된다."""
+    ctx = _QueryObservationContext()
+    parse_candidate = _make_candidate_parser(ctx)
+
+    request = FakeRequest()
+    entry = _make_placeholder_entry(request)
+    entry["body_snapshot_ready"] = False
+    entry["body_snapshot_error_type"] = "EmptyBody"
+    entry["body_snapshot_error_message"] = "response body가 0바이트입니다"
+    entry["body_snapshot"] = 12345  # poison: 해석 시도 시 TypeError로 즉시 드러남
+    ctx.candidates.append(entry)
+    entry_before = dict(entry)
+
+    try:
+        result = parse_candidate(0)
+    except Exception as exc:
+        reporter.fail(f"PARSE-4. body snapshot 오류 경로에서 예외가 밖으로 전파됨(JSON 해석을 시도했을 가능성): {exc!r}")
+        return
+
+    ok = (
+        result == {"items": [], "error": True}
+        and "pending" not in result
+        and entry == entry_before
+        and entry["body_snapshot_error_type"] == "EmptyBody"
+        and entry["body_snapshot_error_message"] == "response body가 0바이트입니다"
+    )
+    if ok:
+        reporter.pass_("PARSE-4. body_snapshot_error_type이 설정된 entry: JSON 해석을 시도하지 않고 {'items': [], 'error': True} 반환, 오류 type/message 보존")
+    else:
+        reporter.fail(f"PARSE-4. body snapshot 오류 계약 실패: result={result}, entry={entry}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -524,6 +679,10 @@ def main() -> bool:
         check_text_fallback_when_body_raises,
         check_no_response_handling,
         check_request_failed_handler_contract,
+        check_parse_candidate_success_and_pending,
+        check_parse_candidate_http_error,
+        check_parse_candidate_json_decode_failure,
+        check_parse_candidate_body_snapshot_error,
     ]
     for check in checks:
         check(reporter)

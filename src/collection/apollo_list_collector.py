@@ -17,7 +17,6 @@
 # 이미 닫힘(Target closed)"·"브라우저 실행 장애"·"일반 navigation 오류" 등
 # 그 외 예외는 timeout으로 위장하지 않고 navigation_error로 별도 분류한다
 # (browser_session.goto와 동일하게 PlaywrightTimeoutError만 관용적으로 흡수).
-import json
 from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -36,12 +35,12 @@ from src.collection.apollo_page_navigator import (
 )
 from src.collection.apollo_response_observer import (
     _QueryObservationContext,
+    _make_candidate_parser,
     _make_request_failed_handler,
     _make_request_finished_handler,
     _make_response_handler,
 )
 from src.collection.place_mapper import (
-    _extract_list_items,
     _map_item_to_row,
     classify_captcha_signal,
     dedup_rows,
@@ -116,6 +115,7 @@ def collect_apollo_first_list_query(
     response_handler = _make_response_handler(ctx)
     request_finished_handler = _make_request_finished_handler(ctx)
     request_failed_handler = _make_request_failed_handler(ctx)
+    _ensure_parsed_simple = _make_candidate_parser(ctx)
     _registered_listeners: list = []
     try:
         for _event, _handler in (
@@ -190,25 +190,6 @@ def collect_apollo_first_list_query(
             review_filter_stats = _merge_review_filter_stats(
                 review_filter_stats, _review_filter_stats(candidate_count, review_rejected)
             )
-
-        def _ensure_parsed_simple(index: int) -> dict:
-            """candidate당 재확인 memoize를 하지 않는 단순화된 버전 - 이
-            경로는 DOM class-diff 등 추가 하드닝이 없어 candidate 수 자체가
-            훨씬 적으므로 매 호출마다
-            다시 파싱해도 비용이 낮다(§3 - 새 pagination 루프는 의도적으로
-            더 단순하게 작성)."""
-            entry = ctx.candidates[index]
-            if entry["body_snapshot_ready"]:
-                if entry.get("candidate_error_type") == "CandidateHttpError":
-                    return {"items": [], "error": True}
-                try:
-                    data = json.loads(entry["body_snapshot"])
-                    return {"items": _extract_list_items(data), "error": False}
-                except Exception:
-                    return {"items": [], "error": True}
-            if entry["body_snapshot_error_type"]:
-                return {"items": [], "error": True}
-            return {"items": [], "error": False, "pending": True}
 
         pagination_stop_reason = None
         current_page_number = 1

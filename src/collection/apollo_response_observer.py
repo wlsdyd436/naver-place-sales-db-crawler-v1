@@ -3,10 +3,14 @@
 # "requestfailed")가 전달하는 것과 동일한 duck-typed 표면)이며, 출력은
 # _QueryObservationContext에 축적되는 candidate 상태(entry dict 목록)다.
 # candidate 판별은 place_mapper.is_candidate_response를 그대로 재사용한다
-# (재구현 없음). 이 모듈은 페이지 이동, listener 등록·해제(page.on/page.off),
-# candidate body의 JSON list 파싱, row 변환, 필터, BrowserSession 수명 관리를
+# (재구현 없음). 자신이 축적한 candidate body를 필요 시 지연 해석(JSON
+# decode + 목록 item 추출)하는 callback(_make_candidate_parser)도 이 모듈이
+# 제공한다. 이 모듈은 페이지 이동, listener 등록·해제(page.on/page.off), row
+# 변환, 필터, navigation, pagination stop reason, BrowserSession 수명 관리를
 # 전혀 수행하지 않는다 - 그 책임은 전부 apollo_list_collector.py에 남는다.
-from src.collection.place_mapper import is_candidate_response
+import json
+
+from src.collection.place_mapper import _extract_list_items, is_candidate_response
 
 # PAGE-300-2B-2B: candidate response body의 안전 상한(바이트). PAGE-300-2B-2A
 # 실측(page 2 candidate 응답 약 414KB)보다 넉넉한 여유를 두되, 메모리 폭주를
@@ -339,3 +343,25 @@ def _make_request_failed_handler(ctx: _QueryObservationContext):
             pass
 
     return handle_request_failed
+
+
+def _make_candidate_parser(ctx: _QueryObservationContext):
+    """ctx.candidates[index]의 body snapshot을 필요한 시점에만 지연 해석하는
+    callback을 만든다(§3 - 이 경로는 candidate 수 자체가 적어 매 호출마다
+    다시 파싱해도 비용이 낮으므로 memoize하지 않는 단순화된 버전)."""
+
+    def parse_candidate(index: int) -> dict:
+        entry = ctx.candidates[index]
+        if entry["body_snapshot_ready"]:
+            if entry.get("candidate_error_type") == "CandidateHttpError":
+                return {"items": [], "error": True}
+            try:
+                data = json.loads(entry["body_snapshot"])
+                return {"items": _extract_list_items(data), "error": False}
+            except Exception:
+                return {"items": [], "error": True}
+        if entry["body_snapshot_error_type"]:
+            return {"items": [], "error": True}
+        return {"items": [], "error": False, "pending": True}
+
+    return parse_candidate
