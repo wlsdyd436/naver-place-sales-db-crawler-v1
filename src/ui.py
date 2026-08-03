@@ -15,7 +15,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from src.exporter import export_places_to_excel
-from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_json_artifact
+from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, build_security_diagnostics_log_messages, save_json_artifact
 from src.collection.home_enrichment import enrich_home_details
 from src.collection.apollo_list_collector import ApolloFirstListCollector
 from src.region.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
@@ -1466,6 +1466,19 @@ class SalesDbCrawlerApp(ctk.CTk):
                 should_continue=_network_should_continue,
                 on_security_block=self._note_security_block,
             )
+
+        # CAPTCHA/보안 차단 진단(JSON+PNG) 저장 결과를 로그창에 표시한다.
+        # 저장 자체는 이미 apollo_list_collector.py에서 실행당 1회만 끝난
+        # 상태이며, 여기서는 그 결과(dict)를 문자열로만 바꿔 보여준다(저장
+        # 로직 재실행 없음). build_security_diagnostics_log_messages는 UI를
+        # 모르는 순수 함수이고, 이 한 곳에서만 소비하므로 중복 로그가 생기지
+        # 않는다 - result에 정보가 없으면(CAPTCHA 없었던 정상 실행) 빈
+        # 리스트라 아무 것도 출력하지 않는다.
+        try:
+            for message in build_security_diagnostics_log_messages(result.get("security_diagnostics")):
+                self.log(message)
+        except Exception:
+            pass
 
         # with 블록 종료: collector의 browser/context/Playwright(sync, Native
         # Edge CDP owned process 포함)가 완전히 정리된 상태다(process 종료 +

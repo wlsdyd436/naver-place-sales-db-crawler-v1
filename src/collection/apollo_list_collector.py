@@ -106,12 +106,11 @@ def _maybe_save_security_diagnostics(
         target_page=target_page,
         current_url=getattr(page, "url", ""),
     )
-    if result.get("json_saved"):
-        print(f"[진단] 보안 차단 정보 저장: {result.get('json_path')}")
-    if result.get("screenshot_saved"):
-        print(f"[진단] CAPTCHA 화면 저장: {result.get('screenshot_path')}")
-    elif result.get("json_saved"):
-        print(f"[진단] CAPTCHA 화면 저장 실패: {result.get('screenshot_error')}")
+    # 이 결과(JSON/PNG 경로·성공 여부)를 사용자에게 보이는 로그로 바꾸는
+    # 책임은 이 계층에 두지 않는다(collection 계층은 UI를 모른다) - 호출자
+    # 체인을 따라 plan_runner.run_collection_plan의 반환 dict로 그대로
+    # 전달되고, ui.py가 build_security_diagnostics_log_messages(src/
+    # diagnostics.py)로 포맷해 self.log()에 표시한다.
     return result
 
 

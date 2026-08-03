@@ -11,6 +11,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.diagnostics import (
+    build_security_diagnostics_log_messages,
     capture_page_diagnostics,
     create_diagnostic_run_dir,
     sanitize_label,
@@ -347,6 +348,130 @@ def check_save_security_block_diagnostics_no_sensitive_keys(reporter: Validation
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def check_build_log_messages_json_and_png_success(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-1: JSON+PNG 모두 성공하면 두 줄이 정확한 문구로 나온다."""
+    result = {
+        "json_saved": True, "json_path": r"C:\logs\diagnostics\x.json", "json_error": None,
+        "screenshot_saved": True, "screenshot_path": r"C:\logs\diagnostics\x.png", "screenshot_error": None,
+    }
+    messages = build_security_diagnostics_log_messages(result)
+    ok = messages == [
+        r"[진단] 보안 차단 정보 저장: C:\logs\diagnostics\x.json",
+        r"[진단] CAPTCHA 화면 저장: C:\logs\diagnostics\x.png",
+    ]
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-1. JSON+PNG 성공 시 정확히 2줄(경로 포함) 생성")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-1 실패: {messages}")
+
+
+def check_build_log_messages_png_failure(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-2: JSON 성공 + PNG 실패 - 2줄, 실패 이유 포함.
+    screenshot_error는 save_security_block_diagnostics가 이미 개행 제거·길이
+    제한을 거친 뒤 채우는 값이므로(이 formatter는 재정규화하지 않음), 여기서도
+    이미 정규화된 형태(개행 없음)를 입력으로 준다."""
+    result = {
+        "json_saved": True, "json_path": r"C:\logs\diagnostics\x.json", "json_error": None,
+        "screenshot_saved": False, "screenshot_path": None,
+        "screenshot_error": "RuntimeError: element screenshot failed",
+    }
+    messages = build_security_diagnostics_log_messages(result)
+    ok = (
+        len(messages) == 2
+        and messages[0] == r"[진단] 보안 차단 정보 저장: C:\logs\diagnostics\x.json"
+        and messages[1] == "[진단] CAPTCHA 화면 저장 실패: RuntimeError: element screenshot failed"
+    )
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-2. JSON 성공+PNG 실패 - 2줄, 실패 이유 정확히 포함")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-2 실패: {messages}")
+
+
+def check_build_log_messages_json_failure_only(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-3: JSON 자체가 실패(screenshot_error도 없는 총체적 실패)면
+    1줄만 나온다(정보 없는 PNG 줄을 억지로 만들지 않음)."""
+    result = {
+        "json_saved": False, "json_path": None, "json_error": "OSError: disk full",
+        "screenshot_saved": False, "screenshot_path": None, "screenshot_error": None,
+    }
+    messages = build_security_diagnostics_log_messages(result)
+    ok = messages == ["[진단] 보안 차단 정보 저장 실패: OSError: disk full"]
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-3. JSON 실패(+PNG 정보 없음)면 1줄만 생성")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-3 실패: {messages}")
+
+
+def check_build_log_messages_json_failure_but_png_saved(reporter: ValidationReporter) -> None:
+    """JSON은 실패했지만 PNG는 저장됐다면(요청서 §5 "현재 결과에 따라 정확히
+    출력") PNG 성공 줄도 함께 나와야 한다 - 추정으로 억누르지 않는다."""
+    result = {
+        "json_saved": False, "json_path": None, "json_error": "PermissionError: denied",
+        "screenshot_saved": True, "screenshot_path": r"C:\logs\diagnostics\x.png", "screenshot_error": None,
+    }
+    messages = build_security_diagnostics_log_messages(result)
+    ok = messages == [
+        "[진단] 보안 차단 정보 저장 실패: PermissionError: denied",
+        r"[진단] CAPTCHA 화면 저장: C:\logs\diagnostics\x.png",
+    ]
+    if ok:
+        reporter.pass_("JSON 실패 + PNG 성공: 실제 결과대로 2줄(추정으로 PNG 줄을 숨기지 않음)")
+    else:
+        reporter.fail(f"JSON 실패+PNG 성공 케이스 실패: {messages}")
+
+
+def check_build_log_messages_none_result_is_empty(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-4: CAPTCHA가 없어 result가 None이면 로그 0줄."""
+    ok = build_security_diagnostics_log_messages(None) == [] and build_security_diagnostics_log_messages({}) == []
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-4. result가 None/빈 dict면 로그 0줄")
+    else:
+        reporter.fail("GUI-DIAG-LOG-4 실패: None/빈 dict에서 메시지가 생성됨")
+
+
+def check_build_log_messages_malformed_input_absorbed(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-7 관련: dict가 아닌 잘못된 입력이 들어와도 예외를 던지지
+    않고 빈 리스트를 반환한다(호출부가 예외 처리를 따로 하지 않아도 안전)."""
+    try:
+        messages = build_security_diagnostics_log_messages("not-a-dict")
+    except Exception as exc:
+        reporter.fail(f"잘못된 입력에서 예외 전파됨: {exc!r}")
+        return
+    if messages == []:
+        reporter.pass_("잘못된 입력(dict 아님)은 예외 없이 빈 리스트 반환")
+    else:
+        reporter.fail(f"잘못된 입력 처리 결과가 예상과 다름: {messages}")
+
+
+def check_build_log_messages_no_sensitive_content(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-8: 실제 저장 파이프라인(save_security_block_diagnostics -
+    이미 cookie/authorization/header/query token을 만들지 않는 필드만 담음)을
+    거친 결과를 포맷팅해도 로그 메시지에 민감정보가 없다 - 포맷 함수 자신이
+    json_path/screenshot_path/error 문자열 외에 current_url/capture_id 등
+    dict의 다른 필드를 추가로 노출하지 않는지도 함께 확인한다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_test_"))
+    try:
+        save_result = save_security_block_diagnostics(
+            captcha_dialog_locator=FakeCaptchaDialogLocator(),
+            diagnostics_root=temp_root,
+            run_id="run-secret-check",
+            current_url="https://map.naver.com/x?token=secret123",
+        )
+        messages = build_security_diagnostics_log_messages(save_result)
+        combined = "\n".join(messages)
+        forbidden = [
+            "cookie", "Cookie", "Authorization", "authorization", "secret123",
+            "run-secret-check", "capture_id", "current_url",
+        ]
+        found = [term for term in forbidden if term in combined]
+        if not found and messages:
+            reporter.pass_("GUI-DIAG-LOG-8. 실제 저장 결과를 포맷팅해도 민감정보/부가 필드가 로그에 노출되지 않음")
+        else:
+            reporter.fail(f"GUI-DIAG-LOG-8 실패: found={found}, messages={messages}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def check_not_wired_to_production_paths(reporter: ValidationReporter) -> None:
     source = (ROOT_DIR / "src" / "diagnostics.py").read_text(encoding="utf-8")
     forbidden_tokens = ["pc_crawler", "src.ui", "src.exporter", "src.crawler", "src.parser"]
@@ -371,6 +496,13 @@ def main() -> int:
     check_save_security_block_diagnostics_screenshot_failure_isolated(reporter)
     check_save_security_block_diagnostics_no_locator_json_only(reporter)
     check_save_security_block_diagnostics_no_sensitive_keys(reporter)
+    check_build_log_messages_json_and_png_success(reporter)
+    check_build_log_messages_png_failure(reporter)
+    check_build_log_messages_json_failure_only(reporter)
+    check_build_log_messages_json_failure_but_png_saved(reporter)
+    check_build_log_messages_none_result_is_empty(reporter)
+    check_build_log_messages_malformed_input_absorbed(reporter)
+    check_build_log_messages_no_sensitive_content(reporter)
     check_not_wired_to_production_paths(reporter)
 
     reporter.summary()

@@ -91,6 +91,7 @@ def run_collection_plan(
             "rejected_rows": [],
             "duplicate_removed_count": 0,
             "review_filter_stats": None,
+            "security_diagnostics": None,
         }
 
     total_jobs = len(jobs)
@@ -107,6 +108,7 @@ def run_collection_plan(
     stop_reason = None
     duplicate_removed_count = 0
     review_filter_stats = None
+    security_diagnostics = None
 
     for job in jobs:
         if should_continue is not None and not should_continue():
@@ -116,6 +118,8 @@ def run_collection_plan(
         result = collect_query(job, per_query_limit) or {}
         executed_query_count += 1
         rejected_rows.extend(result.get("rejected_rows") or [])
+        if result.get("security_diagnostics") is not None:
+            security_diagnostics = result["security_diagnostics"]
 
         if result.get("navigation_error"):
             navigation_error = True
@@ -173,6 +177,7 @@ def run_collection_plan(
         "rejected_rows": rejected_rows,
         "duplicate_removed_count": duplicate_removed_count,
         "review_filter_stats": review_filter_stats,
+        "security_diagnostics": security_diagnostics,
     }
 
 

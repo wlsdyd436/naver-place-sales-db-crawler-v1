@@ -386,6 +386,144 @@ def check_status_429_partial_save(reporter: ValidationReporter) -> None:
         reporter.fail(f"status_429 결과가 예상과 다름: statuses={statuses}, exporter.calls={exporter.calls}")
 
 
+def check_security_diagnostics_json_and_png_logged(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-1: orchestrator 결과의 security_diagnostics가 있으면
+    기존 self.log(callback)로 JSON/PNG 경로가 정확히 1회씩 표시된다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    diag = {
+        "json_saved": True, "json_path": r"C:\logs\diagnostics\x.json", "json_error": None,
+        "screenshot_saved": True, "screenshot_path": r"C:\logs\diagnostics\x.png", "screenshot_error": None,
+    }
+    result = _base_result(
+        stop_reason="security_blocked", final_count=1, rows=_fake_rows(1),
+        security_blocked=True, security_diagnostics=diag,
+    )
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    json_line = r"[진단] 보안 차단 정보 저장: C:\logs\diagnostics\x.json"
+    png_line = r"[진단] CAPTCHA 화면 저장: C:\logs\diagnostics\x.png"
+    ok = logs.count(json_line) == 1 and logs.count(png_line) == 1
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-1. security_diagnostics의 JSON/PNG 경로가 기존 log callback으로 정확히 1회씩 표시됨")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-1 실패: logs={logs}")
+
+
+def check_security_diagnostics_png_failure_logged(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-2: PNG 저장 실패 시 JSON 성공 로그 + PNG 실패 로그가 표시된다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    diag = {
+        "json_saved": True, "json_path": r"C:\logs\diagnostics\x.json", "json_error": None,
+        "screenshot_saved": False, "screenshot_path": None, "screenshot_error": "RuntimeError: boom",
+    }
+    result = _base_result(
+        stop_reason="security_blocked", final_count=1, rows=_fake_rows(1),
+        security_blocked=True, security_diagnostics=diag,
+    )
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        r"[진단] 보안 차단 정보 저장: C:\logs\diagnostics\x.json" in logs
+        and "[진단] CAPTCHA 화면 저장 실패: RuntimeError: boom" in logs
+    )
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-2. PNG 실패 시 JSON 성공 로그 + PNG 실패 로그가 함께 표시됨")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-2 실패: logs={logs}")
+
+
+def check_security_diagnostics_json_failure_logged(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-3: JSON 저장 자체가 실패하면 실패 로그가 표시되고,
+    수집 결과의 security_blocked=True는 그대로 유지된다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    diag = {
+        "json_saved": False, "json_path": None, "json_error": "OSError: disk full",
+        "screenshot_saved": False, "screenshot_path": None, "screenshot_error": None,
+    }
+    result = _base_result(
+        stop_reason="security_blocked", final_count=1, rows=_fake_rows(1),
+        security_blocked=True, security_diagnostics=diag,
+    )
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    ok = (
+        "[진단] 보안 차단 정보 저장 실패: OSError: disk full" in logs
+        and returned.get("security_blocked") is True
+    )
+    if ok:
+        reporter.pass_("GUI-DIAG-LOG-3. JSON 저장 실패 로그 표시 + security_blocked=True 결과 불변")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-3 실패: logs={logs}, returned={returned}")
+
+
+def check_normal_run_no_security_diagnostics_logs(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-4: CAPTCHA가 없는 정상 실행(security_diagnostics=None)이면
+    진단 관련 로그가 0회다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    result = _base_result(stop_reason="queue_exhausted", final_count=1, rows=_fake_rows(1))
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+    )
+
+    diag_logs = [message for message in logs if message.startswith("[진단]")]
+    if diag_logs == []:
+        reporter.pass_("GUI-DIAG-LOG-4. 정상 실행(CAPTCHA 없음)은 진단 로그 0회")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-4 실패: 예상치 못한 진단 로그={diag_logs}")
+
+
+def check_security_diagnostics_malformed_does_not_crash_pipeline(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG-7 관련: security_diagnostics가 dict가 아닌 잘못된 값이어도
+    _run_network_pipeline은 예외를 던지지 않고 정상적으로 결과를 반환한다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    result = _base_result(
+        stop_reason="security_blocked", final_count=1, rows=_fake_rows(1),
+        security_blocked=True, security_diagnostics="malformed-not-a-dict",
+    )
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    try:
+        returned = app._run_network_pipeline(
+            [{"query": "q1"}], 30, 300, "out.xlsx",
+            collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        )
+    except Exception as exc:
+        reporter.fail(f"GUI-DIAG-LOG-7 실패: malformed security_diagnostics로 예외 전파됨: {exc!r}")
+        return
+    if returned.get("security_blocked") is True:
+        reporter.pass_("GUI-DIAG-LOG-7. malformed security_diagnostics가 있어도 예외 없이 정상 반환(security_blocked 불변)")
+    else:
+        reporter.fail(f"GUI-DIAG-LOG-7 실패: returned={returned}")
+
+
 def check_no_double_save_for_security_and_429(reporter: ValidationReporter) -> None:
     """ARCH-300C WIRE-2C-1: on_partial_save 콜백과 종료 후 저장을 동시에 쓰지
     않으므로, security_blocked/status_429에서도 exporter는 정확히 1회만
@@ -725,6 +863,11 @@ def main() -> int:
     check_user_stopped_partial_save(reporter)
     check_security_blocked_partial_save(reporter)
     check_status_429_partial_save(reporter)
+    check_security_diagnostics_json_and_png_logged(reporter)
+    check_security_diagnostics_png_failure_logged(reporter)
+    check_security_diagnostics_json_failure_logged(reporter)
+    check_normal_run_no_security_diagnostics_logs(reporter)
+    check_security_diagnostics_malformed_does_not_crash_pipeline(reporter)
     check_no_double_save_for_security_and_429(reporter)
     check_zero_rows_no_export_no_file_creation(reporter)
     check_empty_jobs_no_export(reporter)

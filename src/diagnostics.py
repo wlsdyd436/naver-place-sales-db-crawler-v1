@@ -300,3 +300,32 @@ def save_security_block_diagnostics(
             "screenshot_path": None,
             "screenshot_error": None,
         }
+
+
+def build_security_diagnostics_log_messages(result) -> list:
+    """save_security_block_diagnostics()의 반환 dict를 사용자에게 보여줄
+    한 줄짜리 로그 문자열 목록으로 변환하는 순수 함수(UI 프레임워크 의존
+    없음 - Tkinter 등 어떤 UI 계층도 import하지 않는다).
+
+    result가 None/빈 dict/dict가 아니면(CAPTCHA가 없었던 정상 실행, 또는
+    잘못된 입력) 빈 list를 반환한다(예외 없음). json/screenshot 각각 실제
+    성공·실패 여부에 따라 정확히 표시하며, 실패인데 표시할 이유(*_error)가
+    전혀 없는 경우(예: mkdir 자체가 실패해 screenshot을 시도조차 못한 경우)는
+    그 줄 자체를 만들지 않는다 - 정보 없는 "실패: None" 줄을 지어내지
+    않는다. json_path/screenshot_path/*_error 외의 다른 필드(current_url/
+    capture_id/run_id 등)는 로그에 노출하지 않는다."""
+    if not isinstance(result, dict) or not result:
+        return []
+
+    messages = []
+    if result.get("json_saved"):
+        messages.append(f"[진단] 보안 차단 정보 저장: {result.get('json_path')}")
+    elif result.get("json_error"):
+        messages.append(f"[진단] 보안 차단 정보 저장 실패: {result.get('json_error')}")
+
+    if result.get("screenshot_saved"):
+        messages.append(f"[진단] CAPTCHA 화면 저장: {result.get('screenshot_path')}")
+    elif result.get("screenshot_error"):
+        messages.append(f"[진단] CAPTCHA 화면 저장 실패: {result.get('screenshot_error')}")
+
+    return messages

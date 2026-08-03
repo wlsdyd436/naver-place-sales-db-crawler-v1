@@ -465,6 +465,54 @@ def check_review_filter_stats_none_when_not_reported(reporter: ValidationReporte
         reporter.fail(f"review_filter_stats가 None이어야 하는데: {result['review_filter_stats']}")
 
 
+def check_security_diagnostics_propagated_from_job_result(reporter: ValidationReporter) -> None:
+    """GUI-DIAG-LOG 사전 조건: collect_query 결과의 security_diagnostics가
+    run_collection_plan 최종 반환에 그대로 전달돼야 ui.py가 볼 수 있다."""
+    jobs = [{"query": "q1"}]
+    diag = {
+        "json_saved": True, "json_path": "C:\\logs\\diagnostics\\x.json", "json_error": None,
+        "screenshot_saved": True, "screenshot_path": "C:\\logs\\diagnostics\\x.png", "screenshot_error": None,
+    }
+
+    def fake_collect(job, per_query_limit):
+        return {"rows": [_row("1")], "security_diagnostics": diag}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-08-03", collect_query=fake_collect,
+    )
+    if result.get("security_diagnostics") == diag:
+        reporter.pass_("security_diagnostics: job 결과가 최종 반환 dict에 그대로 전달됨")
+    else:
+        reporter.fail(f"security_diagnostics 전달 실패: {result.get('security_diagnostics')}")
+
+
+def check_security_diagnostics_none_when_no_captcha(reporter: ValidationReporter) -> None:
+    """CAPTCHA가 없어 job 결과에 security_diagnostics 키 자체가 없으면(기존
+    fake collector와도 하위 호환) 최종 결과도 None이어야 한다."""
+    jobs = [{"query": "q1"}]
+
+    def fake_collect(job, per_query_limit):
+        return {"rows": [_row("1")]}
+
+    result = run_collection_plan(
+        jobs, per_query_limit=10, target_count=1000, collected_at="2026-08-03", collect_query=fake_collect,
+    )
+    if result.get("security_diagnostics") is None:
+        reporter.pass_("security_diagnostics: CAPTCHA 없으면 None 유지(하위 호환)")
+    else:
+        reporter.fail(f"security_diagnostics가 None이어야 하는데: {result.get('security_diagnostics')}")
+
+
+def check_security_diagnostics_empty_jobs_is_none(reporter: ValidationReporter) -> None:
+    result = run_collection_plan(
+        [], per_query_limit=10, target_count=1000, collected_at="2026-08-03", collect_query=lambda j, p: {"rows": []},
+    )
+    if result.get("security_diagnostics") is None:
+        reporter.pass_("security_diagnostics: empty_jobs 경로도 None")
+    else:
+        reporter.fail(f"empty_jobs 경로 security_diagnostics 이상: {result.get('security_diagnostics')}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -485,6 +533,9 @@ def main() -> int:
     check_duplicate_removed_count_across_queries(reporter)
     check_review_filter_stats_aggregated_across_jobs(reporter)
     check_review_filter_stats_none_when_not_reported(reporter)
+    check_security_diagnostics_propagated_from_job_result(reporter)
+    check_security_diagnostics_none_when_no_captcha(reporter)
+    check_security_diagnostics_empty_jobs_is_none(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0
