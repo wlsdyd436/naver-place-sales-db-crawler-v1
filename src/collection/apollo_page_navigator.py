@@ -29,6 +29,17 @@ if TYPE_CHECKING:
 _QUIET_PERIOD_MS = 750
 _POLL_INTERVAL_MS = 100
 
+# 2026-08 실측: 실제 CAPTCHA 발생 시 #wtm-captcha-root 자체는 height=0/
+# visible=False(정적 placeholder)였지만, 그 내부의 실제 challenge dialog
+# ([role="dialog"][aria-modal="true"])는 visible=True였다 - root 자체의
+# visible/bbox만 보던 기존 계산으로는 이 케이스를 active로 못 잡았다. root
+# subtree 안쪽만 한정해서 함께 확인한다(페이지 전역 dialog는 대상이 아님 -
+# selector 문자열 자체가 root 접두어를 포함해야만 조회된다).
+_CAPTCHA_CHILD_DIALOG_SUFFIXES = ('[role="dialog"][aria-modal="true"]',)
+_CAPTCHA_PROBE_SELECTORS_WITH_CHILDREN = list(_CAPTCHA_PROBE_SELECTORS) + [
+    f"{root} {suffix}" for root in _CAPTCHA_PROBE_SELECTORS for suffix in _CAPTCHA_CHILD_DIALOG_SUFFIXES
+]
+
 
 def _probe_captcha_state(page) -> dict:
     """PoC-7 _probe_captcha_presence와 동일한 방식으로 CAPTCHA DOM 상태를 관찰한다.
@@ -55,7 +66,7 @@ def _probe_captcha_state(page) -> dict:
         pass  # child frame 접근 실패 시 main frame만 탐색
 
     for target in frames_to_scan:
-        for selector in _CAPTCHA_PROBE_SELECTORS:
+        for selector in _CAPTCHA_PROBE_SELECTORS_WITH_CHILDREN:
             try:
                 locator = target.locator(selector).first
                 if locator.count() == 0:

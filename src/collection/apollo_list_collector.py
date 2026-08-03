@@ -258,8 +258,27 @@ def collect_apollo_first_list_query(
                 count_before_click = ctx.candidate_response_count
                 try:
                     target_locator.click()
-                except Exception:
-                    pagination_stop_reason = "pagination_click_error"
+                except Exception as exc:
+                    # 2026-08 실측: 클릭 전 probe는 active=False였는데 클릭
+                    # 도중 CAPTCHA dialog가 pointer event를 가로채 click()
+                    # 자체가 예외로 실패하는 경우가 있었다 - 이 예외를 무조건
+                    # pagination_click_error로 뭉개지 않고, 같은 classify_captcha_signal
+                    # (재구현 없음)로 재분류해 실제 CAPTCHA면 captcha_detected로
+                    # 중단한다. final_captcha_signal을 갱신해야 함수 최종
+                    # 반환의 active_captcha_detected(plan_runner의
+                    # security_blocked 연결 지점)에도 반영된다.
+                    post_probe = _probe_captcha_state(page)
+                    post_signal = classify_captcha_signal(
+                        marker_present_in_dom=post_probe["marker_present"],
+                        element_visible=post_probe["visible"],
+                        bounding_box_area=post_probe["bounding_box_area"],
+                        click_exception_message=str(exc),
+                    )
+                    if post_signal["active_captcha_detected"] or post_signal["click_intercepted_by_captcha"]:
+                        pagination_stop_reason = "captcha_detected"
+                        final_captcha_signal = post_signal
+                    else:
+                        pagination_stop_reason = "pagination_click_error"
                     break
 
                 wait_result = _wait_for_next_page_settle(
@@ -333,9 +352,16 @@ def collect_apollo_first_list_query(
             )
 
         capped_rows = unique_rows[:target_count] if target_count else unique_rows
+        # click_intercepted_by_captcha(클릭 도중 CAPTCHA dialog가 pointer
+        # event를 가로챈 경우, root 자체는 active 조건을 못 채울 수 있음)도
+        # active_captcha_detected와 동일하게 CAPTCHA 확정 신호로 취급한다 -
+        # plan_runner는 이 단일 bool 필드만 보고 security_blocked를 판정한다.
         return {
             "rows": capped_rows,
-            "active_captcha_detected": bool(final_captcha_signal["active_captcha_detected"]),
+            "active_captcha_detected": bool(
+                final_captcha_signal["active_captcha_detected"]
+                or final_captcha_signal.get("click_intercepted_by_captcha")
+            ),
             "status_429_seen": ctx.status_429_seen,
             "navigation_error": False,
             "navigation_error_message": "",

@@ -554,6 +554,39 @@ def check_nav3_pagination_click_error(reporter: ValidationReporter) -> None:
         reporter.fail(f"NAV-3. pagination_click_error 케이스 실패: A={result_a}(click={click_calls_a}), B={result_b}(click={click_calls_b})")
 
 
+def check_captcha_tp5_click_intercepted_exception_stops_as_captcha(reporter: ValidationReporter) -> None:
+    """CAPTCHA-TP-5: 실제 관측된 클릭 가로채기 예외 메시지("...subtree
+    intercepts pointer events", id="wtm-captcha-root" 포함)가 click() 중
+    발생하면(클릭 전 probe는 active=False였더라도) 일반 pagination_click_error가
+    아니라 captcha_detected로 중단되고, active_captcha_detected=True로
+    상위(plan_runner의 security_blocked)까지 연결 가능해야 한다."""
+    state = _apollo_state(JOB["query"], [("111", "카페 A")])
+    click_intercept_error = Exception(
+        '<div class="qtAJa" role="dialog" aria-modal="true" aria-label="보안 인증 필요">...</div> '
+        'from <div id="wtm-captcha-root">...</div> subtree intercepts pointer events'
+    )
+    page = FakeApolloPage(
+        [_apollo_state_result(state)],
+        click_plan={"2": {"count": 1, "visible": True, "enabled": True, "click_error": click_intercept_error}},
+    )
+    result = collect_apollo_first_list_query(page, JOB, 30, collected_at="2026-08-03")
+    click_calls = page._frame._click_plan["2"].get("click_calls", 0)
+    handlers_cleared = all(len(v) == 0 for v in page._handlers.values())
+    ok = (
+        result["pagination_stop_reason"] == "captcha_detected"
+        and result["active_captcha_detected"] is True
+        and click_calls == 1
+        and len(result["rows"]) == 1
+        and result["navigation_error"] is False
+        and result["page_count"] == 1
+        and handlers_cleared
+    )
+    if ok:
+        reporter.pass_("CAPTCHA-TP-5. 클릭 가로채기 예외는 pagination_click_error가 아니라 captcha_detected로 중단되고 active_captcha_detected=True로 연결됨")
+    else:
+        reporter.fail(f"CAPTCHA-TP-5 실패: {result}, click_calls={click_calls}, handlers_cleared={handlers_cleared}")
+
+
 def check_nav4_next_page_response_timeout(reporter: ValidationReporter) -> None:
     """다음 페이지 버튼은 정상적으로 1회 클릭되지만 page.schedule_after_click(...)로
     candidate response를 예약하지 않아, 클릭 후에도 새 candidate가 전혀
@@ -1291,6 +1324,7 @@ def main() -> bool:
         check_nav1_first_page_search_frame_not_found,
         check_nav2_ambiguous_page_button,
         check_nav3_pagination_click_error,
+        check_captcha_tp5_click_intercepted_exception_stops_as_captcha,
         check_nav4_next_page_response_timeout,
         check_capture_session_cookies_returns_context_cookies,
         check_capture_session_cookies_returns_empty_on_exception,

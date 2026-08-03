@@ -622,6 +622,72 @@ def check_captcha_frame2_and_frame3_visible_child_frame(reporter: ValidationRepo
         )
 
 
+def check_captcha_tp1_hidden_root_only_no_child_dialog(reporter: ValidationReporter) -> None:
+    """CAPTCHA-TP-1: 실제 관측값(width=390, height=0, visible=False)과 동일한
+    hidden root만 있고 그 내부에 challenge dialog가 전혀 없으면, child selector가
+    추가돼도 기존 오탐 방지 계약(active 아님)이 그대로 유지돼야 한다."""
+    hidden_root = FakeLocator(count_value=1, visible=False, box={"width": 390, "height": 0})
+    page = FakePage(locator_map={"#wtm-captcha-root": hidden_root})
+    result = _probe_captcha_state(page)
+    ok = (
+        result["marker_present"] is True
+        and result["visible"] is False
+        and result["bounding_box_area"] == 0.0
+    )
+    if ok:
+        reporter.pass_("13. CAPTCHA-TP-1. hidden root만 있고 child dialog 없음 -> active 아님(기존 계약 유지)")
+    else:
+        reporter.fail(f"13. CAPTCHA-TP-1 실패: {result}")
+
+
+def check_captcha_tp2_visible_child_dialog_despite_hidden_root(reporter: ValidationReporter) -> None:
+    """CAPTCHA-TP-2: 실제 CAPTCHA 증거(root height=0/visible=False, 그러나 그
+    내부 [role="dialog"][aria-modal="true"]는 visible+양수 bbox) 재현 - root
+    자체의 visible/area만 보던 기존 계산으로는 이 경우를 놓쳤다. root subtree
+    안의 challenge dialog를 발견하면 그 값을 채택해야 한다."""
+    hidden_root = FakeLocator(count_value=1, visible=False, box={"width": 390, "height": 0})
+    visible_child_dialog = FakeLocator(count_value=1, visible=True, box={"width": 300, "height": 200})
+    page = FakePage(
+        locator_map={
+            "#wtm-captcha-root": hidden_root,
+            '#wtm-captcha-root [role="dialog"][aria-modal="true"]': visible_child_dialog,
+        }
+    )
+    result = _probe_captcha_state(page)
+    ok = (
+        result["marker_present"] is True
+        and result["visible"] is True
+        and result["bounding_box_area"] == 60000.0
+    )
+    if ok:
+        reporter.pass_("14. CAPTCHA-TP-2. root는 hidden/height=0이어도 그 내부 visible challenge dialog를 발견해 visible=True/area 반영")
+    else:
+        reporter.fail(f"14. CAPTCHA-TP-2 실패: {result}")
+
+
+def check_captcha_tp3_dialog_outside_root_ignored(reporter: ValidationReporter) -> None:
+    """CAPTCHA-TP-3: #wtm-captcha-root 밖(페이지 전역)의 일반 dialog는 절대
+    조회되지 않는다 - root selector 접두어 없는 전역 [role="dialog"] selector를
+    다시 도입하지 않았음을 회귀 가드한다(오탐 방지)."""
+    unrelated_dialog = FakeLocator(count_value=1, visible=True, box={"width": 500, "height": 400})
+    page = FakePage(
+        locator_map={
+            "#wtm-captcha-root": FakeLocator(count_value=0),
+            '[role="dialog"][aria-modal="true"]': unrelated_dialog,  # root 접두어 없음 - 절대 조회 안 됨
+        }
+    )
+    result = _probe_captcha_state(page)
+    ok = (
+        result["marker_present"] is False
+        and result["visible"] is False
+        and result["bounding_box_area"] == 0.0
+    )
+    if ok:
+        reporter.pass_("15. CAPTCHA-TP-3. root 밖의 일반 dialog는 조회되지 않고 무시됨(전역 selector 미도입 회귀 가드)")
+    else:
+        reporter.fail(f"15. CAPTCHA-TP-3 실패: {result}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -637,6 +703,9 @@ def main() -> bool:
         check_captcha_fp3_normal_content_with_saram,
         check_captcha_frame1_hidden_placeholder_in_child_frame,
         check_captcha_frame2_and_frame3_visible_child_frame,
+        check_captcha_tp1_hidden_root_only_no_child_dialog,
+        check_captcha_tp2_visible_child_dialog_despite_hidden_root,
+        check_captcha_tp3_dialog_outside_root_ignored,
     ]
     for check in checks:
         check(reporter)
