@@ -963,6 +963,34 @@ def check_classify_single_url_hostname_overrides_unknown_type_label(reporter: Va
         reporter.fail(f"기타 분류 결과가 예상과 다름: category={category!r}, normalized={normalized!r}")
 
 
+def check_malformed_bracket_prefixed_url_does_not_raise(reporter: ValidationReporter) -> None:
+    """HOME-VE-1: place_id=1398764421(톨브 링크플레이스 신세계백화점
+    타임스퀘어점) 홈페이지 보강에서 실제로 발생한 ValueError("Invalid IPv6
+    URL") 재현 - `[라벨]도메인` 형태(공백 없이 대괄호로 시작하는 라벨이
+    붙은 URL, 백화점 입점 업체 표기에서 흔함)로 scheme 보정("https://" 접두)이
+    이뤄지면 urlsplit()이 netloc을 IPv6 리터럴로 오인해 예외를 던진다.
+    `_normalize_external_url`의 기존 계약("유효하지 않으면 빈 문자열 반환,
+    예외 없음")대로 처리되어야 하며, 다른 정상 URL은 그대로 보존돼야 한다."""
+    item = {
+        "id": "1398764421",
+        "name": "톨브 링크플레이스 신세계백화점 타임스퀘어점",
+        "homepages": {
+            "repr": {"url": "[신세계타임스퀘어]blog.naver.com/example", "type": "홈페이지"},
+            "etc": [{"url": "https://instagram.com/example_valid", "type": "인스타그램"}],
+        },
+    }
+    try:
+        row = _map_item_to_row(item, "2026-08-03")
+    except ValueError as exc:
+        reporter.fail(f"HOME-VE-1. 대괄호 라벨 URL이 여전히 ValueError를 던짐(미수정): {exc}")
+        return
+    ok = row["홈페이지"] == "" and row["인스타"] == "https://instagram.com/example_valid"
+    if ok:
+        reporter.pass_("HOME-VE-1. 대괄호 라벨 URL은 예외 없이 제외되고, 다른 정상 URL(인스타)은 보존됨")
+    else:
+        reporter.fail(f"HOME-VE-1. 대괄호 라벨 URL 처리 결과가 예상과 다름: {row}")
+
+
 def check_format_common_address_removes_duplicate_dong_paren_suffix(reporter: ValidationReporter) -> None:
     """§14 실제 3건: commonAddress와 동일한 행정동이 detail 끝에 괄호로
     중복되면 제거하고, 건물명이 함께 있으면 건물명만 보존한다."""
@@ -1065,6 +1093,7 @@ def main() -> int:
     check_multiple_responses_repeated_merge_no_extra_growth(reporter)
     check_excluded_urls_never_become_channels(reporter)
     check_classify_single_url_hostname_overrides_unknown_type_label(reporter)
+    check_malformed_bracket_prefixed_url_does_not_raise(reporter)
     check_format_common_address_removes_duplicate_dong_paren_suffix(reporter)
     check_format_common_address_preserves_building_style_dong_tokens(reporter)
     check_build_place_url_from_id_valid(reporter)

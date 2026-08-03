@@ -946,6 +946,77 @@ def check_user_stop_before_retry_pass_skips_retry(reporter: ValidationReporter) 
         reporter.fail(f"G. 재시도 전 사용자 중지 검증 실패: result={result}")
 
 
+def check_malformed_bracket_url_does_not_crash_whole_place(reporter: ValidationReporter) -> None:
+    """HOME-VE-1(전체 파이프라인): place_id=1398764421 실패 재현 - homepages에
+    대괄호 라벨 URL(`[신세계타임스퀘어]blog.naver.com/example`)이 섞여 있어도
+    `_fetch_place_home_async`가 unexpected_error/ValueError로 죽지 않고
+    success 처리되며, 문제 URL만 제외되고 다른 정상 URL(인스타)은 보존된다."""
+    rows = [_row("977")]
+    html = _apollo_html(
+        "977",
+        parent_overrides={
+            "homepages": {
+                "repr": {"url": "[신세계타임스퀘어]blog.naver.com/example", "type": "홈페이지"},
+                "etc": [{"url": "https://instagram.com/example_valid", "type": "인스타그램"}],
+            }
+        },
+    )
+    ctx = FakeAsyncRequestContext({"977": FakeAsyncResponse(200, html)})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    row0 = result["rows"][0]
+    ok = (
+        result["home_success_count"] == 1
+        and result["failure_count"] == 0
+        and row0["홈페이지"] == ""
+        and row0["인스타"] == "https://instagram.com/example_valid"
+    )
+    if ok:
+        reporter.pass_("HOME-VE-1. 대괄호 라벨 URL이 섞여도 업체 전체가 실패하지 않고, 문제 URL만 제외되고 나머지는 보존됨")
+    else:
+        reporter.fail(f"HOME-VE-1. 대괄호 라벨 URL 전체 파이프라인 검증 실패: result={result}, row0={row0}")
+
+
+def check_unexpected_error_attempt_has_diagnostic_fields(reporter: ValidationReporter) -> None:
+    """HOME-VE-4/HOME-VE-5: HTTP 응답 이후 단계(_map_item_to_row, 요청 자체의
+    request_error 경로와 무관)에서 어떤 미확인 예외가 나도(place_mapper의
+    _map_item_to_row를 일시적으로 monkeypatch해 RuntimeError를 주입) attempt
+    기록에 error_stage/error_message/error_location/retry_reason이 채워지고,
+    error_location에는 프로젝트 상대 경로만 남으며 절대경로(사용자명/TEMP)나
+    민감정보는 포함되지 않는다. HTTP 요청 자체의 예외(request_error)는 이미
+    `_fetch_place_home_async` 안에서 별도로 처리되므로(HOME-VE-1과 구분),
+    응답을 정상 수신한 뒤의 처리 단계에서 예외를 주입해야 unexpected_error
+    경로(_run_one의 범용 except)를 실제로 검증할 수 있다."""
+    rows = [_row("988")]
+    ctx = FakeAsyncRequestContext({"988": FakeAsyncResponse(200, _apollo_html("988"))})
+
+    original_map_item_to_row = home_enrichment._map_item_to_row
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom: unexpected failure")
+
+    home_enrichment._map_item_to_row = _boom
+    try:
+        result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    finally:
+        home_enrichment._map_item_to_row = original_map_item_to_row
+    attempt = result["diagnostics_report"]["attempts"][0]
+    location = attempt.get("error_location", "")
+    ok = (
+        attempt.get("status") == "unexpected_error"
+        and attempt.get("error_stage")
+        and attempt.get("error_message") == "boom: unexpected failure"
+        and location
+        and ":" in location
+        and "C:\\" not in location and "/home/" not in location.lower()
+        and "wlsdy" not in location.lower()
+        and attempt.get("retry_reason") == "no_retry_unexpected_error"
+    )
+    if ok:
+        reporter.pass_("HOME-VE-4/5. unexpected_error attempt에 error_stage/message/location/retry_reason이 채워지고 절대경로가 없음")
+    else:
+        reporter.fail(f"HOME-VE-4/5. 진단 필드 검증 실패: attempt={attempt}")
+
+
 def check_diagnostics_report_structure_and_no_sensitive_data(reporter: ValidationReporter) -> None:
     """H(§13): diagnostics_report에 place_id/이름/상태 등 공개·구조 정보만
     있고 쿠키/Authorization/토큰/HTML 원문이 전혀 없으며, 한글 업체명이
@@ -1056,6 +1127,8 @@ def main() -> bool:
         check_place_id_mismatch_not_merged_and_not_retried,
         check_retry_pass_concurrency_capped_at_one,
         check_user_stop_before_retry_pass_skips_retry,
+        check_malformed_bracket_url_does_not_crash_whole_place,
+        check_unexpected_error_attempt_has_diagnostic_fields,
         check_diagnostics_report_structure_and_no_sensitive_data,
         check_parse_apollo_state_from_html_extracts_state,
         check_parse_apollo_state_from_html_missing_marker_returns_none,

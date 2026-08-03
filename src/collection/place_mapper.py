@@ -517,7 +517,14 @@ def _normalize_external_url(raw) -> str:
             return ""
         text = "https://" + text
 
-    parsed = urlsplit(text)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        # "[라벨]도메인" 처럼 공백 없이 대괄호로 시작하는 라벨이 scheme 보정
+        # 후 netloc 자리에 오면 urlsplit이 IPv6 리터럴로 오인해 예외를 던진다
+        # (예: place_id=1398764421 실측, ValueError: Invalid IPv6 URL) - 다른
+        # 무효 URL과 동일하게 빈 문자열로 처리한다(예외 없음 계약 유지).
+        return ""
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return ""
     hostname = parsed.hostname.lower()

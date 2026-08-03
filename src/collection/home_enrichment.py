@@ -25,8 +25,10 @@
 # 동시에 같은 profile을 쓰는 충돌은 발생하지 않는다.
 import asyncio
 import math
+import re
 import subprocess
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,12 +87,94 @@ _HOME_RETRYABLE_STATUSES = frozenset(
 )
 
 
+# PAGE300-6G-R2(진단 스키마 보강): place_id=1398764421 실패 감사 - unexpected_error가
+# 발생하면 _run_one이 _fetch_place_home_async의 부분 진행 상태를 전부 버리고
+# 새 dict로 교체하므로(§ 아래 _error_result), 기존 필드만으로는 어느 단계에서
+# 무엇이 실패했는지 알 수 없었다. status(기존 값)별 안정적인 stage/retry_reason
+# 라벨 - deterministic 실패는 "no_retry"/"deterministic_" 접두어로 retryable=False와
+# 모순되지 않게, transient 실패는 _HOME_RETRYABLE_STATUSES와 일치하게 둔다.
+_ERROR_STAGE_BY_STATUS = {
+    "no_place_url": "input_validation",
+    "timeout": "detail_request",
+    "request_error": "detail_request",
+    "http_5xx": "detail_request",
+    "http_4xx": "detail_request",
+    "captcha_detected": "detail_request",
+    "security_blocked": "detail_request",
+    "empty_html": "response_parse",
+    "apollo_missing": "response_parse",
+    "base_missing": "response_parse",
+    "place_id_mismatch": "response_parse",
+    "adapter_empty": "apollo_adapter",
+    "parent_missing": "apollo_adapter",
+}
+_RETRY_REASON_BY_STATUS = {
+    "timeout": "request_timeout",
+    "request_error": "transient_request_error",
+    "http_5xx": "transient_http_5xx",
+    "empty_html": "transient_empty_html",
+    "apollo_missing": "transient_apollo_missing",
+    "base_missing": "transient_base_missing",
+    "parent_missing": "transient_parent_missing",
+    "adapter_empty": "transient_adapter_empty",
+    "captcha_detected": "security_block",
+    "security_blocked": "security_block",
+    "place_id_mismatch": "deterministic_place_id_mismatch",
+    "http_4xx": "deterministic_http_4xx",
+    "no_place_url": "deterministic_no_place_url",
+    "unexpected_error": "no_retry_unexpected_error",
+}
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_ERROR_MESSAGE_MAX_LEN = 300
+_SENSITIVE_MESSAGE_PATTERN = re.compile(r"(?i)\b(cookie|authorization|bearer)\S*")
+
+
+def _sanitize_error_message(message: str) -> str:
+    """예외 메시지를 진단 JSON에 남기기 전 정리한다 - 줄바꿈 제거, 쿠키/
+    Authorization/Bearer류 토큰 마스킹, 메시지에 URL이 섞여 있을 경우를 대비해
+    쿼리스트링·fragment 제거, 최대 300자로 절단(요청서 §12)."""
+    text = re.sub(r"[\r\n]+", " ", message or "").strip()
+    text = _SENSITIVE_MESSAGE_PATTERN.sub("[REDACTED]", text)
+    text = re.sub(r"[?#]\S*", "", text)
+    return text[:_ERROR_MESSAGE_MAX_LEN]
+
+
+def _project_error_frame(exc: BaseException) -> tuple:
+    """예외 traceback에서 프로젝트 내부 마지막 frame만 사용해 (location, stage)를
+    만든다(요청서 §12) - location은 "path:func:line"(절대경로/사용자명/TEMP
+    경로 없음), stage는 함수명만. 프로젝트 밖(stdlib/venv) frame만 있으면
+    라이브러리 파일명:함수명만 남긴다."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    project_frame = None
+    for frame in frames:
+        try:
+            rel = Path(frame.filename).resolve().relative_to(_PROJECT_ROOT)
+        except ValueError:
+            continue
+        project_frame = (rel.as_posix(), frame.name, frame.lineno)
+    if project_frame:
+        path, func, line = project_frame
+        return f"{path}:{func}:{line}", func
+    if frames:
+        last = frames[-1]
+        return f"{Path(last.filename).name}:{last.name}", last.name
+    return "", ""
+
+
 def _not_attempted_result(place_id: str) -> dict:
     return {"place_id": place_id, "detail_success": False, "home_status": "not_attempted"}
 
 
-def _error_result(place_id: str) -> dict:
-    return {"place_id": place_id, "detail_success": False, "home_status": "unexpected_error"}
+def _error_result(place_id: str, exc: Exception | None = None) -> dict:
+    result = {"place_id": place_id, "detail_success": False, "home_status": "unexpected_error"}
+    if exc is not None:
+        location, stage = _project_error_frame(exc)
+        result["home_error_type"] = type(exc).__name__
+        result["home_error_message"] = _sanitize_error_message(str(exc))
+        result["home_error_location"] = location
+        result["home_error_stage"] = stage
+    return result
 
 
 def _blank_home_fetch_result(place_id: str) -> dict:
@@ -397,6 +481,10 @@ async def _enrich_home_batch_async(
         row = row_by_place_id.get(place_id, {})
         status = result.get("home_status", "")
         retryable = (not result.get("detail_success")) and status in _HOME_RETRYABLE_STATUSES
+        error_stage = (
+            result.get("home_error_stage", "") if status == "unexpected_error"
+            else _ERROR_STAGE_BY_STATUS.get(status, "")
+        )
         attempts.append(
             {
                 "sequence": sequence["n"],
@@ -416,7 +504,11 @@ async def _enrich_home_batch_async(
                 "external_url_count": _external_url_count(result),
                 "status": status,
                 "error_type": result.get("home_error_type", ""),
+                "error_stage": error_stage,
+                "error_message": result.get("home_error_message", ""),
+                "error_location": result.get("home_error_location", ""),
                 "retryable": retryable,
+                "retry_reason": _RETRY_REASON_BY_STATUS.get(status, ""),
                 "blocked": status in ("security_blocked", "captcha_detected"),
                 "final": False,  # 마지막에 place_id별 최종 시도만 True로 보정한다
             }
@@ -451,8 +543,7 @@ async def _enrich_home_batch_async(
                 try:
                     result = await _fetch_place_home_async(request_context, row_by_place_id[place_id])
                 except Exception as exc:
-                    result = _error_result(place_id)
-                    result["home_error_type"] = type(exc).__name__
+                    result = _error_result(place_id, exc)
                 status = result.get("home_status")
                 pass_counters["attempted"] += 1
                 if result.get("detail_success"):
