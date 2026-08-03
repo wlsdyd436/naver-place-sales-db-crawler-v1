@@ -17,6 +17,7 @@
 # 이미 닫힘(Target closed)"·"브라우저 실행 장애"·"일반 navigation 오류" 등
 # 그 외 예외는 timeout으로 위장하지 않고 navigation_error로 별도 분류한다
 # (browser_session.goto와 동일하게 PlaywrightTimeoutError만 관용적으로 흡수).
+import uuid
 from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -29,10 +30,12 @@ from src.collection.apollo_list_adapter import (
 from src.collection.apollo_page_navigator import (
     _find_page_button,
     _find_search_frame,
+    _find_visible_captcha_dialog_locator,
     _probe_captcha_state,
     _wait_for_apollo_list_ready,
     _wait_for_next_page_settle,
 )
+from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, save_security_block_diagnostics
 from src.collection.apollo_response_observer import (
     _QueryObservationContext,
     _make_candidate_parser,
@@ -55,6 +58,61 @@ from src.collection.row_filters import (
 from src.run_control import wait_while_paused
 
 _SEARCH_URL_TEMPLATE = "https://map.naver.com/v5/search/{query}"
+
+
+class _SecurityDiagnosticsRecorder:
+    """실행(하나의 ApolloFirstListCollector `with` 블록 = 사용자가 시작한
+    수집 1회) 단위로 CAPTCHA/보안 차단 진단 저장을 최초 1회만 허용한다.
+    모듈 전역 mutable 상태를 쓰지 않고, 호출자가 인스턴스를 명시적으로 들고
+    다니며 재사용한다(같은 실행의 여러 job/페이지가 이 인스턴스를 공유) -
+    새 실행은 새 인스턴스를 만들면 다시 저장 가능하다."""
+
+    def __init__(self):
+        self._captured = False
+
+    def try_reserve(self) -> bool:
+        if self._captured:
+            return False
+        self._captured = True
+        return True
+
+
+def _maybe_save_security_diagnostics(
+    *, page, security_diagnostics_recorder, diagnostics_root, run_id,
+    detection_source, probe, signal, pagination_stop_reason,
+    collected_count, page_sequence, target_page,
+):
+    """recorder가 아직 저장한 적 없을 때만(요청서 §3 실행당 1회) best-effort로
+    진단을 저장한다. security_diagnostics_recorder가 None이면(기존 직접
+    함수 호출 테스트 등 opt-in하지 않은 호출자) 아무 것도 하지 않는다 -
+    기존 호출부에 부작용이 생기지 않도록 기본값 자체가 "off"다."""
+    if security_diagnostics_recorder is None or not security_diagnostics_recorder.try_reserve():
+        return None
+    dialog_locator = _find_visible_captcha_dialog_locator(page)
+    result = save_security_block_diagnostics(
+        captcha_dialog_locator=dialog_locator,
+        diagnostics_root=diagnostics_root if diagnostics_root is not None else DEFAULT_DIAGNOSTICS_ROOT,
+        run_id=run_id,
+        detection_source=detection_source,
+        active_captcha_detected=bool(signal.get("active_captcha_detected")),
+        click_intercepted_by_captcha=bool(signal.get("click_intercepted_by_captcha")),
+        passive_captcha_marker_found=bool(signal.get("passive_captcha_marker_found")),
+        marker_present=bool(probe.get("marker_present")),
+        element_visible=bool(probe.get("visible")),
+        bounding_box_area=float(probe.get("bounding_box_area") or 0.0),
+        pagination_stop_reason=pagination_stop_reason,
+        collected_count=collected_count,
+        page_sequence=page_sequence,
+        target_page=target_page,
+        current_url=getattr(page, "url", ""),
+    )
+    if result.get("json_saved"):
+        print(f"[진단] 보안 차단 정보 저장: {result.get('json_path')}")
+    if result.get("screenshot_saved"):
+        print(f"[진단] CAPTCHA 화면 저장: {result.get('screenshot_path')}")
+    elif result.get("json_saved"):
+        print(f"[진단] CAPTCHA 화면 저장 실패: {result.get('screenshot_error')}")
+    return result
 
 
 def _default_session_factory():
@@ -81,7 +139,8 @@ def _default_session_factory():
 
 
 def collect_apollo_first_list_query(
-    page, job, target_count, *, collected_at, max_pages: int = 5, pause_event=None, stop_event=None
+    page, job, target_count, *, collected_at, max_pages: int = 5, pause_event=None, stop_event=None,
+    security_diagnostics_recorder=None, diagnostics_root=None, run_id="",
 ) -> dict:
     """신규 Apollo/GraphQL-first 목록 수집. 1페이지는 메인 placeList(...)
     operation만 파싱하고(DOM 스크롤 없음), 2페이지 이후는 자연 발생 GraphQL
@@ -194,6 +253,7 @@ def collect_apollo_first_list_query(
         pagination_stop_reason = None
         current_page_number = 1
         final_captcha_signal = None
+        security_diagnostics_result = None
 
         if new_opening_only:
             # §4 Live 실측: 새로오픈 전용 operation은 page 1의 고정 소규모
@@ -222,6 +282,13 @@ def collect_apollo_first_list_query(
                 )
                 if final_captcha_signal["active_captcha_detected"]:
                     pagination_stop_reason = "captcha_detected"
+                    security_diagnostics_result = _maybe_save_security_diagnostics(
+                        page=page, security_diagnostics_recorder=security_diagnostics_recorder,
+                        diagnostics_root=diagnostics_root, run_id=run_id,
+                        detection_source="visible_dialog", probe=probe, signal=final_captcha_signal,
+                        pagination_stop_reason=pagination_stop_reason, collected_count=len(unique_rows),
+                        page_sequence=current_page_number, target_page=None,
+                    )
                     break
                 if ctx.status_429_seen:
                     pagination_stop_reason = "status_429_seen"
@@ -277,6 +344,13 @@ def collect_apollo_first_list_query(
                     if post_signal["active_captcha_detected"] or post_signal["click_intercepted_by_captcha"]:
                         pagination_stop_reason = "captcha_detected"
                         final_captcha_signal = post_signal
+                        security_diagnostics_result = _maybe_save_security_diagnostics(
+                            page=page, security_diagnostics_recorder=security_diagnostics_recorder,
+                            diagnostics_root=diagnostics_root, run_id=run_id,
+                            detection_source="click_interception", probe=post_probe, signal=post_signal,
+                            pagination_stop_reason=pagination_stop_reason, collected_count=len(unique_rows),
+                            page_sequence=current_page_number, target_page=target_page_number,
+                        )
                     else:
                         pagination_stop_reason = "pagination_click_error"
                     break
@@ -294,6 +368,13 @@ def collect_apollo_first_list_query(
                 )
                 if final_captcha_signal["active_captcha_detected"]:
                     pagination_stop_reason = "captcha_detected"
+                    security_diagnostics_result = _maybe_save_security_diagnostics(
+                        page=page, security_diagnostics_recorder=security_diagnostics_recorder,
+                        diagnostics_root=diagnostics_root, run_id=run_id,
+                        detection_source="visible_dialog", probe=probe, signal=final_captcha_signal,
+                        pagination_stop_reason=pagination_stop_reason, collected_count=len(unique_rows),
+                        page_sequence=target_page_number, target_page=target_page_number,
+                    )
                     break
                 if ctx.status_429_seen:
                     pagination_stop_reason = "status_429_seen"
@@ -369,6 +450,7 @@ def collect_apollo_first_list_query(
             "pagination_stop_reason": pagination_stop_reason,
             "rejected_rows": rejected_rows,
             "review_filter_stats": review_filter_stats if review_filter_enabled else None,
+            "security_diagnostics": security_diagnostics_result,
         }
     finally:
         for event, event_handler in (
@@ -400,6 +482,11 @@ class ApolloFirstListCollector:
         self._session_factory = session_factory or _default_session_factory
         self._session_cm = None
         self._session = None
+        # 이 인스턴스(하나의 with 블록 = 사용자가 시작한 수집 1회) 동안
+        # 여러 job/페이지가 CAPTCHA를 만나도 진단 저장은 최초 1회만 - 모듈
+        # 전역이 아닌 인스턴스 상태로 관리한다(요청서 §3).
+        self._security_diagnostics_recorder = _SecurityDiagnosticsRecorder()
+        self._run_id = uuid.uuid4().hex
 
     def __enter__(self):
         self._session_cm = self._session_factory()
@@ -427,6 +514,8 @@ class ApolloFirstListCollector:
                 max_pages=self.max_pages,
                 pause_event=self.pause_event,
                 stop_event=self.stop_event,
+                security_diagnostics_recorder=self._security_diagnostics_recorder,
+                run_id=self._run_id,
             )
         finally:
             try:

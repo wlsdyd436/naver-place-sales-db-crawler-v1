@@ -24,6 +24,7 @@ from src.collection.apollo_page_navigator import (
     _POLL_INTERVAL_MS,
     _find_page_button,
     _find_search_frame,
+    _find_visible_captcha_dialog_locator,
     _probe_captcha_state,
     _wait_for_apollo_list_ready,
     _wait_for_next_page_settle,
@@ -688,6 +689,50 @@ def check_captcha_tp3_dialog_outside_root_ignored(reporter: ValidationReporter) 
         reporter.fail(f"15. CAPTCHA-TP-3 실패: {result}")
 
 
+def check_find_visible_captcha_dialog_locator_returns_visible_child(reporter: ValidationReporter) -> None:
+    """DIAG helper: root는 hidden/height=0이어도 그 내부 visible challenge
+    dialog가 있으면 그 locator를 반환한다(detection과 동일 selector 재사용)."""
+    hidden_root = FakeLocator(count_value=1, visible=False, box={"width": 390, "height": 0})
+    visible_child_dialog = FakeLocator(count_value=1, visible=True, box={"width": 300, "height": 200})
+    page = FakePage(
+        locator_map={
+            "#wtm-captcha-root": hidden_root,
+            '#wtm-captcha-root [role="dialog"][aria-modal="true"]': visible_child_dialog,
+        }
+    )
+    result = _find_visible_captcha_dialog_locator(page)
+    if result is visible_child_dialog:
+        reporter.pass_("16. _find_visible_captcha_dialog_locator: root hidden이어도 visible child dialog locator를 반환")
+    else:
+        reporter.fail(f"16. _find_visible_captcha_dialog_locator 실패: {result!r}")
+
+
+def check_find_visible_captcha_dialog_locator_none_when_hidden_only(reporter: ValidationReporter) -> None:
+    """DIAG helper: visible dialog가 전혀 없으면 None을 반환한다(예외 없음)."""
+    hidden_root = FakeLocator(count_value=1, visible=False, box={"width": 390, "height": 0})
+    page = FakePage(locator_map={"#wtm-captcha-root": hidden_root})
+    result = _find_visible_captcha_dialog_locator(page)
+    if result is None:
+        reporter.pass_("17. _find_visible_captcha_dialog_locator: visible dialog 없으면 None 반환")
+    else:
+        reporter.fail(f"17. _find_visible_captcha_dialog_locator 실패(None 기대): {result!r}")
+
+
+def check_find_visible_captcha_dialog_locator_absorbs_exceptions(reporter: ValidationReporter) -> None:
+    """DIAG helper: locator 조회 자체가 예외를 던져도 None을 반환하고 예외를
+    전파하지 않는다."""
+    page = FakePage(locator_error_selectors={"#wtm-captcha-root": RuntimeError("boom")})
+    try:
+        result = _find_visible_captcha_dialog_locator(page)
+    except Exception as exc:
+        reporter.fail(f"18. _find_visible_captcha_dialog_locator 예외 전파됨: {exc!r}")
+        return
+    if result is None:
+        reporter.pass_("18. _find_visible_captcha_dialog_locator: locator 조회 예외를 흡수하고 None 반환")
+    else:
+        reporter.fail(f"18. _find_visible_captcha_dialog_locator 실패: {result!r}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -706,6 +751,9 @@ def main() -> bool:
         check_captcha_tp1_hidden_root_only_no_child_dialog,
         check_captcha_tp2_visible_child_dialog_despite_hidden_root,
         check_captcha_tp3_dialog_outside_root_ignored,
+        check_find_visible_captcha_dialog_locator_returns_visible_child,
+        check_find_visible_captcha_dialog_locator_none_when_hidden_only,
+        check_find_visible_captcha_dialog_locator_absorbs_exceptions,
     ]
     for check in checks:
         check(reporter)

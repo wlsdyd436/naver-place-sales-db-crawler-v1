@@ -15,6 +15,7 @@ from src.diagnostics import (
     create_diagnostic_run_dir,
     sanitize_label,
     save_json_artifact,
+    save_security_block_diagnostics,
     save_text_artifact,
 )
 from src.collection.safety import SafetyReason, classify_exception
@@ -220,6 +221,132 @@ def check_exception_and_safety_decision_metadata(reporter: ValidationReporter) -
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+class FakeCaptchaDialogLocator:
+    def __init__(self, *, fail_screenshot=False):
+        self._fail_screenshot = fail_screenshot
+        self.screenshot_calls = []
+
+    def screenshot(self, path=None):
+        if self._fail_screenshot:
+            raise RuntimeError("simulated element screenshot failure")
+        Path(path).write_bytes(b"fake-captcha-png")
+        self.screenshot_calls.append(path)
+
+
+def check_save_security_block_diagnostics_with_visible_dialog(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-1: visible dialog locator가 있으면 JSON+PNG 모두 저장되고
+    basename이 동일하며 schema 필드가 정확히 채워진다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_test_"))
+    try:
+        locator = FakeCaptchaDialogLocator()
+        result = save_security_block_diagnostics(
+            captcha_dialog_locator=locator,
+            diagnostics_root=temp_root,
+            run_id="run-abc",
+            detection_source="visible_dialog",
+            active_captcha_detected=True,
+            marker_present=True,
+            element_visible=True,
+            bounding_box_area=60000.0,
+            pagination_stop_reason="captcha_detected",
+            collected_count=5,
+            current_url="https://map.naver.com/v5/search/x?query=secret&token=abc#frag",
+        )
+        json_ok = result["json_saved"] and result["json_path"] and Path(result["json_path"]).exists()
+        png_ok = result["screenshot_saved"] and result["screenshot_path"] and Path(result["screenshot_path"]).exists()
+        basename_ok = (
+            json_ok and png_ok
+            and Path(result["json_path"]).stem == Path(result["screenshot_path"]).stem
+        )
+        payload = json.loads(Path(result["json_path"]).read_text(encoding="utf-8")) if json_ok else {}
+        schema_ok = (
+            payload.get("event_type") == "security_blocked"
+            and payload.get("security_reason") == "captcha_detected"
+            and payload.get("run_id") == "run-abc"
+            and payload.get("active_captcha_detected") is True
+            and payload.get("current_url") == "https://map.naver.com/v5/search/x"
+            and "?" not in payload.get("current_url", "")
+            and "#" not in payload.get("current_url", "")
+        )
+        if json_ok and png_ok and basename_ok and schema_ok:
+            reporter.pass_("DIAG-CAPTCHA-1. visible dialog: JSON+PNG 저장, basename 동일, schema/URL sanitize 정확")
+        else:
+            reporter.fail(
+                f"DIAG-CAPTCHA-1 실패: result={result}, basename_ok={basename_ok}, payload={payload}"
+            )
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_save_security_block_diagnostics_screenshot_failure_isolated(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-5: locator.screenshot()이 예외를 던져도 JSON은 저장되고
+    screenshot_saved=False, screenshot_error가 기록되며 예외가 전파되지 않는다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_test_"))
+    try:
+        locator = FakeCaptchaDialogLocator(fail_screenshot=True)
+        try:
+            result = save_security_block_diagnostics(
+                captcha_dialog_locator=locator, diagnostics_root=temp_root,
+            )
+        except Exception as exc:
+            reporter.fail(f"DIAG-CAPTCHA-5 예외 전파됨: {exc!r}")
+            return
+        ok = (
+            result["json_saved"] is True
+            and result["screenshot_saved"] is False
+            and result["screenshot_path"] is None
+            and result["screenshot_error"]
+            and "\n" not in result["screenshot_error"]
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-5. screenshot 실패가 격리됨(JSON은 저장, screenshot_saved=False, 예외 미전파)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-5 실패: {result}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_save_security_block_diagnostics_no_locator_json_only(reporter: ValidationReporter) -> None:
+    """captcha_dialog_locator=None(visible dialog를 못 찾은 경우): 전체 페이지
+    screenshot으로 대체하지 않고 PNG 없이 JSON만 저장한다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_test_"))
+    try:
+        result = save_security_block_diagnostics(captcha_dialog_locator=None, diagnostics_root=temp_root)
+        ok = (
+            result["json_saved"] is True
+            and result["screenshot_saved"] is False
+            and result["screenshot_path"] is None
+            and result["screenshot_error"] == "visible_dialog_locator_not_available"
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA. locator=None이면 전체 페이지 screenshot 대체 없이 JSON만 저장")
+        else:
+            reporter.fail(f"locator=None 케이스 실패: {result}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_save_security_block_diagnostics_no_sensitive_keys(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-10: 저장 JSON에 민감정보 key/값이 없다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_test_"))
+    try:
+        result = save_security_block_diagnostics(
+            captcha_dialog_locator=FakeCaptchaDialogLocator(),
+            diagnostics_root=temp_root,
+            current_url="https://map.naver.com/x?token=secret123",
+        )
+        serialized = Path(result["json_path"]).read_text(encoding="utf-8")
+        forbidden = ["cookie", "Cookie", "authorization", "Authorization", "header",
+                     "localStorage", "sessionStorage", "response_body", "<html", "secret123"]
+        found = [term for term in forbidden if term in serialized]
+        if not found:
+            reporter.pass_("DIAG-CAPTCHA-10. 저장 JSON에 민감정보 key/값 없음(query token 제거 포함)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-10 실패: 민감정보 발견={found}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def check_not_wired_to_production_paths(reporter: ValidationReporter) -> None:
     source = (ROOT_DIR / "src" / "diagnostics.py").read_text(encoding="utf-8")
     forbidden_tokens = ["pc_crawler", "src.ui", "src.exporter", "src.crawler", "src.parser"]
@@ -240,6 +367,10 @@ def main() -> int:
     check_capture_with_fake_page(reporter)
     check_screenshot_failure_does_not_raise(reporter)
     check_exception_and_safety_decision_metadata(reporter)
+    check_save_security_block_diagnostics_with_visible_dialog(reporter)
+    check_save_security_block_diagnostics_screenshot_failure_isolated(reporter)
+    check_save_security_block_diagnostics_no_locator_json_only(reporter)
+    check_save_security_block_diagnostics_no_sensitive_keys(reporter)
     check_not_wired_to_production_paths(reporter)
 
     reporter.summary()

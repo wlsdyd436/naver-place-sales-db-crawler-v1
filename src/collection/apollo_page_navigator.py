@@ -96,6 +96,35 @@ def _probe_captcha_state(page) -> dict:
     }
 
 
+def _find_visible_captcha_dialog_locator(page):
+    """진단 element screenshot 전용 helper(요청서 §6 옵션 A) - _probe_captcha_state와
+    동일한 selector 목록(_CAPTCHA_PROBE_SELECTORS_WITH_CHILDREN)과 frame 순회
+    순서를 그대로 재사용해(재구현 없음, detection과 screenshot이 서로 다른
+    selector를 쓰지 않도록 보장) 실제로 visible+양수 bbox인 첫 Locator를
+    반환한다. _probe_captcha_state의 bool 전용 반환 계약은 이 함수와 무관하게
+    그대로 유지된다. 찾지 못하거나 조회 중 예외가 나면 None을 반환한다(예외
+    전파 없음) - 호출자(diagnostics 저장)가 None이면 PNG 없이 JSON만 저장한다."""
+    frames_to_scan = [page]
+    try:
+        frames_to_scan.extend(list(page.frames))
+    except Exception:
+        pass
+
+    for target in frames_to_scan:
+        for selector in _CAPTCHA_PROBE_SELECTORS_WITH_CHILDREN:
+            try:
+                locator = target.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                if not locator.is_visible(timeout=300):
+                    continue
+                box = locator.bounding_box()
+                if box and float(box.get("width", 0)) * float(box.get("height", 0)) > 0:
+                    return locator
+            except Exception:
+                continue
+    return None
+
 
 def _find_search_frame(page):
     """PAGE-300-2B-1: src/browser/session.py의 BrowserSession.find_search_frame

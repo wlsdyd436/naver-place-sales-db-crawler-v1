@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
+import shutil
 import sys
+import tempfile
 import threading
 import time
 
@@ -89,10 +91,12 @@ def _apollo_state_result(state) -> dict:
 
 
 class FakeCaptchaLocator:
-    def __init__(self, count=0, visible=False, box=None):
+    def __init__(self, count=0, visible=False, box=None, fail_screenshot=False):
         self._count = count
         self._visible = visible
         self._box = box or {"width": 0, "height": 0}
+        self._fail_screenshot = fail_screenshot
+        self.screenshot_calls = []
 
     @property
     def first(self):
@@ -106,6 +110,12 @@ class FakeCaptchaLocator:
 
     def bounding_box(self):
         return self._box
+
+    def screenshot(self, path=None):
+        if self._fail_screenshot:
+            raise RuntimeError("simulated element screenshot failure")
+        Path(path).write_bytes(b"fake-captcha-png")
+        self.screenshot_calls.append(path)
 
 
 class FakeRequest:
@@ -389,6 +399,310 @@ def check_captcha_mid_pagination_stops_with_partial_rows(reporter: ValidationRep
         reporter.pass_("6. CAPTCHA 감지 시 새 페이지 시도 없이 즉시 중단 + 부분 rows 보존")
     else:
         reporter.fail(f"6. CAPTCHA 중단 케이스 실패: {result}")
+
+
+# --------------------------------------------------------------------------
+# DIAG-CAPTCHA-1~10: CAPTCHA 확정 시 JSON+PNG 진단 자동 저장(실행당 1회,
+# 저장 실패 격리). apollo_page_navigator._find_visible_captcha_dialog_locator/
+# diagnostics.save_security_block_diagnostics(둘 다 별도 단위 테스트로 이미
+# 검증됨)를 collect_apollo_first_list_query가 실제로 배선하는지만 검증한다.
+# --------------------------------------------------------------------------
+_CHILD_DIALOG_SELECTOR = '#wtm-captcha-root [role="dialog"][aria-modal="true"]'
+
+
+def _list_json_files(directory) -> list:
+    directory = Path(directory)
+    return sorted(directory.glob("security_blocked_*.json")) if directory.exists() else []
+
+
+def _list_png_files(directory) -> list:
+    directory = Path(directory)
+    return sorted(directory.glob("security_blocked_*.png")) if directory.exists() else []
+
+
+def check_diag_captcha1_visible_dialog_saves_json_and_png(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-1: 클릭 전 probe에서 visible child dialog가 확인되면
+    JSON+PNG가 저장되고 detection_source=visible_dialog다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        state = _apollo_state(JOB["query"], [("111", "카페 A")])
+        page = FakeApolloPage(
+            [_apollo_state_result(state)],
+            captcha_selectors={
+                "#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=False, box={"width": 390, "height": 0}),
+                _CHILD_DIALOG_SELECTOR: FakeCaptchaLocator(count=1, visible=True, box={"width": 300, "height": 200}),
+            },
+        )
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+        result = collect_apollo_first_list_query(
+            page, JOB, 30, collected_at="2026-08-03",
+            security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-1",
+        )
+        diag = result.get("security_diagnostics") or {}
+        json_files = _list_json_files(temp_root)
+        png_files = _list_png_files(temp_root)
+        ok = (
+            result["active_captcha_detected"] is True
+            and result["pagination_stop_reason"] == "captcha_detected"
+            and diag.get("json_saved") is True
+            and diag.get("screenshot_saved") is True
+            and len(json_files) == 1
+            and len(png_files) == 1
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-1. visible dialog 감지 시 JSON+PNG 자동 저장(실행 경로 배선 확인)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-1 실패: result={result}, json_files={json_files}, png_files={png_files}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+class FakeDelayedVisibilityLocator:
+    """DIAG-CAPTCHA-2 전용: count=1 고정, is_visible()가 처음
+    appear_after_calls번까지는 False를 반환하다가 그 이후 호출부터 True로
+    바뀐다 - "클릭 시점에는 아직 안 보이다가, 클릭 도중/이후에야 CAPTCHA
+    dialog가 나타난" 실제 관측 상황(요청서 §0)을 흉내낸다. 클릭 전 probe(1회
+    호출)와 클릭 예외 직후 재분류 probe(2회째)에서는 계속 hidden으로 남겨,
+    click_intercepted_by_captcha(예외 메시지 판정)만으로 CAPTCHA가 확정되는
+    경로를 검증하고, 그 다음(_find_visible_captcha_dialog_locator의 screenshot
+    대상 탐색, 3회째)부터 visible이 되어 실제 screenshot 대상을 찾을 수
+    있게 한다."""
+
+    def __init__(self, box, appear_after_calls=2):
+        self._box = box
+        self._calls = 0
+        self._appear_after_calls = appear_after_calls
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def is_visible(self, timeout=300):
+        self._calls += 1
+        return self._calls > self._appear_after_calls
+
+    def bounding_box(self):
+        return self._box
+
+    def screenshot(self, path=None):
+        Path(path).write_bytes(b"fake-captcha-png")
+
+
+def check_diag_captcha2_click_interception_saves_diagnostics(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-2: 클릭 전 probe와 클릭 직후 재분류 probe에서는 여전히
+    visible dialog가 확인되지 않아(active=False) 클릭 예외 메시지의
+    click_intercepted_by_captcha 판정만으로 CAPTCHA가 확정되고,
+    detection_source=click_interception으로 저장되며, 그 다음 screenshot
+    대상 재탐색에서야 비로소 visible dialog를 찾아 PNG도 저장된다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        state = _apollo_state(JOB["query"], [("111", "카페 A")])
+        click_intercept_error = Exception(
+            '<div role="dialog" aria-modal="true">...</div> '
+            'from <div id="wtm-captcha-root">...</div> subtree intercepts pointer events'
+        )
+        page = FakeApolloPage(
+            [_apollo_state_result(state)],
+            click_plan={"2": {"count": 1, "visible": True, "enabled": True, "click_error": click_intercept_error}},
+            captcha_selectors={
+                "#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=False, box={"width": 390, "height": 0}),
+                _CHILD_DIALOG_SELECTOR: FakeDelayedVisibilityLocator(box={"width": 300, "height": 200}),
+            },
+        )
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+        result = collect_apollo_first_list_query(
+            page, JOB, 30, collected_at="2026-08-03",
+            security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-2",
+        )
+        diag = result.get("security_diagnostics") or {}
+        click_calls = page._frame._click_plan["2"].get("click_calls", 0)
+        ok = (
+            result["pagination_stop_reason"] == "captcha_detected"
+            and result["active_captcha_detected"] is True
+            and click_calls == 1
+            and diag.get("json_saved") is True
+            and diag.get("screenshot_saved") is True
+            and len(_list_json_files(temp_root)) == 1
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-2. 클릭 가로채기 경로도 JSON+PNG 저장(재클릭 없음)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-2 실패: result={result}, diag={diag}, click_calls={click_calls}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_diag_captcha3_same_run_saves_once(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-3: 같은 recorder(=같은 실행)로 두 번 CAPTCHA를 만나도
+    JSON은 총 1개만 저장된다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+
+        def _run_once(place_id):
+            state = _apollo_state(JOB["query"], [(place_id, "카페")])
+            page = FakeApolloPage(
+                [_apollo_state_result(state)],
+                captcha_selectors={
+                    "#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=False, box={"width": 390, "height": 0}),
+                    _CHILD_DIALOG_SELECTOR: FakeCaptchaLocator(count=1, visible=True, box={"width": 300, "height": 200}),
+                },
+            )
+            return collect_apollo_first_list_query(
+                page, JOB, 30, collected_at="2026-08-03",
+                security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-3",
+            )
+
+        result_a = _run_once("111")
+        result_b = _run_once("222")
+        json_files = _list_json_files(temp_root)
+        ok = (
+            result_a["active_captcha_detected"] is True
+            and result_b["active_captcha_detected"] is True
+            and (result_a.get("security_diagnostics") or {}).get("json_saved") is True
+            and not (result_b.get("security_diagnostics") or {})
+            and len(json_files) == 1
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-3. 같은 실행(recorder 공유)에서 두 번째 CAPTCHA는 추가 저장하지 않음(JSON 총 1개)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-3 실패: result_a={result_a}, result_b={result_b}, json_files={json_files}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_diag_captcha4_new_run_saves_again(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-4: 서로 다른 recorder(=새 실행)는 각각 독립적으로 1개씩
+    저장하며 파일명이 충돌하지 않는다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        def _run_with_new_recorder(place_id):
+            state = _apollo_state(JOB["query"], [(place_id, "카페")])
+            page = FakeApolloPage(
+                [_apollo_state_result(state)],
+                captcha_selectors={
+                    "#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=False, box={"width": 390, "height": 0}),
+                    _CHILD_DIALOG_SELECTOR: FakeCaptchaLocator(count=1, visible=True, box={"width": 300, "height": 200}),
+                },
+            )
+            recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+            return collect_apollo_first_list_query(
+                page, JOB, 30, collected_at="2026-08-03",
+                security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-new",
+            )
+
+        result_a = _run_with_new_recorder("111")
+        result_b = _run_with_new_recorder("222")
+        json_files = _list_json_files(temp_root)
+        diag_a = result_a.get("security_diagnostics") or {}
+        diag_b = result_b.get("security_diagnostics") or {}
+        ok = (
+            diag_a.get("json_saved") is True
+            and diag_b.get("json_saved") is True
+            and diag_a.get("json_path") != diag_b.get("json_path")
+            and len(json_files) == 2
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-4. 새 recorder(새 실행)는 다시 저장하며 파일명이 충돌하지 않음")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-4 실패: diag_a={diag_a}, diag_b={diag_b}, json_files={json_files}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_diag_captcha6_json_write_failure_isolated(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-6: diagnostics_root 자체가 쓸 수 없는 경로(파일이 이미
+    그 이름으로 존재)여도 수집 결과(captcha_detected/active_captcha_detected)는
+    그대로 유지되고 예외가 전파되지 않는다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        blocked_path = temp_root / "not_a_directory"
+        blocked_path.write_text("occupied", encoding="utf-8")  # 디렉터리 생성 실패를 유발
+
+        state = _apollo_state(JOB["query"], [("111", "카페 A")])
+        page = FakeApolloPage(
+            [_apollo_state_result(state)],
+            captcha_selectors={"#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=True, box={"width": 100, "height": 100})},
+        )
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+        try:
+            result = collect_apollo_first_list_query(
+                page, JOB, 30, collected_at="2026-08-03",
+                security_diagnostics_recorder=recorder, diagnostics_root=blocked_path, run_id="run-6",
+            )
+        except Exception as exc:
+            reporter.fail(f"DIAG-CAPTCHA-6 예외 전파됨: {exc!r}")
+            return
+        diag = result.get("security_diagnostics") or {}
+        ok = (
+            result["active_captcha_detected"] is True
+            and result["pagination_stop_reason"] == "captcha_detected"
+            and diag.get("json_saved") is False
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-6. 진단 저장 실패가 격리됨(수집 결과 불변, 예외 미전파)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-6 실패: result={result}, diag={diag}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_diag_captcha7_normal_run_saves_nothing(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-7: CAPTCHA가 없으면 진단 파일이 0개다."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        state = _apollo_state(JOB["query"], [("111", "카페 A")])
+        page = FakeApolloPage([_apollo_state_result(state)])
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+        result = collect_apollo_first_list_query(
+            page, JOB, 30, collected_at="2026-08-03",
+            security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-7",
+        )
+        ok = (
+            result["active_captcha_detected"] is False
+            and not result.get("security_diagnostics")
+            and len(_list_json_files(temp_root)) == 0
+            and len(_list_png_files(temp_root)) == 0
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-7. 정상 실행(CAPTCHA 없음)은 진단 파일 0개")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-7 실패: result={result}, files={_list_json_files(temp_root)}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def check_diag_captcha8_hidden_placeholder_saves_nothing(reporter: ValidationReporter) -> None:
+    """DIAG-CAPTCHA-8: root marker만 있고 hidden/area=0(클릭 가로채기도 없음)이면
+    active_captcha_detected=False로 정상 페이지네이션이 계속되고, 진단도
+    저장되지 않는다(기존 오탐 방지 계약 유지)."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pc_diag_captcha_test_"))
+    try:
+        state = _apollo_state(JOB["query"], [("111", "카페 A")])
+        page = FakeApolloPage(
+            [_apollo_state_result(state)],
+            captcha_selectors={"#wtm-captcha-root": FakeCaptchaLocator(count=1, visible=False, box={"width": 390, "height": 0})},
+        )
+        recorder = apollo_list_collector._SecurityDiagnosticsRecorder()
+        result = collect_apollo_first_list_query(
+            page, JOB, 30, collected_at="2026-08-03",
+            security_diagnostics_recorder=recorder, diagnostics_root=temp_root, run_id="run-8",
+        )
+        ok = (
+            result["active_captcha_detected"] is False
+            and result["pagination_stop_reason"] != "captcha_detected"
+            and not result.get("security_diagnostics")
+            and len(_list_json_files(temp_root)) == 0
+        )
+        if ok:
+            reporter.pass_("DIAG-CAPTCHA-8. hidden placeholder만 있으면 진단 저장 없음(오탐 방지 계약 유지)")
+        else:
+            reporter.fail(f"DIAG-CAPTCHA-8 실패: result={result}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def check_status_429_stops_with_partial_rows(reporter: ValidationReporter) -> None:
@@ -690,7 +1004,7 @@ def check_collector_opens_and_closes_one_page_per_query(reporter: ValidationRepo
     calls: list = []
     original = apollo_list_collector.collect_apollo_first_list_query
 
-    def fake_collect(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
+    def fake_collect(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None, **kwargs):
         calls.append(page)
         return {"rows": [], "active_captcha_detected": False, "status_429_seen": False,
                 "navigation_error": False, "navigation_error_message": "", "page_count": 1,
@@ -722,7 +1036,7 @@ def check_collector_closes_page_even_when_collect_raises(reporter: ValidationRep
 
     original = apollo_list_collector.collect_apollo_first_list_query
 
-    def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None):
+    def fake_collect_raises(page, job, per_query_limit, *, collected_at, max_pages, pause_event=None, stop_event=None, **kwargs):
         raise RuntimeError("boom")
 
     apollo_list_collector.collect_apollo_first_list_query = fake_collect_raises
@@ -1318,6 +1632,13 @@ def main() -> bool:
         check_only_apollo_state_js_evaluated,
         check_page2_graphql_harvest_and_dedup,
         check_captcha_mid_pagination_stops_with_partial_rows,
+        check_diag_captcha1_visible_dialog_saves_json_and_png,
+        check_diag_captcha2_click_interception_saves_diagnostics,
+        check_diag_captcha3_same_run_saves_once,
+        check_diag_captcha4_new_run_saves_again,
+        check_diag_captcha6_json_write_failure_isolated,
+        check_diag_captcha7_normal_run_saves_nothing,
+        check_diag_captcha8_hidden_placeholder_saves_nothing,
         check_status_429_stops_with_partial_rows,
         check_pagination_exhausted_is_normal_stop,
         check_max_pages_reached_is_normal_stop,

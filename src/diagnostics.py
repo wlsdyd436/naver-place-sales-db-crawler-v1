@@ -6,10 +6,12 @@
 # DiagnosticArtifact(success=False)로만 기록합니다.
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 
 # 고객 산출물(output/)과 분리된 진단 전용 저장 루트입니다.
@@ -179,3 +181,122 @@ def capture_page_diagnostics(
     artifacts.append(save_json_artifact(run_dir, "metadata.json", metadata))
 
     return DiagnosticCaptureResult(run_dir=run_dir, artifacts=artifacts)
+
+
+_ERROR_MESSAGE_MAX_LEN = 300
+
+
+def _sanitize_message(message) -> str:
+    """줄바꿈을 제거하고 길이를 제한한다(요청서 §4 - 긴 원문/스택트레이스 저장 금지)."""
+    text = re.sub(r"[\r\n]+", " ", str(message or "")).strip()
+    return text[:_ERROR_MESSAGE_MAX_LEN]
+
+
+def _sanitize_current_url(url) -> str:
+    """query string과 fragment를 제거한 origin/path만 남긴다(요청서 §4)."""
+    try:
+        parsed = urlsplit(str(url or ""))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except Exception:
+        return ""
+
+
+def save_security_block_diagnostics(
+    *,
+    captcha_dialog_locator,
+    diagnostics_root: Path = DEFAULT_DIAGNOSTICS_ROOT,
+    run_id: str = "",
+    security_reason: str = "captcha_detected",
+    detection_source: str = "unknown",
+    active_captcha_detected: bool = False,
+    click_intercepted_by_captcha: bool = False,
+    passive_captcha_marker_found: bool = False,
+    marker_present: bool = False,
+    element_visible: bool = False,
+    bounding_box_area: float = 0.0,
+    pagination_stop_reason: str = "",
+    security_blocked: bool = True,
+    collected_count: int = 0,
+    page_sequence=None,
+    target_page=None,
+    current_url: str = "",
+) -> dict:
+    """CAPTCHA/보안 차단이 확정된 순간 JSON(항상 시도)과 CAPTCHA dialog
+    element PNG(captcha_dialog_locator가 있을 때만)를 저장한다.
+
+    이 함수는 Playwright page/frame을 직접 다루지 않는다(check_not_wired_to_
+    production_paths와 동일한 원칙 - captcha_dialog_locator는 `.screenshot(path=...)`
+    계약만 있으면 되는 duck-typed 객체이며, current_url은 호출자가 이미
+    문자열로 추출해 넘긴다). 예외를 밖으로 전파하지 않는다 - 어떤 저장
+    실패도 Production 수집 결과를 바꾸지 않는다(best-effort). 전체 페이지
+    screenshot은 절대 찍지 않는다(locator 없음/실패 시 PNG 없이 JSON만
+    저장하고 screenshot_saved=False로 기록).
+
+    반환: {"json_saved", "json_path", "json_error", "screenshot_saved",
+    "screenshot_path", "screenshot_error"}.
+    """
+    try:
+        diagnostics_root = Path(diagnostics_root)
+        diagnostics_root.mkdir(parents=True, exist_ok=True)
+
+        capture_id = uuid.uuid4().hex[:8]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        basename = f"security_blocked_{timestamp}_{capture_id}"
+        json_filename = f"{basename}.json"
+        png_filename = f"{basename}.png"
+
+        screenshot_saved = False
+        screenshot_error = None
+        if captcha_dialog_locator is not None:
+            png_path = diagnostics_root / png_filename
+            try:
+                captcha_dialog_locator.screenshot(path=str(png_path))
+                screenshot_saved = True
+            except Exception as exc:
+                screenshot_error = _sanitize_message(f"{type(exc).__name__}: {exc}")
+        else:
+            screenshot_error = "visible_dialog_locator_not_available"
+
+        payload = {
+            "schema_version": 1,
+            "event_type": "security_blocked",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id or None,
+            "capture_id": capture_id,
+            "security_reason": security_reason,
+            "detection_source": detection_source,
+            "active_captcha_detected": bool(active_captcha_detected),
+            "click_intercepted_by_captcha": bool(click_intercepted_by_captcha),
+            "passive_captcha_marker_found": bool(passive_captcha_marker_found),
+            "marker_present": bool(marker_present),
+            "element_visible": bool(element_visible),
+            "bounding_box_area": float(bounding_box_area),
+            "pagination_stop_reason": pagination_stop_reason or None,
+            "security_blocked": bool(security_blocked),
+            "collected_count": int(collected_count),
+            "page_sequence": page_sequence,
+            "target_page": target_page,
+            "current_url": _sanitize_current_url(current_url) or None,
+            "screenshot_saved": screenshot_saved,
+            "screenshot_filename": png_filename if screenshot_saved else None,
+            "screenshot_error": screenshot_error,
+        }
+
+        json_artifact = save_json_artifact(diagnostics_root, json_filename, payload)
+        return {
+            "json_saved": json_artifact.success,
+            "json_path": str(json_artifact.path) if json_artifact.success else None,
+            "json_error": json_artifact.error_message or None,
+            "screenshot_saved": screenshot_saved,
+            "screenshot_path": str(diagnostics_root / png_filename) if screenshot_saved else None,
+            "screenshot_error": screenshot_error,
+        }
+    except Exception as exc:
+        return {
+            "json_saved": False,
+            "json_path": None,
+            "json_error": _sanitize_message(f"{type(exc).__name__}: {exc}"),
+            "screenshot_saved": False,
+            "screenshot_path": None,
+            "screenshot_error": None,
+        }
