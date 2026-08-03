@@ -27,6 +27,7 @@ from src.ui_query_plan import (
     calculate_legal_dong_target_count,
 )
 from src.ui_status_messages import _format_eta_seconds, _network_stop_message
+from src.ui_export_flow import export_network_result
 
 
 # LEGALDONG-UI-2: 공식 법정동 Snapshot(§_build_region_section)이 시도/시군구/
@@ -1198,43 +1199,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         수집 단계 진행률과는 별개의 상태 텍스트만 갱신한다."""
         self.set_status(f"홈페이지/SNS 정보 수집 중: {completed} / {total} (성공 {success_count}, 실패 {failure_count})")
 
-    def _export_network_result(self, result: dict, output_path: str, excel_exporter) -> dict:
-        """orchestrator 결과의 rows를 Excel로 저장하는 단일 지점(ARCH-300C WIRE-2C-1).
-
-        저장은 이 메서드 한 곳에서만, 최대 1회 발생한다 - run_collection_plan에는
-        on_partial_save를 넘기지 않으므로 중간 저장과 종료 후 저장이 겹치는
-        이중 저장은 구조적으로 발생하지 않는다. rows가 비어 있으면(0건) 근거
-        없는 빈 Excel 파일을 남기지 않기 위해 excel_exporter를 아예 호출하지
-        않는다. result는 orchestrator가 반환한 원본 dict를 그대로 변형하지
-        않도록 복사해서 사용한다.
-        """
-        result = dict(result)
-        rows = result.get("rows") or []
-
-        if not rows:
-            result.update(exported=False, export_path="", export_error=False, export_error_message="")
-            self.log("[ui][network] 저장할 결과가 없어 Excel 저장을 건너뜁니다.")
-            return result
-
-        try:
-            # mobile/pc 원본 인자는 Network/List 경로에 해당 소스가 없으므로 빈
-            # 리스트로 전달한다 - exporter는 3시트 구조를 그대로 유지하되
-            # 원본_모바일/원본_PC는 헤더만 있는 빈 시트가 된다(exporter 무수정).
-            saved_path = excel_exporter(rows, [], [], output_path)
-            result.update(
-                exported=True, export_path=str(saved_path or output_path),
-                export_error=False, export_error_message="",
-            )
-            self.log(f"[ui][network] Excel 저장 완료: {result['export_path']} ({len(rows)}건)")
-        except Exception as exc:
-            # traceback/전체 경로를 사용자 상태 라벨에 노출하지 않는다 - 로그에만
-            # 짧게 남기고, 실패를 성공으로 오인하지 않도록 exported=False로 둔다.
-            message = f"{type(exc).__name__}: {exc}"[:200]
-            result.update(exported=False, export_path="", export_error=True, export_error_message=message)
-            self.log(f"[ui][network] Excel 저장 실패: {message}")
-
-        return result
-
     def _run_network_pipeline(
         self,
         query_queue: list[dict],
@@ -1425,7 +1389,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 f"확인불가 {review_filter_stats['unknown']})"
             )
 
-        result = self._export_network_result(result, output_path, excel_exporter)
+        result = export_network_result(result, output_path, excel_exporter, on_log=self.log)
 
         self.set_status(_network_stop_message(result, target_count))
         return result
