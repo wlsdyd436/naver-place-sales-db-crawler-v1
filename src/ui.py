@@ -1319,8 +1319,11 @@ class SalesDbCrawlerApp(ctk.CTk):
             return ""
         home_stop_reason = result.get("home_stop_reason")
         completion = " 홈페이지/SNS 보강 완료." if home_stop_reason in (None, "") else " 홈페이지/SNS 보강 부분 완료(중단)."
+        success_count = result.get("home_success_count", 0)
+        link_found = result.get("home_link_found_count", success_count)
+        no_link = result.get("home_no_link_count", 0)
         return (
-            f"{completion} 성공 {result.get('home_success_count', 0)}건, "
+            f"{completion} 상세 처리 성공 {success_count}건(링크 발견 {link_found}건/없음 {no_link}건), "
             f"실패 {result.get('home_failure_count', 0)}건, "
             f"미시도 {result.get('home_not_attempted_count', 0)}건."
         )
@@ -1490,6 +1493,10 @@ class SalesDbCrawlerApp(ctk.CTk):
         result["home_stop_reason"] = None
         result["home_security_blocked"] = False
         result["home_success_count"] = 0
+        result["home_processed_success_count"] = 0
+        result["home_link_found_count"] = 0
+        result["home_no_link_count"] = 0
+        result["home_retry_count"] = 0
         result["home_failure_count"] = 0
         result["home_not_attempted_count"] = 0
         rows = result.get("rows") or []
@@ -1509,18 +1516,31 @@ class SalesDbCrawlerApp(ctk.CTk):
             result["home_success_count"] = home_result["home_success_count"]
             result["home_failure_count"] = home_result["failure_count"]
             result["home_not_attempted_count"] = home_result["not_attempted_count"]
+            # PAGE300-6H: home_success_count는 "상세 처리가 예외 없이 끝남"만
+            # 뜻하고 링크 존재 여부와 무관하다 - 신규 통계가 없는 기존
+            # home_enrichment_fn fake와도 호환되도록, 없으면 home_success_count로
+            # 안전하게 대체한다(그 fake들은 "링크 발견" 개념 자체가 없으므로
+            # 발견/없음을 나눌 근거가 없어 전부 "발견"으로 보는 것이 기존
+            # 동작과 가장 가깝다 - 실패로 잘못 보이지 않게 함).
+            result["home_processed_success_count"] = home_result.get(
+                "home_processed_success_count", home_result["home_success_count"]
+            )
+            result["home_link_found_count"] = home_result.get(
+                "home_link_found_count", home_result["home_success_count"]
+            )
+            result["home_no_link_count"] = home_result.get("home_no_link_count", 0)
+            result["home_retry_count"] = home_result.get("home_retry_count", 0)
 
             # PAGE300-6G-R1: first_pass/retry_pass가 없는 fake(구 버전 테스트
             # fixture 등)와도 호환되도록 .get(..., 기본값)만 사용한다.
-            first_pass = home_result.get("first_pass") or {}
-            retry_pass = home_result.get("retry_pass") or {}
             self.log(
                 "[ui][network][home] 보강 종료: "
-                f"1차 성공={first_pass.get('success', home_result['home_success_count'])}, "
-                f"1차 실패={first_pass.get('failed', home_result['failure_count'])}, "
-                f"재시도 성공={retry_pass.get('success', 0)}, "
-                f"최종 실패={home_result['failure_count']}, "
-                f"미시도={home_result['not_attempted_count']}"
+                f"상세 처리 성공 {result['home_processed_success_count']}건 "
+                f"(외부 링크 발견 {result['home_link_found_count']}건 / "
+                f"없음 {result['home_no_link_count']}건), "
+                f"실패 {result['home_failure_count']}건, "
+                f"재시도 {result['home_retry_count']}회, "
+                f"미시도 {result['home_not_attempted_count']}건"
             )
 
             final_failures = home_result.get("final_failures") or []

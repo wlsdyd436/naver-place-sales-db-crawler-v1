@@ -851,6 +851,122 @@ def check_home_sns_mode_calls_home_enrichment_fn_once_and_preserves_core_fields(
         reporter.fail(f"home_sns모드 결과가 예상과 다름: calls={len(home_fn.calls)}, returned={returned}")
 
 
+class FakeHomeEnrichmentFnWithStats:
+    """새 통계 필드(home_processed_success_count 등)를 실제로 반환하는
+    home_enrichment_fn fake - 최종 로그 문구 검증용."""
+
+    def __init__(self, home_result_overrides: dict):
+        self._overrides = home_result_overrides
+
+    def __call__(self, rows, **kwargs):
+        base = {
+            "rows": rows, "stop_reason": None, "security_blocked": False,
+            "home_success_count": 0, "home_processed_success_count": 0,
+            "home_link_found_count": 0, "home_no_link_count": 0, "home_retry_count": 0,
+            "failure_count": 0, "not_attempted_count": 0,
+        }
+        base.update(self._overrides)
+        return base
+
+
+def check_home_stat12_basic_mode_new_fields_default_and_excel_unchanged(reporter: ValidationReporter) -> None:
+    """HOME-STAT-12: basic 모드는 home_enrichment_fn을 호출하지 않고, 신규
+    통계 필드도 기존 계약대로 기본값(0)을 유지하며 Excel 저장 rows는 그대로다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _core_field_rows(2)
+    result = _base_result(stop_reason="queue_exhausted", final_count=2, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+
+    returned = app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx", collection_mode="basic",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        home_enrichment_fn=_home_enrichment_fn_must_not_be_called,
+    )
+
+    ok = (
+        returned.get("home_processed_success_count") == 0
+        and returned.get("home_link_found_count") == 0
+        and returned.get("home_no_link_count") == 0
+        and returned.get("home_retry_count") == 0
+        and returned["rows"] == rows
+        and exporter.calls and exporter.calls[0]["merged_data"] == rows
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-12. basic 모드: home_enrichment_fn 미호출, 신규 통계 기본값 0, Excel rows 불변")
+    else:
+        reporter.fail(f"HOME-STAT-12 실패: returned={returned}, exporter.calls={exporter.calls}")
+
+
+def check_home_sns_summary_log_shows_link_found_and_no_link_breakdown(reporter: ValidationReporter) -> None:
+    """새 요약 로그는 '성공 N건' 단독 표현 대신 상세 처리 성공/외부 링크
+    발견·없음/실패/재시도/미시도를 명확히 구분해 표시한다."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _core_field_rows(1)
+    result = _base_result(stop_reason="queue_exhausted", final_count=1, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+    home_fn = FakeHomeEnrichmentFnWithStats({
+        "home_success_count": 5, "home_processed_success_count": 5,
+        "home_link_found_count": 2, "home_no_link_count": 3,
+        "home_retry_count": 1, "failure_count": 0, "not_attempted_count": 0,
+        "first_pass": {"attempted": 5, "success": 4, "failed": 1},
+        "retry_pass": {"attempted": 1, "success": 1, "failed": 0, "skipped": 0},
+    })
+
+    app._run_network_pipeline(
+        [{"query": "q1"}], 30, 300, "out.xlsx", collection_mode="home_sns",
+        collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+        home_enrichment_fn=home_fn,
+    )
+
+    summary_logs = [message for message in logs if "[ui][network][home] 보강 종료" in message]
+    ok = (
+        len(summary_logs) == 1
+        and "상세 처리 성공 5건" in summary_logs[0]
+        and "외부 링크 발견 2건" in summary_logs[0]
+        and "없음 3건" in summary_logs[0]
+        and "실패 0건" in summary_logs[0]
+        and "재시도 1회" in summary_logs[0]
+        and "미시도 0건" in summary_logs[0]
+        and "성공 5건" not in summary_logs[0].replace("상세 처리 성공 5건", "")
+    )
+    if ok:
+        reporter.pass_("새 요약 로그: 상세 처리 성공/외부 링크 발견·없음/실패/재시도(회)/미시도를 명확히 구분해 표시")
+    else:
+        reporter.fail(f"요약 로그 문구 검증 실패: summary_logs={summary_logs}")
+
+
+def check_home_sns_summary_log_backward_compatible_without_new_fields(reporter: ValidationReporter) -> None:
+    """home_enrichment_fn이 신규 통계 필드를 반환하지 않는 기존 fake(예:
+    SpyHomeEnrichmentFn)여도 예외 없이 로그가 생성된다(하위 호환)."""
+    app, logs, statuses = _make_app()
+    factory = FakeCollectorFactory()
+    exporter = FakeExporter()
+    rows = _core_field_rows(2)
+    result = _base_result(stop_reason="queue_exhausted", final_count=2, rows=rows)
+    fake_orchestrator, _ = _make_fake_orchestrator(result)
+    home_fn = SpyHomeEnrichmentFn()
+
+    try:
+        app._run_network_pipeline(
+            [{"query": "q1"}], 30, 300, "out.xlsx", collection_mode="home_sns",
+            collector_factory=factory, orchestrator=fake_orchestrator, excel_exporter=exporter,
+            home_enrichment_fn=home_fn,
+        )
+    except Exception as exc:
+        reporter.fail(f"신규 필드 없는 home_enrichment_fn 결과 처리 중 예외 발생: {exc!r}")
+        return
+
+    summary_logs = [message for message in logs if "[ui][network][home] 보강 종료" in message]
+    if len(summary_logs) == 1:
+        reporter.pass_("신규 통계 필드가 없는 기존 home_enrichment_fn 결과도 예외 없이 요약 로그 생성(하위 호환)")
+    else:
+        reporter.fail(f"하위 호환 결과가 예상과 다름: summary_logs={summary_logs}")
+
+
 def main() -> int:
     reporter = ValidationReporter()
 
@@ -879,6 +995,9 @@ def main() -> int:
     check_run_network_pipeline_passes_target_count_through(reporter)
     check_basic_mode_never_calls_home_enrichment_fn(reporter)
     check_home_sns_mode_calls_home_enrichment_fn_once_and_preserves_core_fields(reporter)
+    check_home_stat12_basic_mode_new_fields_default_and_excel_unchanged(reporter)
+    check_home_sns_summary_log_shows_link_found_and_no_link_breakdown(reporter)
+    check_home_sns_summary_log_backward_compatible_without_new_fields(reporter)
 
     reporter.summary()
     return 1 if reporter.fail_count else 0

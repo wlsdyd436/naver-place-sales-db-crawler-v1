@@ -410,6 +410,22 @@ async def _connect_native_edge_context(backend_config: BrowserBackendConfig):
         raise
 
 
+# PAGE300-6H(홈페이지 보강 결과 의미 세분화): home_status="success"(detail_success
+# =True)는 "업체 상세 보강 처리가 예외 없이 완료됨"만 뜻하며 홈페이지·SNS
+# 링크 존재 여부와 무관하다(§4 요청서) - 링크가 하나도 없는 업체도 정상
+# 성공이다. 사용자가 "성공 N건"을 "링크 N건 발견"으로 오인하지 않도록,
+# 상세 처리 성공 row를 merge_home_result_into_row가 만드는 최종 export
+# 필드(홈페이지/인스타/블로그/추가 링크) 기준으로 다시 "외부 링크 발견"과
+# "외부 링크 없음"으로 나눈다. raw Apollo 값이 있어도 URL 정규화에서
+# 폐기됐다면(예: malformed URL) 최종 필드가 비어 있으므로 "없음"으로
+# 집계된다 - 이 판정은 항상 병합 이후 최종 row를 기준으로 한다.
+_EXTERNAL_LINK_ROW_FIELDS = ("홈페이지", "인스타", "블로그", "추가 링크")
+
+
+def _row_has_external_link(row: dict) -> bool:
+    return any(str(row.get(field) or "").strip() for field in _EXTERNAL_LINK_ROW_FIELDS)
+
+
 def _external_url_count(result: dict) -> int:
     if not result.get("detail_success"):
         return 0
@@ -638,6 +654,28 @@ async def _enrich_home_batch_async(
     not_attempted_count = sum(1 for result in cache.values() if result.get("home_status") == "not_attempted")
     final_failure_count = len(cache) - final_success_count - not_attempted_count
 
+    # 상세 처리 성공(final_success_count) row만 최종 병합 row 기준으로 외부
+    # 링크 발견/없음으로 나눈다 - 이 loop는 정확히 성공 row 집합만 순회하므로
+    # link_found_count + no_link_count == final_success_count는 구조적으로
+    # 항상 성립한다(런타임 방어 불필요, 어긋날 수 있는 외부 입력이 없음).
+    link_found_count = 0
+    no_link_count = 0
+    for place_id in unique_place_ids:
+        result = cache.get(place_id)
+        if result is None or not result.get("detail_success"):
+            continue
+        merged_for_stats = merge_home_result_into_row(row_by_place_id[place_id], result)
+        if _row_has_external_link(merged_for_stats):
+            link_found_count += 1
+        else:
+            no_link_count += 1
+
+    # 실제로 추가 요청이 실행된 횟수(retryable로 "표시"만 되고 안전장치/
+    # 중지로 실행되지 않은 건 포함하지 않음) - retry_pass_counters["attempted"]가
+    # 이미 정확히 이 의미다(재시도 대상은 최대 1회만 재시도하는 구조라 row
+    # 수와 시도 횟수가 항상 같다 - 별도 retried_row_count는 추가하지 않는다).
+    home_retry_count = retry_pass_counters["attempted"]
+
     final_failures = []
     failure_reason_counts: dict = {}
     for place_id in unique_place_ids:
@@ -676,6 +714,9 @@ async def _enrich_home_batch_async(
             "failed": final_failure_count,
             "not_attempted": not_attempted_count,
             "stop_reason": stop_reason,
+            "link_found": link_found_count,
+            "no_link": no_link_count,
+            "retry_count": home_retry_count,
         },
         "failure_reason_counts": failure_reason_counts,
         "attempts": attempts,
@@ -690,7 +731,11 @@ async def _enrich_home_batch_async(
         "rows": merged_rows,
         "stop_reason": stop_reason,
         "security_blocked": stop_new_requests.is_set(),
-        "home_success_count": final_success_count,
+        "home_success_count": final_success_count,  # 하위 호환 별칭(HOME-STAT-11) - home_processed_success_count와 항상 동일
+        "home_processed_success_count": final_success_count,
+        "home_link_found_count": link_found_count,
+        "home_no_link_count": no_link_count,
+        "home_retry_count": home_retry_count,
         "failure_count": final_failure_count,
         "not_attempted_count": not_attempted_count,
         "first_pass": diagnostics_report["first_pass"],

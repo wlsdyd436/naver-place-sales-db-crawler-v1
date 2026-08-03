@@ -1095,6 +1095,263 @@ def check_classify_ssr_block_signal_detects_captcha_text_marker(reporter: Valida
         reporter.fail(f"CAPTCHA 텍스트 마커 판정 이상: {result}")
 
 
+# ============================================================================
+# HOME-STAT-1~11: 홈페이지·SNS 보강 결과 통계를 "상세 처리 성공"과
+# "외부 링크 발견/없음"으로 구분한다. 기존 home_success_count/failure_count/
+# not_attempted_count 필드와 의미는 그대로 유지하고(요청서 §4 - 제거·의미
+# 변경 금지), 다음 신규 필드만 추가한다: home_processed_success_count(=
+# home_success_count의 별칭), home_link_found_count, home_no_link_count,
+# home_retry_count(실제 재시도 pass에서 실행된 시도 수 - retryable=True
+# 표시만 있고 실행되지 않은 건 포함하지 않음).
+# ============================================================================
+
+
+def check_home_stat1_link_found_when_homepage_present(reporter: ValidationReporter) -> None:
+    """HOME-STAT-1: 홈페이지 링크가 있는 정상 성공 - 상세 처리 성공=1,
+    외부 링크 발견=1, 없음=0, 실패=0, 미시도=0."""
+    rows = [_row("111")]
+    ctx = FakeAsyncRequestContext({"111": FakeAsyncResponse(200, _success_html_for("111"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["home_success_count"] == 1
+        and result["home_processed_success_count"] == 1
+        and result["home_link_found_count"] == 1
+        and result["home_no_link_count"] == 0
+        and result["failure_count"] == 0
+        and result["not_attempted_count"] == 0
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-1. 홈페이지 링크 발견: 상세 성공=1, 링크 발견=1, 없음=0")
+    else:
+        reporter.fail(f"HOME-STAT-1 실패: {result}")
+
+
+def check_home_stat2_no_link_is_success_not_failure(reporter: ValidationReporter) -> None:
+    """HOME-STAT-2: 상세 처리는 정상, 홈페이지·SNS 미등록(링크 0개) - 상세
+    처리 성공=1, 외부 링크 발견=0, 없음=1, 실패=0(링크 없음을 실패로 분류하면
+    안 됨)."""
+    rows = [_row("911")]
+    html = _apollo_html("911", parent_overrides={"homepages": None})
+    ctx = FakeAsyncRequestContext({"911": FakeAsyncResponse(200, html)})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["home_processed_success_count"] == 1
+        and result["home_link_found_count"] == 0
+        and result["home_no_link_count"] == 1
+        and result["failure_count"] == 0
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-2. 링크 없는 정상 성공: 외부 링크 없음=1, 실패=0")
+    else:
+        reporter.fail(f"HOME-STAT-2 실패: {result}")
+
+
+def check_home_stat3_multiple_links_counts_as_one_business(reporter: ValidationReporter) -> None:
+    """HOME-STAT-3: 홈페이지·인스타·카카오채널이 모두 있는 업체 - 외부 링크
+    발견은 링크 개수(3)가 아니라 업체 수(1)로 집계된다."""
+    rows = [_row("222")]
+    ctx = FakeAsyncRequestContext({"222": FakeAsyncResponse(200, _success_html_with_extra_links("222"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = result["home_link_found_count"] == 1 and result["home_no_link_count"] == 0
+    if ok:
+        reporter.pass_("HOME-STAT-3. 링크가 여러 개(홈페이지+인스타+카카오채널)여도 업체 수 1건으로 집계됨")
+    else:
+        reporter.fail(f"HOME-STAT-3 실패: {result}")
+
+
+def check_home_stat4_normalization_discarded_link_counts_as_no_link(reporter: ValidationReporter) -> None:
+    """HOME-STAT-4: raw 값은 존재하지만(대괄호 라벨 URL) 최종 정규화 후
+    4개 export 필드가 전부 빈 값이면 '외부 링크 없음'으로 집계된다(실패 아님)."""
+    rows = [_row("977")]
+    html = _apollo_html(
+        "977",
+        parent_overrides={"homepages": {"repr": {"url": "[신세계타임스퀘어]blog.naver.com/example", "type": "홈페이지"}, "etc": []}},
+    )
+    ctx = FakeAsyncRequestContext({"977": FakeAsyncResponse(200, html)})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    row0 = result["rows"][0]
+    ok = (
+        result["home_processed_success_count"] == 1
+        and result["home_no_link_count"] == 1
+        and result["home_link_found_count"] == 0
+        and row0["홈페이지"] == "" and row0["인스타"] == "" and row0["블로그"] == ""
+        and row0.get("추가 링크", "") == ""
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-4. 정규화에서 폐기된 raw 링크는 외부 링크 없음으로 집계됨(실패 아님)")
+    else:
+        reporter.fail(f"HOME-STAT-4 실패: {result}, row0={row0}")
+
+
+def check_home_stat5_final_failure_not_counted_as_success(reporter: ValidationReporter) -> None:
+    """HOME-STAT-5: 1차·재시도 모두 timeout - 상세 처리 성공=0, 실패=1,
+    미시도=0(HOME-STAT-7과 동일 fixture, 재시도 횟수 관점은 그쪽에서 확인)."""
+    rows = [_row("933")]
+    outcomes = {"933": [PlaywrightAsyncTimeoutError("t1"), PlaywrightAsyncTimeoutError("t2")]}
+    ctx = FakeAsyncRequestContext({}, outcomes_by_place_id=outcomes)
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["home_processed_success_count"] == 0
+        and result["failure_count"] == 1
+        and result["not_attempted_count"] == 0
+        and result["home_link_found_count"] == 0
+        and result["home_no_link_count"] == 0
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-5. 최종 실패는 상세 처리 성공에 포함되지 않고 실패로만 집계됨")
+    else:
+        reporter.fail(f"HOME-STAT-5 실패: {result}")
+
+
+def check_home_stat6_retry_success_counts_one_retry(reporter: ValidationReporter) -> None:
+    """HOME-STAT-6: 1차 apollo_missing -> 재시도 실제 실행 -> 재시도 성공 -
+    상세 처리 성공=1, 실패=0, 재시도=1회(실제 추가 요청 횟수)."""
+    rows = [_row("922")]
+    outcomes = {"922": [FakeAsyncResponse(200, b"<html>no apollo state here</html>"), FakeAsyncResponse(200, _apollo_html("922"))]}
+    ctx = FakeAsyncRequestContext({}, outcomes_by_place_id=outcomes)
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["home_processed_success_count"] == 1
+        and result["failure_count"] == 0
+        and result["home_retry_count"] == 1
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-6. 실제 재시도 후 성공: 재시도=1회, 상세 처리 성공=1")
+    else:
+        reporter.fail(f"HOME-STAT-6 실패: {result}")
+
+
+def check_home_stat7_retry_failure_counts_one_retry(reporter: ValidationReporter) -> None:
+    """HOME-STAT-7: 1차 실패 -> 재시도 실제 실행 -> 재시도도 실패 - 상세
+    처리 성공=0, 실패=1, 재시도=1회(재시도가 '실행됐다'는 사실 자체는 결과를
+    바꾸지 않고 그대로 실패로 남는다)."""
+    rows = [_row("933")]
+    outcomes = {"933": [PlaywrightAsyncTimeoutError("t1"), PlaywrightAsyncTimeoutError("t2")]}
+    ctx = FakeAsyncRequestContext({}, outcomes_by_place_id=outcomes)
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = (
+        result["home_processed_success_count"] == 0
+        and result["failure_count"] == 1
+        and result["home_retry_count"] == 1
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-7. 재시도 실행 후에도 최종 실패: 재시도=1회, 실패=1")
+    else:
+        reporter.fail(f"HOME-STAT-7 실패: {result}")
+
+
+def check_home_stat8_retryable_marked_but_not_actually_retried_is_zero(reporter: ValidationReporter) -> None:
+    """HOME-STAT-8: 1차에서 재시도 대상(apollo_missing 등)으로 분류된 업체가
+    있어도, 같은 1차 순회에서 다른 업체가 HTTP 403(보안 차단)을 만나면 안전
+    장치로 재시도 큐 자체가 실행되지 않는다 - 재시도=0회(대상으로 '표시'만
+    되고 실제 추가 요청은 없었음)."""
+    place_ids = [str(700 + i) for i in range(5)]
+    rows = [_row(pid) for pid in place_ids]
+    responses = {pid: FakeAsyncResponse(200, _apollo_html(pid)) for pid in place_ids}
+    responses[place_ids[0]] = FakeAsyncResponse(403, b"")
+    ctx = FakeAsyncRequestContext(responses, delay_by_place_id={place_ids[1]: 0.05})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    ok = result["home_retry_count"] == 0 and result["retry_pass"]["attempted"] == 0
+    if ok:
+        reporter.pass_("HOME-STAT-8. 보안 차단으로 재시도 큐가 실행되지 않으면 재시도=0회")
+    else:
+        reporter.fail(f"HOME-STAT-8 실패: {result}")
+
+
+def check_home_stat9_security_block_leaves_remaining_not_attempted(reporter: ValidationReporter) -> None:
+    """HOME-STAT-9: 5건 중 앞 2건 처리 완료(1건 차단 감지 + 동시 진행 중이던
+    1건은 계속 완료), CAPTCHA로 중단, 남은 3건은 미시도. 상세 처리 성공+실패
+    =2, 미시도=3, 전체 합계=5(불변식)."""
+    place_ids = [str(200 + i) for i in range(5)]
+    rows = [_row(pid) for pid in place_ids]
+    responses = {pid: FakeAsyncResponse(200, _apollo_html(pid)) for pid in place_ids}
+    responses[place_ids[0]] = FakeAsyncResponse(403, b"")
+    # 앞 2개(동시성 상한 2)가 같은 지연으로 semaphore를 함께 점유하는 동안
+    # 나머지 3개는 슬롯을 얻지 못한다 - 두 요청이 모두 끝난 뒤에야 3,4,5가
+    # 슬롯을 얻으려 시도하지만 그 시점엔 이미 차단이 감지된 뒤라 스케줄되지
+    # 않는다(정확히 2건 처리 + 3건 미시도를 결정적으로 재현).
+    ctx = FakeAsyncRequestContext(
+        responses, delay_by_place_id={place_ids[0]: 0.02, place_ids[1]: 0.02},
+    )
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    processed = result["home_processed_success_count"] + result["failure_count"]
+    ok = (
+        processed == 2
+        and result["not_attempted_count"] == 3
+        and processed + result["not_attempted_count"] == 5
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-9. 보안 차단: 처리 완료 2건 + 미시도 3건 = 전체 5건(불변식 유지)")
+    else:
+        reporter.fail(f"HOME-STAT-9 실패: {result}, processed={processed}")
+
+
+def check_home_stat10_user_stop_leaves_remaining_not_attempted(reporter: ValidationReporter) -> None:
+    """HOME-STAT-10: 사용자 중지 시 처리 완료/실패 row는 보존되고, 남은
+    row는 미시도로 분류되며 합계 불변식이 유지된다."""
+    place_ids = [str(300 + i) for i in range(5)]
+    rows = [_row(pid) for pid in place_ids]
+    responses = {pid: FakeAsyncResponse(200, _success_html_for(pid)) for pid in place_ids}
+    stop_flag = {"stop": False}
+
+    def _stop_after_first():
+        stop_flag["stop"] = True
+
+    ctx = FakeAsyncRequestContext(
+        responses,
+        delay_by_place_id={place_ids[1]: 0.05},
+        on_response_for={place_ids[0]: _stop_after_first},
+    )
+    result = _run(
+        _enrich_home_batch_async(
+            rows, should_continue=lambda: not stop_flag["stop"], request_context_factory=_factory_for(ctx),
+        )
+    )
+    total = result["home_processed_success_count"] + result["failure_count"] + result["not_attempted_count"]
+    ok = (
+        result["stop_reason"] == "user_stopped"
+        and result["not_attempted_count"] >= 3
+        and total == 5
+    )
+    if ok:
+        reporter.pass_("HOME-STAT-10. 사용자 중지: 처리 완료 row 보존 + 남은 row 미시도 + 합계 불변식 유지")
+    else:
+        reporter.fail(f"HOME-STAT-10 실패: {result}, total={total}")
+
+
+def check_home_stat11_success_count_equals_processed_success_count(reporter: ValidationReporter) -> None:
+    """HOME-STAT-11: 기존 home_success_count는 신규 home_processed_success_count의
+    별칭으로 유지된다(기존 consumer 하위 호환)."""
+    rows = [_row("111")]
+    ctx = FakeAsyncRequestContext({"111": FakeAsyncResponse(200, _success_html_for("111"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    if result["home_success_count"] == result["home_processed_success_count"]:
+        reporter.pass_("HOME-STAT-11. home_success_count == home_processed_success_count(하위 호환 별칭)")
+    else:
+        reporter.fail(f"HOME-STAT-11 실패: {result}")
+
+
+def check_home_stat_diagnostics_report_includes_new_fields(reporter: ValidationReporter) -> None:
+    """diagnostics_report["final"]에도 기존 키(success/failed/not_attempted/
+    stop_reason)를 그대로 유지한 채 신규 키(link_found/no_link/retry_count)가
+    추가된다."""
+    rows = [_row("111")]
+    ctx = FakeAsyncRequestContext({"111": FakeAsyncResponse(200, _success_html_for("111"))})
+    result = _run(_enrich_home_batch_async(rows, request_context_factory=_factory_for(ctx)))
+    final = result["diagnostics_report"]["final"]
+    ok = (
+        final.get("success") == 1
+        and final.get("link_found") == 1
+        and final.get("no_link") == 0
+        and final.get("retry_count") == 0
+        and "failed" in final and "not_attempted" in final and "stop_reason" in final
+    )
+    if ok:
+        reporter.pass_("diagnostics_report.final에 기존 필드 유지 + link_found/no_link/retry_count 신규 추가")
+    else:
+        reporter.fail(f"diagnostics_report.final 필드 검증 실패: {final}")
+
+
 def main() -> bool:
     reporter = ValidationReporter()
     checks = [
@@ -1134,6 +1391,18 @@ def main() -> bool:
         check_parse_apollo_state_from_html_missing_marker_returns_none,
         check_classify_ssr_block_signal_detects_blocking_http_status,
         check_classify_ssr_block_signal_detects_captcha_text_marker,
+        check_home_stat1_link_found_when_homepage_present,
+        check_home_stat2_no_link_is_success_not_failure,
+        check_home_stat3_multiple_links_counts_as_one_business,
+        check_home_stat4_normalization_discarded_link_counts_as_no_link,
+        check_home_stat5_final_failure_not_counted_as_success,
+        check_home_stat6_retry_success_counts_one_retry,
+        check_home_stat7_retry_failure_counts_one_retry,
+        check_home_stat8_retryable_marked_but_not_actually_retried_is_zero,
+        check_home_stat9_security_block_leaves_remaining_not_attempted,
+        check_home_stat10_user_stop_leaves_remaining_not_attempted,
+        check_home_stat11_success_count_equals_processed_success_count,
+        check_home_stat_diagnostics_report_includes_new_fields,
     ]
     for check in checks:
         check(reporter)
