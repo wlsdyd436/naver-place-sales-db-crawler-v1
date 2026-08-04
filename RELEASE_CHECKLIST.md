@@ -1,121 +1,214 @@
-# 첫 출시 후보 체크리스트 (RELEASE CHECKLIST)
+# 출시 검증 체크리스트
 
-본 문서는 네이버 플레이스 영업 DB 수집기의 첫 출시 후보 판단을 위한 체크리스트입니다. `[x]`는 완료, `[ ]`는 미완/확인 필요, `[-]`는 이번 출시 범위에서 보류를 의미합니다. 상태는 실제 코드/문서 변경과 동기화될 때만 갱신합니다.
+> 이 문서는 현재 버전의 출시 전 검증 절차다.
+> 과거 엔진·스키마 기준은 적용하지 않는다.
 
-최종 갱신: 2026-07-08 (SAFE-1V)
+## 1. 사용 방법과 판정 규칙
 
----
+- `[ ]` 미확인 · `[x]` 확인 완료 · `[-]` 이번 출시 범위에서 보류(반드시 사유를 함께 적음)
+- 이 문서는 출시를 시도할 때마다 값을 새로 채우는 반복 사용 문서다. 과거 실행 결과를 근거로 체크박스를 미리 채우지 않는다.
+- 정적 회귀(pytest/compileall/import) 통과는 이 문서의 검증이 아니라 "출시 검증을 시작할 준비가 됐다"는 선행 조건일 뿐이다. GUI·live·EXE 검증과는 별개다.
 
-## 1. 기능 체크
+## 2. 출시 대상과 현재 범위
 
-- [x] 빠른 수집(모바일, `basic`) 경로 동작 유지 (기존 `crawl_places`)
-- [x] 상세 수집(PC, `premium`) 경로가 UI에 연결됨 (`_collect_premium_query` → `collect_pc_full` → `build_full_collector`)
-- [x] 카드 index 클릭 → entryIframe wait → place_id 사후 확보 → 상세 병합
-- [x] 대표전화 / 주소 / 플레이스 URL / 리뷰수 / 새로오픈여부 / 홈페이지·인스타·블로그 수집
-- [x] 주소 정제(역/출구/거리 안내 제거) 적용 (Stage 3B.1)
-- [x] Stop / Pause 이벤트가 상세 수집 경로에 전달됨
-- [x] 부분 실패 시 부분 결과 보존 반환 (collect_pc_full 계약)
-- [ ] 다건(limit>1) / 다지역 대량 흐름 실사용 검증 (출시 후 별도 확인 권장)
-  - 성능 최적화(OPT-A, 리스트 스크롤 충분성 gate) 구현 완료, PERF-2R(limit=3) 재측정 PASS, PERF-3(limit=10) PASS, PERF-3S(dev UI Stop·Pause·부분저장, limit=10 full run) PASS (2026-07-08, PROJECT_STATE.md 참조)
-  - PERF-4(limit=30) **FAIL** — page=2에서 CAPTCHA/보안 확인 발생, `DetailCollectionAborted`로 안전 종료(부분 결과 15/30 보존, 크래시/우회 시도 없음) (2026-07-08, PROJECT_STATE.md 참조)
-  - SAFE-1V(dev UI, limit=30) — 30/30 정상 수집은 다시 **FAIL**(page=2에서 CAPTCHA 재발생), 단 CAPTCHA 대응 자체는 PASS(§11 참조) (2026-07-08, PROJECT_STATE.md 참조)
+- 제품: 네이버 플레이스 영업 DB 수집기
+- 실행 진입점: `app.py` → `SalesDbCrawlerApp`(Windows CustomTkinter)
+- 목록 수집: Native Edge/Chrome persistent profile + CDP로 연결한 브라우저가 검색 과정에서 자연히 수신하는 Apollo/GraphQL 응답을 관찰해 수집한다. 별도의 GraphQL 직접 POST를 기본 경로로 사용하지 않으며, 리스트 카드를 클릭해 상세 화면으로 진입하는 것도 기본 경로가 아니다.
+- 수집 모드(내부 값 `basic`/`home_sns`, 화면 표시명 "빠른 기본 수집"/"홈페이지·SNS 포함 수집")
+- 순위 추적은 현재 제품 범위에서 제외되어 있다(별도 프로그램·저장소로 설계 예정, 이 체크리스트 대상 아님)
+- 상세 구조는 `CODEBASE_MAP.md`, 사용자 기능 설명은 `README.md`를 참고한다(이 문서에서 반복하지 않음).
 
-## 2. Excel 스키마 체크
+## 3. Git·환경 사전 점검
 
-- [x] `통합_결과` 11컬럼: 업체명·업종·새로오픈여부·리뷰수·주소·대표전화·플레이스 URL·수집일·홈페이지·인스타·블로그
-- [x] 기존 8컬럼 이름/순서/위치 보존 + 신규 3컬럼 맨 뒤 append
-- [x] `place_id`는 내부 필드로 유지되고 Excel에는 비노출
-- [x] 3시트(`통합_결과`/`원본_모바일`/`원본_PC`) 구조 유지
-- [-] 원본_모바일/원본_PC 시트 의미 정리(명칭-내용 불일치) — README 설명으로 갈음, 시트 재설계는 후속
+- [ ] `.venv\Scripts\python.exe` 존재
+- [ ] `git status --short` 결과가 clean(또는 검증 대상 변경만 존재함을 확인)
+- [ ] `HEAD == main == origin/main`(다르면 검증 대상 커밋을 아래에 명시)
+- 기준 commit: ____________________
 
-## 3. UI 문구 체크
+## 4. 문서 정합성
 
-- [x] 수집 모드 라디오 라벨 정리: `빠른 수집(모바일)` / `상세 수집(PC·전화·SNS)`
-- [x] 라디오 내부 value(`basic`/`premium`) 및 분기 로직 불변
-- [x] 온라인 채널 체크박스에 `(준비 중)` 표기 (오해 방지)
-- [ ] 온라인 채널 필터 실배선 (Stage 3F)
+- [ ] `README.md`가 현재 수집 모드·필터·Excel 계약과 일치한다.
+- [ ] `CODEBASE_MAP.md`가 현재 실행 흐름·모듈 경계와 일치한다.
+- [ ] `PROJECT_STATE.md` canonical 상단의 "알려진 위험"이 최신 상태다.
+- [ ] `LEGAL_NOTICE.md`의 새로오픈여부 O/X/빈칸 설명이 실제 출력과 일치한다.
 
-## 4. 법적 / 공개정보 안내 체크
+## 5. 정적 회귀 테스트
 
-- [x] LEGAL_NOTICE에 상세 수집(PC) 경로 반영 섹션 추가(2026-07-06)
-- [x] entryIframe 상세 진입 및 홈페이지/SNS 링크 수집 명시(공개 정보 범위)
-- [x] CAPTCHA/보안 확인 비우회 원칙 명시
-- [x] 과도한 요청/반복 수집 지양 안내
-- [x] 사용자의 약관/법령 준수 의무 안내
-- [x] README의 "상세 진입 안 함" 등 구 서술 정정
+- [ ] `pytest --collect-only -q` 실행, collect 수 기록: ____
+- [ ] `pytest -q` 실행, 결과 기록: ____
+- [ ] `compileall -q app.py src tests scripts` exit code 기록: ____
+- [ ] import 스모크(`src.ui`/`src.collection.apollo_list_collector`/`src.collection.plan_runner`/`src.exporter`) 결과 기록: ____
 
-## 5. 테스트 체크
+## 6. 앱 시작·기본 UI
 
-- [x] 단위/회귀 테스트 스위트 최신 실행 결과 (Stage 3E, 문서/UI 텍스트 정렬 후 재실행)
-  - test_ui_pc_full_wiring: PASS 3 / FAIL 0
-  - test_exporter_schema: PASS 7 / FAIL 0
-  - test_export_adapter: PASS 2 / FAIL 0
-  - test_pc_detail_scraper: PASS 23 / FAIL 0
-  - test_pc_list_scraper: PASS 21 / FAIL 0
-  - test_pc_browser_session: PASS 15 / FAIL 0
-  - test_pc_pipeline: PASS 8 / FAIL 0
-  - Stage 3E는 문서/텍스트 정렬 작업이며 런타임 로직 변경이 없어, 위 결과는 회귀 없음을 확인하는 용도임. 이번 Stage 3E 자체에서는 live test를 실행하지 않음(직전 Stage 3D UI end-to-end smoke는 이미 성공 기록 완료).
-- [x] `test_excel_validation.py`의 통합_결과 기대 컬럼 11컬럼 동기화
+- [ ] `python app.py` 실행 시 GUI가 오류 없이 뜬다.
+  - 기대: "DB 수집" 탭이 기본 선택, "안내·정책" 탭 존재(순위추적 탭 없음).
+  - 증빙: 스크린샷 또는 실행 로그.
+- [ ] 좌측 패널의 지역 선택·키워드 입력·필터·검색 조합당 수집 상한·전체 목표 저장 개수(자동 계산, 읽기 전용)·수집 모드 섹션이 모두 표시된다.
 
-## 6. Smoke 체크
+## 7. 빠른 기본 수집
 
-- [x] Stage 3B 최종 live smoke 성공 (place_id/URL/전화/주소/인스타)
-- [x] Stage 3D UI end-to-end live smoke 성공 (premium 경로 → Excel 11컬럼 생성)
-- [x] smoke 시 CAPTCHA/Timeout 미발생
-- [ ] 다건/다지역 smoke (출시 후보 확정 전 선택적 확인)
+- [ ] 테스트 지역·업종으로 "빠른 기본 수집"을 실행한다.
+  - 기대: 목록 수집만 진행되고 Home stage가 시작되지 않는다(로그에 홈페이지 보강 관련 메시지가 없음).
+  - 증빙: GUI 로그, 생성된 Excel 경로.
+- [ ] 홈페이지·인스타·블로그·추가 링크 컬럼이 목록 응답에 값이 있는 경우를 제외하면 대부분 빈칸인지 확인한다.
 
-## 7. Legacy Fallback 체크
+## 8. 홈페이지·SNS 포함 수집
 
-- [x] 기존 모바일+PC 병합 premium 로직을 `_collect_premium_query_legacy`로 보존
-- [x] `pc_crawler.py` / `crawler.py` / `parser.py` / `merger.py` 삭제 없이 유지
-- [x] 롤백 경로: `_collect_premium_query`가 legacy를 호출하도록 한 줄 교체하면 구 동작 복귀
-- [-] legacy 제거 시점: 상세 수집 경로 충분 검증 후 별도 스테이지
+- [ ] 동일 조건으로 "홈페이지·SNS 포함 수집"을 실행한다.
+  - 기대: 목록 수집 완료 후 별도 Home stage가 시작된다(로그에 "홈페이지/SNS 보강 시작" 표시).
+- [ ] 상세 처리 성공 건수와 외부 링크 발견 건수가 로그에서 구분되는지 확인한다(성공했지만 링크가 없는 업체가 실패로 표시되지 않아야 함).
+- [ ] 목록 단계에서 이미 채워진 업체명·업종·리뷰수·주소·플레이스 URL·수집일이 Home 단계 이후에도 바뀌지 않는지 확인한다.
+- [ ] `logs/diagnostics/home_enrichment_<실행시각>.json` 파일이 생성되는지 확인한다.
+- [ ] 잘못된 형식의 외부 링크가 있는 업체가 있어도 전체 실행이 중단되지 않는지 확인한다(해당 링크만 무시).
 
-## 8. 출시 전 남은 보류 항목
+## 9. 법정동·지역 필터
 
-- [-] 온라인 채널 존재 필터 실배선 (후속 단계)
-- [-] 원본_모바일/원본_PC 시트명·구조 정리 또는 단일 시트화
-- [-] basic 경로의 상세 엔진 통합 여부 판단
-- [-] legacy 수집 엔진 제거
-- [-] 버전 표기(README H1) 갱신 여부 결정
-- [-] 다건/다지역 대량 live 검증
-- [ ] CAPTCHA/대량 수집 리스크 설계 검토 — PERF-4(limit=30)에서 CAPTCHA 발생 확인(2026-07-08)에 따라 limit=50/100/300 등 대량 규모 측정보다 우선 필요. SAFE-1(§11)로 UI 안내/부분저장/Queue 조기중단은 구현 완료, 자동 딜레이/배치 휴식 등 부하 완화 정책은 여전히 보류. 검토 완료 전까지 release_candidate 생성 보류
+- [ ] `data/legal_dong_snapshot.json`이 있는 상태에서 시도 → 시군구 → 법정동(다중 선택, 팝업) 흐름이 정상 동작한다.
+- [ ] 법정동 목록이 가나다순으로 표시된다.
+- [ ] 법정동을 선택하지 않고 실행하면 시군구(시군구가 없는 지역은 시도) 단위로 검색되는지 확인한다.
+- [ ] 선택한 법정동 밖의 주소를 가진 결과가 최종 저장 결과에 없는지 확인한다(지역 exact 필터).
+- [ ] Snapshot 파일을 임시로 이름 바꾸거나 제거하면 화면에 오류가 표시되고 "수집 시작" 버튼이 비활성화되는지 확인한다(확인 후 파일명 복구).
 
-## 9. 패키징 / 빌드 체크
+## 10. 신규 오픈 전용 수집
 
-- [x] PyInstaller 빌드 스크립트 존재 (`build.bat`, `--onefile --windowed --collect-all customtkinter`)
-- [x] `app.py`가 `src.ui` import 전에 `PLAYWRIGHT_BROWSERS_PATH`를 설정 (frozen 시 EXE 옆 `ms-playwright` 우선)
-- [x] chromium 번들 포함 확인 (`dist/ms-playwright/chromium-*`, `chromium_headless_shell-*`)
-- [x] frozen(EXE) 환경에서 `DiagnosticConfig.from_env()`가 강제 안전 모드 (test_pc_config `check_frozen_forces_safe_mode`로 검증)
-- [x] README에 EXE 배포/실행 절 추가(EXE + ms-playwright 동일 폴더 배치, output 위치, AV 오탐/최초 실행 지연 안내)
-- [x] `.env.example`를 현재 `PCCRAWLER_*` 진단 env 기준으로 최신화(frozen 시 무시됨을 명시)
-- [ ] 빌드 머신 `playwright` 버전이 requirements(1.60.0)와 일치하고 번들 chromium 리비전과 정합
-- [-] 브라우저 번들 chromium 한정 축소(용량 최적화) — 후속 패키징 최적화 단계
-- [-] build.bat / `.spec` 빌드 방식 일원화 — 후속 단계
+- [ ] "새로오픈 업체만 수집"을 켜고 실행한다.
+  - 기대: 새로오픈 전용 목록만 수집되고, 목표보다 결과가 적어도 일반 목록으로 자동 보충되지 않는다.
+- [ ] 새로오픈여부 컬럼이 O/X/빈칸 중 하나로만 채워지는지 확인한다(추측으로 O나 X를 임의 확정하지 않음).
+- [ ] 일반(새로오픈 미체크) 수집에서도 새로오픈여부가 값이 있으면 O/X, 값이 없으면 빈칸으로 채워지는지 확인한다.
 
-## 10. 출시 smoke 계획 (Tier 1 / Tier 2)
+## 11. 리뷰 필터
 
-두 smoke 모두 **각 1회, 별도 승인 후 실행**한다(반복 live 금지). 실행 결과는 성공 시 별도 기록을 남긴다.
+- [ ] 리뷰 수 최소·최대를 입력하고 실행한다.
+  - 기대: 총리뷰수가 범위 밖인 업체는 결과에 없다.
+- [ ] 필터로 제외된 업체가 검색 조합당 수집 상한을 소비하지 않는지 로그의 리뷰 필터 통계로 확인한다.
+- [ ] 값을 비워두면 리뷰 필터가 적용되지 않는지 확인한다.
 
-- [x] **Tier 1 — 번들 chromium 실행 확인 (빌드 불필요, 1회)** — 2026-07-07 완료
-  - `PLAYWRIGHT_BROWSERS_PATH=dist/ms-playwright` 설정 후 상세 수집 `limit=1`(keyword: 서울특별시 강동구 카페) 실행
-  - 목적: EXE 빌드 없이 번들 chromium이 실제 구동되고 place_id/플레이스 URL/전화가 수집되는지 조기 확인
-  - 결과: rows=1, place_id/플레이스 URL/주소/대표전화/인스타 수집 성공, CAPTCHA/Timeout 없음, 예외 없음 (PROJECT_STATE.md 2026-07-07 기록 참조)
-- [x] **Tier 2 — 패키징 EXE end-to-end (빌드 후, 1회)** — 2026-07-07 완료
-  - `build.bat`로 빌드 → `dist/NaverPlaceSalesDBCollector.exe` 실행 → 상세 수집 `limit=1` → `output/*.xlsx` 통합_결과 11컬럼 생성 확인, place_id 비노출, CAPTCHA/예외 없음
-  - 목적: 배포 산출물(EXE + ms-playwright)로 실제 end-to-end 동작을 출시 게이트로 확인
-  - 결과: EXE 실행/GUI 표시/Excel 생성 모두 성공, 통합_결과 11컬럼·place_id 비노출 확인, 생성 파일 `naver_place_premium_db_20260707_0238.xlsx` (PROJECT_STATE.md 2026-07-07 Tier 2 기록 참조)
+## 12. 실행 제어와 부분 저장
 
-## 11. CAPTCHA/보안 확인 대응 (SAFE-1)
+- [ ] 시작 → 일시정지 → 재개 → 정상 종료 흐름이 동작한다.
+- [ ] 실행 중 "중지"를 누르면 새 검색 조합을 시작하지 않고 현재까지의 결과를 저장하는지 확인한다.
+- [ ] 결과가 0건인 상태로 중지하면 Excel 파일이 생성되지 않는지 확인한다.
+- [ ] 전체 목표 개수 도달로 종료된 경우와 선택한 검색 조합을 모두 실행해 종료된 경우가 로그 문구로 구분되는지 확인한다.
 
-PERF-4(limit=30, 2026-07-08)에서 실제 CAPTCHA/보안 확인이 발생했으나 UI에 그 사실이 전달되지 않고 "정상 완료"로 오인될 수 있는 문제가 확인되어, 최소 배선(SAFE-1)으로 대응했다. CAPTCHA 우회/자동 해결/DOM 조작/stealth는 여전히 절대 금지이며, 이번 단계는 감지 이후의 **정직한 안내·부분 저장·안전 중단**만 다룬다.
+## 13. CAPTCHA·429·오류 처리
 
-- [x] `collect_pc_full`에 optional keyword-only `on_security_block` 콜백 추가(기존 인자/반환 계약 불변, best-effort 호출)
-- [x] `classify_exception`이 `CAPTCHA_OR_SECURITY_BLOCK`으로 분류한 경우에만 콜백 호출
-- [x] UI(`_note_security_block`)가 감지 시 인스턴스 상태 기록 + 로그 출력
-- [x] 보안 차단 감지 시 남은 Queue 조기 중단(현재까지 누적 결과는 기존 저장 흐름으로 Excel 저장)
-- [x] 최종 안내가 정상 완료가 아닌 "보안 확인 감지" 메시지로 분기(상태 라벨: `보안 확인 감지 — 부분 저장됨`)
-- [x] 단위 테스트 추가(`test_pc_pipeline.py` 4종, `test_ui_pc_full_wiring.py` 1종 + 기존 3종 회귀 확인)
-- [-] 자동 딜레이/배치 휴식 등 부하 완화 정책 — SAFE-1 범위 밖, 후속 SAFE-2 후보로 보류
-- [x] **SAFE-1V** limit=30 재테스트(dev UI, 2026-07-08) — **PASS**: page=2에서 CAPTCHA 재발생, SAFE-1 로그(`보안 확인(CAPTCHA) 감지: 안전 중단합니다` 등) 정상 출력, 부분 결과 15/30 Excel 저장(`naver_place_premium_db_20260708_1453.xlsx`), 남은 Queue 조기 중단, 앱 크래시/우회 시도 없음. 단 30/30 정상 수집 자체는 이번에도 FAIL(성공 기준은 "CAPTCHA 미발생"이 아니라 "발생 시 정직한 안내·안전 중단"이었으므로 PASS 판정) (PROJECT_STATE.md 2026-07-08 SAFE-1V 기록 참조)
-- [-] limit=50/100/300 대량 측정 — page=2 CAPTCHA 재발생 반복 확인(PERF-4, SAFE-1V)으로 현재 방식 그대로 진행은 부적절. SAFE-2(수집 속도/배치/부하 완화 정책) 설계 및 적용 전까지 계속 보류
+- [ ] CAPTCHA/보안 확인 감지 로직이 dialog/frame/click 신호를 사용하고 HTTP 403/429 상태 코드만으로 판정하지 않는지 코드·자동화 테스트 기준으로 재확인한다(`tests/test_collection_apollo_page_navigator.py`, `tests/test_collection_place_mapper.py`).
+- [ ] CAPTCHA가 실제로 발생하면(재현을 강제하지 않음, 발생 시에만 확인): 추가 클릭·재시도 없이 즉시 중단, 진단 JSON 저장, 가능하면 PNG 저장, GUI 로그에 진단 경로가 표시되는지 확인한다.
+- [ ] 429가 실제로 발생하면: `security_blocked`와 별도로 `status_429` stop_reason으로 분류되는지 확인한다.
+- [ ] navigation_error가 실제로 발생하면: 즉시 중단되고 이전 결과가 보존되는지 확인한다.
+- [ ] 위 세 상황 모두, 발생 시점까지 수집된 결과가 있으면 저장되는지 확인한다(0건이면 미저장).
+
+## 14. Excel 14열·3시트
+
+- [ ] `통합_결과` 시트 열 이름·순서가 정확히 다음과 같다: 업체명·업종·새로오픈여부·방문자리뷰수·블로그리뷰수·총리뷰수·주소·대표전화·플레이스 URL·수집일·홈페이지·인스타·블로그·추가 링크.
+- [ ] `원본_모바일`/`원본_PC` 시트가 존재하며 현재는 헤더만 있는 빈 시트로 생성되는지 확인한다.
+- [ ] 개인 휴대전화(010/011/016~019 등)가 대표전화 컬럼에 남아 있지 않은지 확인한다.
+- [ ] 생성된 파일이 Excel 또는 호환 뷰어로 정상적으로 열리는지 확인한다.
+- [ ] 같은 저장 경로로 다시 실행했을 때 타임스탬프가 붙어 기존 파일을 덮어쓰지 않는지 확인한다.
+- [ ] `output/` 폴더가 없을 때 자동 생성되는지 확인한다.
+
+## 15. 진단 파일과 로그
+
+- [ ] 보안 차단 진단 JSON에 쿠키·Authorization·HTML 원문이 저장되지 않는지 확인한다.
+- [ ] Home 보강 진단 JSON에도 동일하게 민감 정보가 없는지 확인한다.
+- [ ] 진단 저장이 실패해도(예: 폴더 쓰기 권한 문제) 수집 실행 자체가 중단되지 않는지 확인한다.
+
+## 16. PyInstaller 빌드
+
+- [ ] tracked `NaverPlaceSalesDBCollector.spec`으로 `build.bat`을 실행한다.
+  - 기대: `dist/NaverPlaceSalesDBCollector.exe`, `dist/ms-playwright/` 생성.
+- [ ] `data/legal_dong_snapshot.json`이 spec의 `datas`로 번들되어 있는지 spec 파일에서 확인한다.
+- [ ] `requirements.txt`의 `playwright` 버전과 빌드 머신에 설치된 버전, 번들 chromium 리비전이 정합하는지 확인한다.
+- [ ] 빌드 전 `build`/`dist` 폴더가 정리되는지(`build.bat` 자동 삭제 여부) 확인한다.
+
+## 17. EXE 실행 검증
+
+- [ ] EXE와 `ms-playwright` 폴더를 같은 위치에 두고 실행한다.
+- [ ] 진단 모드가 EXE 환경에서 강제로 비활성화되는지 확인한다(브라우저 화면 밖 실행, 진단 산출물 미저장).
+- [ ] 한글 경로·공백 포함 경로에서 실행 가능한지 확인한다.
+- [ ] Native Edge/Chrome profile lock 관련 오류(`profile_in_use`) 발생 시 안내 문구가 사용자에게 명확한지 확인한다.
+- [ ] Windows Defender 등 보안 프로그램이 오탐할 가능성이 있음을 확인 항목으로만 기록한다(발생 여부를 보장하지 않음).
+- [ ] 생성된 Excel이 EXE 실행 위치 기준 `output/` 폴더에 저장되는지 확인한다.
+
+## 18. 알려진 제한사항 수용
+
+각 항목의 판정·근거·후속 작업을 채운다. 미해결 결함을 자동으로 수용 완료 처리하지 않는다.
+
+- [ ] 네이버 UI·GraphQL 구조 변경 시 수집이 실패할 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] Edge profile lock 또는 CDP startup 실패가 발생할 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] 신규 오픈 provider 결과가 지역에 따라 제한적일 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] 시도/시군구는 단일 선택만 지원한다(다중 시군구 동시 선택 미지원).
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] Home enrichment에서 예상 밖 예외가 발생하면 목록 결과도 저장되지 않을 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] `원본_모바일`/`원본_PC` 시트는 현재 항상 빈 시트다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] 법정동 snapshot은 개발자가 별도 스크립트로 주기적으로 갱신해야 한다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] CAPTCHA·보안 차단으로 목표 개수에 미달할 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+- [ ] 전체 목표 저장 개수는 보장값이 아니며 실제 결과가 더 적을 수 있다.
+  - 판정: ____ 근거: ____ 후속 작업: ____
+
+## 19. 출시 산출물 확인
+
+- [ ] `output/`에 생성된 Excel 파일 경로 기록: ____
+- [ ] `logs/diagnostics/`에 생성된 진단 파일 목록 기록: ____
+- [ ] 빌드된 EXE 경로와 크기 기록(빌드한 경우): ____
+
+## 20. 최종 승인 Gate
+
+- [ ] 필수 문서가 현재 계약과 일치한다.
+- [ ] 정적 회귀가 모두 통과했다.
+- [ ] 기본 수집 실제 시나리오가 통과했다.
+- [ ] 홈페이지·SNS 수집 실제 시나리오가 통과했다.
+- [ ] 필터(지역/신규오픈/리뷰) 시나리오가 통과했다.
+- [ ] 중지·부분 저장 시나리오가 통과했다.
+- [ ] Excel 14열·3시트가 확인됐다.
+- [ ] PyInstaller build가 성공했다.
+- [ ] 생성된 EXE가 실제 환경에서 실행됐다.
+- [ ] 알려진 제한사항의 출시 수용 여부가 결정됐다.
+- [ ] 최종 출시 승인자가 승인했다.
+
+최종 상태 기록:
+
+- 최종 판정: **미검증**
+- 판정일: ____________________
+- 판정자: ____________________
+- 기준 commit: ____________________
+- 비고: ____________________
+
+## 부록 A. 실제 검증 결과 기록
+
+- 검증일:
+- 검증자:
+- Git commit:
+- Python:
+- Windows:
+- 브라우저:
+- 테스트 지역:
+- 테스트 업종:
+- 목표 수:
+- 수집 모드:
+- 생성 Excel:
+- diagnostics 경로:
+- EXE 경로:
+
+## 문서 작성 시점의 정적 기준
+
+- 기준일: 2026-08-04
+- 기준 commit: `c17476f`
+- pytest collect: 206
+- pytest: 206 passed
+- compileall: exit 0
+- imports: OK
+- 실제 GUI 검증: 미실행
+- 실제 live 수집: 미실행
+- EXE build: 미실행
+- EXE runtime: 미실행
+
+정적 회귀가 통과해도 최종 출시는 미승인 상태로 유지한다.

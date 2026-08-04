@@ -93,18 +93,15 @@
 
 ## 10. 남은 공식 단계
 
-1. `LEGAL_NOTICE.md`의 현재 기능 계약 정정
-2. `RELEASE_CHECKLIST.md`를 현재 단일 Apollo 엔진·14열 기준으로 재작성
-3. 앱 최종 시나리오 검증
-4. EXE 재빌드 및 실행 검증
-5. 최종 출시 가능 상태 판정
+1. 앱 최종 시나리오 검증
+2. EXE 재빌드 및 실행 검증
+3. 최종 출시 가능 상태 판정
 
 ## 11. 문서 상태
 
-- **현재 최신**: `README.md`, `CODEBASE_MAP.md`, 핵심 module/class docstring
-- **수정 필요**:
-  - `LEGAL_NOTICE.md` — "새로오픈여부는 현재 항상 빈칸"이라는 구형 설명이 현재 O/X/빈칸 tri-state 구현과 모순(MUST_FIX_BEFORE_FINAL_VALIDATION)
-  - `RELEASE_CHECKLIST.md` — Basic/Premium 2엔진, entryIframe, 구형 11열 schema가 현재 Apollo/GraphQL 단일 목록 엔진과 불일치(MUST_FIX_BEFORE_FINAL_VALIDATION)
+- **현재 최신**: `README.md`, `CODEBASE_MAP.md`, `LEGAL_NOTICE.md`, `RELEASE_CHECKLIST.md`, 핵심 module/class docstring
+  - `LEGAL_NOTICE.md` — 새로오픈여부 O/X/빈칸 출력 계약 반영 완료
+  - `RELEASE_CHECKLIST.md` — 현재 단일 Apollo 수집 구조·14열 Excel 계약 반영 완료
 
 ## 12. 공식 일정
 
