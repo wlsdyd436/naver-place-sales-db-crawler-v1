@@ -1,3 +1,13 @@
+"""CustomTkinter 기반 데스크톱 UI.
+
+화면 위젯과 사용자 입력 상태(SalesDbCrawlerApp)를 소유하며, UI thread에서
+입력값을 검증해 순수 값으로 확정한 뒤 worker thread를 시작해 Collection
+orchestration(`run_collection_plan`)을 호출한다. 법정동 검색 계획 계산은
+`ui_query_plan`, 홈페이지·SNS 보강 단계는 `ui_home_stage`, Excel 저장은
+`ui_export_flow`, 상태 문구 생성은 `ui_status_messages`에 위임한다. worker
+thread의 결과는 `self.after`로 예약된 콜백을 통해서만 화면에 반영한다 -
+Apollo 파싱이나 Excel 파일 생성 자체는 이 모듈이 구현하지 않는다.
+"""
 # 2026-06-25: V2.0 CustomTkinter UI. 기존 크롤링/파싱/엑셀 저장 파이프라인은 유지합니다.
 # 2026-07-09 UI-CLEANUP-1: 다중 키워드/수집모드 선택/온라인 채널 필터를 제거하고
 # 단일 키워드 + 자동 세분화 미리보기 중심으로 정리했다(구조 변경, 상세 설계는
@@ -109,6 +119,15 @@ def _parse_review_bound(raw: str) -> int | None:
 
 
 class SalesDbCrawlerApp(ctk.CTk):
+    """사용자 입력 위젯과 pause/stop Event를 소유하는 최상위 App.
+
+    수집은 worker thread(`_run_network_pipeline_worker`)에서 실행되고,
+    화면 갱신은 위젯을 직접 건드리지 않고 `self.after`로 예약된 콜백을
+    통해서만 이뤄진다. 실제 Collection/홈페이지 보강/Excel 저장 로직은 이
+    class가 아니라 분리된 모듈(`src.collection`, `src.ui_home_stage`,
+    `src.ui_export_flow`)이 담당한다.
+    """
+
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("System")
@@ -317,7 +336,7 @@ class SalesDbCrawlerApp(ctk.CTk):
                 "행정안전부 공식 법정동 데이터를 사용합니다(앱 실행 중 API 호출 없음).\n"
                 "법정동을 선택하지 않으면 시군구(시군구 없는 지역은 시도) 단위로 검색합니다.\n"
                 "전남광주통합특별시/세종특별자치시 등은 공식 명칭을 그대로 표시하며,\n"
-                "네이버 검색어 호환성과 지역 exact 필터는 아직 다음 단계입니다."
+                "법정동을 선택하면 공식 지역 판정을 적용해 선택 지역 밖의 결과는 제외합니다."
             ),
             justify="left", anchor="w", text_color="gray", font=ctk.CTkFont(size=11), wraplength=360,
         ).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 10))

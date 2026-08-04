@@ -1,4 +1,12 @@
-# V1 exporter placeholder. Implementation is intentionally excluded in STEP 1.
+"""수집 결과를 .xlsx 파일로 저장한다.
+
+병합 결과(MERGED_COLUMNS)·원본 모바일(MOBILE_COLUMNS)·원본 PC
+(PC_COLUMNS) 세 시트를 구성하고, 출력 폴더 생성과 열 너비·줄바꿈 등 기본
+서식을 적용한 뒤 저장된 파일 경로를 반환한다. rows가 비어 있을 때 이
+모듈을 호출할지 여부는 호출자(`src.ui_export_flow`)의 책임이며, 이 모듈은
+전달받은 데이터로 항상 세 시트를 그대로 생성한다. UI 로그나 최종 상태
+문구는 담당하지 않는다.
+"""
 
 from pathlib import Path
 

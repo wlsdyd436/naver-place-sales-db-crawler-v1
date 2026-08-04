@@ -1,24 +1,25 @@
-# ARCH-300 PoC-1: 브라우저 네트워크 응답 관찰 기반 업체 리스트 수집(기술 검증 단계).
-#
-# 이 모듈은 "직접 API를 호출"하지 않는다. Playwright 브라우저가 검색 결과 화면을
-# 정상적으로 렌더링하는 과정에서 자연히 발생시키는 Network response(xhr/fetch)를
-# 관찰(observe)하여, 그 응답에 이미 담겨 있는 업체 리스트 데이터를 파싱만 한다.
-# CAPTCHA 우회/자동 해결/stealth/proxy/무단 반복 호출은 이 모듈의 목적이 아니며
-# 시도하지 않는다.
-#
-# 아직 PoC-1 단계이므로 이 모듈은 UI(src/ui.py)나 pipeline(src/collection/plan_runner.py)에
-# 연결되지 않는다. 순수 함수(파서/매퍼/필터/dedup)만 제공하며, 실제 Playwright
-# page/response 객체를 다루는 코드(리스너 등록 등)는 scratchpad의 PoC 스크립트가
-# 담당한다 - 이렇게 분리해야 이 모듈을 live 브라우저 없이 fixture만으로 테스트할
-# 수 있다.
-#
-# 네이버 내부 응답의 JSON 구조는 비공식/미문서화이며 사전 예고 없이 바뀔 수 있다.
-# 따라서 모든 파싱은 방어적으로 작성한다: 알려진 경로를 우선 시도하고, 실패하면
-# 휴리스틱으로 재귀 탐색하며, 그래도 실패하면 예외를 던지지 않고 빈 값을 반환한다.
-#
-# safety.is_captcha_or_security_message는 읽기 전용으로 재사용한다(src/collection/safety.py는
-# 수정하지 않는다) - 클릭 예외 메시지의 CAPTCHA/보안 차단 키워드 판정 로직을
-# 중복 구현하지 않기 위함이다.
+"""Apollo 목록·상세·HTML 응답에서 얻은 업체 item을 판매 DB row로 정규화하는 순수 모듈.
+
+업체명·업종·리뷰수(방문자/블로그/총합)·주소·대표전화·플레이스 URL·홈페이지·
+인스타·블로그·추가 링크 등 exporter.MERGED_COLUMNS 공통 필드로 변환하고,
+place_id/업체명 기반 dedup 키 생성과 CAPTCHA/보안 차단 신호 분류
+(classify_captcha_signal)도 담당한다. `apollo_list_collector`(목록 수집),
+`row_filters`(지역/새로오픈/리뷰 필터), `home_enrichment`(홈페이지 보강)가
+이 모듈의 함수를 직접 호출해 사용한다.
+
+이 모듈은 "직접 API를 호출"하지 않는다 - Playwright 브라우저가 검색 결과를
+렌더링하는 과정에서 자연히 발생시키는 Network response(xhr/fetch)에 이미
+담긴 데이터를 파싱만 한다. 네이버 내부 응답의 JSON 구조는 비공식/미문서화라
+사전 예고 없이 바뀔 수 있으므로 모든 파싱은 방어적으로 작성한다: 알려진
+경로를 우선 시도하고, 실패하면 휴리스틱으로 재귀 탐색하며, 그래도 실패하면
+예외를 던지지 않고 빈 값을 반환한다. CAPTCHA 우회/자동 해결/stealth/proxy는
+이 모듈의 목적이 아니며 시도하지 않는다. 네트워크 요청이나 UI 갱신은
+담당하지 않는다.
+
+`safety.is_captcha_or_security_message`는 읽기 전용으로 재사용한다
+(`src/collection/safety.py`는 수정하지 않는다) - 클릭 예외 메시지의
+CAPTCHA/보안 차단 키워드 판정 로직을 중복 구현하지 않기 위함이다.
+"""
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
