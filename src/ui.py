@@ -11,8 +11,7 @@ Apollo 파싱이나 Excel 파일 생성 자체는 이 모듈이 구현하지 않
 # 2026-06-25: V2.0 CustomTkinter UI. 기존 크롤링/파싱/엑셀 저장 파이프라인은 유지합니다.
 # 2026-07-09 UI-CLEANUP-1: 다중 키워드/수집모드 선택/온라인 채널 필터를 제거하고
 # 단일 키워드 + 자동 세분화 미리보기 중심으로 정리했다(구조 변경, 상세 설계는
-# PROJECT_STATE.md 2026-07-09 UI-CLEANUP-1 기록 참고). [DB 수집] 탭과, 아직
-# 실제 기능이 없는 [순위추적] V2 예정 탭으로 분리했다.
+# PROJECT_STATE.md 2026-07-09 UI-CLEANUP-1 기록 참고).
 import os
 import re
 import threading
@@ -60,7 +59,7 @@ _MULTI_KEYWORD_PATTERN = re.compile(r"[,;\n/|·]")
 _SECTION_TITLE_PADY = (16, 4)
 _SECTION_BODY_PADY = (0, 16)
 
-# UI-CLEANUP-1D-A: [DB 수집]/[순위추적] 탭 자체를 감싸는 앱 전체 외곽 여백.
+# UI-CLEANUP-1D-A: 탭 자체를 감싸는 앱 전체 외곽 여백.
 # 왼쪽 패널 "섹션 간" 여백(위 상수)과는 다른 층위 - 이건 "제목 아래 ~ 탭
 # 바로 위"와 "앱 맨 아래" 여백을 상하 대칭으로 맞추기 위한 것이다. tabview는
 # 창 전체를 채우는 단일 grid 셀이므로, 이 pady 하나만 상하 동일하게 주면
@@ -230,9 +229,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # UI-CLEANUP-1: 제목 아래에 [DB 수집] / [순위추적] 탭을 추가한다. 순위추적은
-        # 업체 DB 수집과는 다른 알고리즘(검색 노출 순위 확인)이 필요해 별도 탭으로
-        # 분리하고, 이번 단계에서는 V2 예정 화면만 제공한다(§_build_rank_tracking_tab).
         # UI-CLEANUP-1D-A: tabview는 창 전체를 채우는 유일한 최상위 grid 셀이므로,
         # 여기 pady를 상하 동일(_OUTER_PAD_Y)하게 주는 것만으로 "제목~탭 위" 여백과
         # "앱 맨 아래" 여백이 자동으로 대칭이 된다(왼쪽 패널 섹션 간격과는 다른 층위).
@@ -243,7 +239,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(self)
         self.tabview.grid(row=0, column=0, sticky="nsew", padx=_OUTER_PAD_X, pady=_OUTER_PAD_Y)
         self.db_tab = self.tabview.add("DB 수집")
-        self.rank_tab = self.tabview.add("순위추적")
         self.policy_tab = self.tabview.add("안내·정책")
         self.tabview.set("DB 수집")
 
@@ -277,7 +272,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self._build_control_section()
         self._build_log_section()
 
-        self._build_rank_tracking_tab()
         self._build_policy_tab()
 
     def _build_region_section(self):
@@ -705,69 +699,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self.right_panel, state="disabled")
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self.log("[ui] 실행 준비 완료")
-
-    def _build_rank_tracking_tab(self):
-        # 순위추적은 업체 DB 수집(리스트/상세 수집)과는 전혀 다른 알고리즘
-        # (특정 키워드로 검색했을 때 노출 순서를 확인)이 필요하다. 이번
-        # UI-CLEANUP-1은 화면 정리 작업이므로 실제 검색/크롤러/DB 스키마/
-        # 자동 스케줄링은 구현하지 않고, 어떤 기능이 올 예정인지 보여주는
-        # 정적 미리보기만 제공한다. 실제 구현은 DB 수집 MVP 안정화 이후
-        # 별도 단계(PROJECT_STATE.md 참고)에서 진행한다.
-        self.rank_tab.grid_rowconfigure(0, weight=1)
-        self.rank_tab.grid_columnconfigure(0, weight=1)
-
-        container = ctk.CTkScrollableFrame(self.rank_tab)
-        container.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        container.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(container, text="순위추적 V2 예정", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w", pady=(4, 4))
-        ctk.CTkLabel(
-            container,
-            text=(
-                "순위추적은 업체 DB 수집과 별도 알고리즘으로 동작합니다.\n"
-                "특정 업체 또는 특정 키워드를 기준으로 노출 순위를 확인하고,\n"
-                "날짜별 변화를 기록하는 기능입니다."
-            ),
-            justify="left", anchor="w", text_color="gray",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
-
-        self._build_rank_tracking_card(
-            container, row=2, title="업체별 순위",
-            description="특정 업체가 여러 키워드에서 몇 위인지 확인합니다.",
-            example=(
-                "예: 굽네치킨 천호점\n"
-                "- 천호동 치킨: 7위\n"
-                "- 강동구 치킨: 15위\n"
-                "- 천호역 치킨: 4위"
-            ),
-        )
-        self._build_rank_tracking_card(
-            container, row=3, title="키워드별 순위",
-            description="특정 키워드에서 어떤 업체들이 상위에 노출되는지 확인합니다.",
-            example=(
-                "예: 천호동 치킨\n"
-                "1위 교촌치킨 천호점\n"
-                "2위 굽네치킨 천호점\n"
-                "3위 BBQ 천호점"
-            ),
-        )
-        self._build_rank_tracking_card(
-            container, row=4, title="날짜별 변화 기록",
-            description="매일 또는 주간 단위로 순위 변화를 저장하고 리포트화합니다.",
-            example=None,
-        )
-
-        self.rank_placeholder_button = ctk.CTkButton(container, text="순위추적 기능 준비중", state="disabled")
-        self.rank_placeholder_button.grid(row=5, column=0, sticky="ew", pady=(10, 0))
-
-    def _build_rank_tracking_card(self, parent, row: int, title: str, description: str, example: str | None):
-        card = ctk.CTkFrame(parent)
-        card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
-        ctk.CTkLabel(card, text=description, anchor="w", justify="left").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4 if example else 10))
-        if example:
-            ctk.CTkLabel(card, text=example, justify="left", anchor="w", text_color="gray").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
 
     def _build_policy_tab(self):
         # ARCH-300C WIRE-2D: [안내·정책] 탭에 실제 동작과 일치하는 핵심 정책을
