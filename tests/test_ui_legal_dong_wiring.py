@@ -20,7 +20,6 @@ def _make_app():
     app.set_status = lambda message: None
     app.after = lambda delay, func, *args: func(*args)
     app.duplicate_removed_var = _SimpleVar("중복 제거: 0개")
-    app._security_block_decision = None
     return app
 
 

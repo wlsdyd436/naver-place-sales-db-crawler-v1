@@ -1013,19 +1013,6 @@ class SalesDbCrawlerApp(ctk.CTk):
         self.log("[ui] 중지 요청: 현재 진행 중인 수집이 끝난 후 중단됩니다.")
         self.set_status("중지 요청됨")
 
-    def _filter_by_review_count(self, places, min_val, max_val):
-        filtered_places = []
-        for row in places or []:
-            review_text = str((row or {}).get("리뷰수", "")).strip()
-            review_digits = re.sub(r"[^\d]", "", review_text)
-            review_count = int(review_digits) if review_digits else 0
-            if min_val is not None and review_count < min_val:
-                continue
-            if max_val is not None and review_count > max_val:
-                continue
-            filtered_places.append(row)
-        return filtered_places
-
     def _validate_single_keyword(self, raw_keyword: str) -> str | None:
         """다중 키워드로 보이는 입력이면 에러 메시지를, 문제 없으면 None을 반환한다.
 
@@ -1184,15 +1171,9 @@ class SalesDbCrawlerApp(ctk.CTk):
                 self.after(0, self._cancel_eta_timer)
             self.set_running(False)
 
-    def _set_queue_progress(self, completed: int, total: int):
-        progress = completed / total if total else 0
-        self.after(0, lambda: self.progress_bar.set(progress))
-        self.after(0, self.progress_percent_var.set, f"{completed}/{total}")
-
     def _note_security_block(self, decision) -> None:
-        # SAFE-1: Network 파이프라인의 on_security_block 콜백. CAPTCHA/보안 차단 감지를
-        # 인스턴스 상태에 기록만 하고, 실제 중단/저장/안내는 _run_network_pipeline이 담당한다.
-        self._security_block_decision = decision
+        # SAFE-1: Network 파이프라인의 on_security_block 콜백. 로그만 남기고,
+        # 실제 중단/저장/안내는 _run_network_pipeline이 담당한다.
         self.log("[ui] 보안 확인(CAPTCHA) 감지: 안전 중단합니다.")
 
     def _note_home_progress(self, completed: int, total: int, success_count: int, failure_count: int) -> None:

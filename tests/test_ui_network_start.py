@@ -129,7 +129,6 @@ def _make_app(*, districts=("강동구",), query_queue=None):
     app.stop_event = threading.Event()
     app.pause_event = threading.Event()
     app.eta_after_id = None
-    app._security_block_decision = None
 
     app.keyword_input_var = FakeVar("카페")
     app.output_path_var = FakeVar("output/naver_place_test.xlsx")

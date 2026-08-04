@@ -54,7 +54,6 @@ def _make_app():
     app.set_status = lambda message: statuses.append(message)
     app.after = lambda delay, func, *args: func(*args)
     app.duplicate_removed_var = SimpleNamespace(set=lambda value: None)
-    app._security_block_decision = None
     return app, logs, statuses
 
 
