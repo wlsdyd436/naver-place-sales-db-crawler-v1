@@ -1,88 +1,125 @@
-# 프로젝트 상태 관리 (PROJECT_STATE.md)
+# 프로젝트 상태 관리
 
-## 1. 프로젝트 개요
+> 이 문서의 상단은 현재 canonical 상태다.
+> 아래 날짜별 기록은 당시 기준의 역사적 작업 기록이며,
+> 현재 구조와 다를 수 있다.
 
-- **프로젝트명**: 네이버 플레이스 영업 DB 수집기 V1.2
+## 1. 현재 제품 상태
+
+- **제품명**: 네이버 플레이스 영업 DB 수집기
+- **형태**: Windows CustomTkinter 데스크톱 앱. Native Edge/Chrome persistent profile + CDP 기반 브라우저 실행. Apollo/GraphQL 자연 브라우저 응답 기반 목록 수집. Excel 결과 생성.
 - **목표**: 광고대행사, POS/키오스크 영업자, 식자재 유통업체가 바로 영업에 활용할 수 있는 공개 사업장 DB를 수집하고 Excel로 정리한다.
-- **현재 방향**: GUI 기반 Basic/Premium 모드 분리 운영
-- **핵심 원칙**: 상세 페이지 진입 없이 리스트 화면에서 확보 가능한 정보만 수집한다.
 
----
+## 2. 현재 제품 범위
 
-## 2. 설계 변경 기록
+포함:
 
-### 2026-06-04
+- 법정동 기반 업체 검색
+- 신규 오픈 전용 수집
+- 리뷰 최소·최대 필터
+- 기본 목록 수집
+- 홈페이지·SNS 보강
+- 일시정지·재개·중지
+- CAPTCHA·보안 차단 안전 중단
+- 부분 결과 저장
+- Excel 내보내기
 
-- Gemini 분석 결과에 따라 수집 타겟을 PC 네이버 지도에서 모바일 웹으로 변경했다.
-- 기존 방향이었던 PC 네이버 지도 `map.naver.com/v5/search` 기반 접근을 V1 범위에서 제외했다.
-- `searchIframe`, `entryIframe` 접근 방식은 V1에서 사용하지 않기로 했다.
-- 상세 페이지 클릭/진입은 V1에서 제외했다.
-- 리뷰 수, 영업시간, 평점은 V1 수집 필드에서 제외했다.
-- V1은 모바일 웹 리스트 화면 중심의 최소 수집 방식으로 설계한다.
-- V1.2에서 GUI 진입점은 `app.py`로 확정하고 CLI 전용 `main.py`는 제거했다.
-- 기획/시장 분석 문서는 `docs/` 폴더로 이동했다.
+제외(현재 저장소 범위 아님):
 
----
+- **순위 추적**: 미구현 placeholder 탭 제거 완료(2026-08-04). 현재 저장소에서 개발하지 않으며, 향후 개발한다면 별도 프로그램·별도 저장소로 처음부터 설계한다. 출시 일정이나 구현 약속은 현재 없다.
 
-## 3. V1.2 수집 범위
+## 3. 지원 기능과 수집 모드
 
-Basic Mode 수집 필드:
+내부 값: `basic` / `home_sns`
 
-- 업체명
-- 업종
-- 주소
-- 대표전화
-- 플레이스 URL
-- 수집일
+- **빠른 기본 수집**(`basic`, 기본 선택값): 목록 결과 중심이며 Home enrichment를 실행하지 않는다(홈페이지 상세 GET 0회). 홈페이지·SNS 관련 열은 목록 응답에 값이 없으면 비어 있다.
+- **홈페이지·SNS 포함 수집**(`home_sns`): 목록 수집 후 별도 Home stage를 실행해 place_id 기반 상세 처리로 홈페이지·인스타·블로그·추가 링크를 병합한다. 상세 처리 성공과 외부 링크 발견은 다른 의미다(링크가 없어도 처리는 성공할 수 있음). 동시성 2, transient 실패만 최대 1회 재시도하며, 보안 차단 시 추가 재시도를 중단한다.
 
-Premium Mode 통합 결과 필드:
+## 4. 현재 코드 구조
 
-- 업체명
-- 업종
-- 새로오픈여부
-- 리뷰수
-- 주소
-- 대표전화
-- 플레이스 URL
-- 수집일
+완료 상태:
 
-제외 필드:
+- COLLECTOR_SPLIT_COMPLETE(Apollo list/detail/HTML adapter, response observer, page navigator, row filter, home enrichment, plan runner로 역할별 분리)
+- UI_STRUCTURE_REFACTORING_COMPLETE(`ui_query_plan.py`/`ui_status_messages.py`/`ui_export_flow.py`/`ui_home_stage.py` 분리, UI dead code 제거)
+- 핵심 module/class docstring 정리 완료
+- `CODEBASE_MAP.md` 작성 및 최신화 완료
+- `README.md` 최신화 완료
+- 순위 추적 placeholder 제거 완료
 
-- 리뷰 수
-- 영업시간
-- 평점
-- 상세 페이지 내부 정보
-- 대표자명
-- 개인 휴대폰 번호
-- 개인 이메일
+주요 계층: `app.py` → UI → Collection → Browser → Region → Diagnostics/Exporter
 
----
+파일별 상세 역할·import 방향·실행 흐름은 `CODEBASE_MAP.md`를 참고한다(이 문서에서 반복하지 않음).
 
-## 4. 개발 및 진행 단계
+## 5. 핵심 실행 정책
 
-- [x] STEP 0: 고객 문제 및 사업성 분석
-- [x] STEP 0.1: 법적 리스크 검토 및 `LEGAL_NOTICE.md` 작성
-- [x] STEP 0.2: 모바일 웹 타겟팅으로 설계 변경
-- [x] STEP 1: 환경 구성 및 실행 준비
-- [x] STEP 2: 모바일 웹 리스트 수집기 구현
-- [x] STEP 3: 리스트 DOM 파서 구현 (parser.py)
-- [x] STEP 4: Excel 저장 및 중복/무전화 업체 정리 (exporter.py)
-- [x] STEP 5: GUI 실행 진입점 통합 및 MVP 검증 (`app.py`)
-- [x] STEP 6: GUI 기반 지역/업종/모드 선택 구조 적용
-- [x] STEP 7: 대전 카페 / 대전 미용실 / 대전 치킨 기준 안정성 테스트 완료
-- [x] STEP 8: Premium Mode PC 리스트 수집 및 Safe Merge 실험
-- [x] STEP 9: 폴더 구조 정리 (`docs/` 추가, `main.py` 삭제)
-- [ ] STEP 10: 크몽 납품형 상품화 준비
+- **지역**: bundled 법정동 snapshot을 사용하며 실행 중 법정동 API를 호출하지 않는다. 공식 지역 판정 후 선택 지역 밖 결과는 제외되고, 지역 유효 row만 target count에 반영된다.
+- **신규 오픈**: dedicated `filterOpening=true` 목록을 사용하며 일반 목록 fallback이 없다. 공급자 결과가 적어도 일반 결과로 보충하지 않는다. 새로오픈여부는 O/X/빈칸 tri-state다.
+- **리뷰 필터**: 최소·최대, 기준은 총리뷰수. 필터 탈락 row는 목표 수를 소비하지 않는다.
+- **CAPTCHA·보안 차단**: 실제 dialog/frame/click block 등 신호를 사용하며 HTTP 403/429만으로 CAPTCHA를 판정하지 않는다. 감지 시 추가 클릭·재시도를 중단하고 최초 진단 JSON/PNG를 저장하며, 가능한 경우 부분 결과를 저장한다.
+- **중지(stop_reason)**: `user_stopped` / `status_429` / `navigation_error` / `security_blocked` / `target_reached` / `queue_exhausted`(선택한 검색 조합을 모두 실행) 중 하나.
 
----
+## 6. Excel 출력 계약
 
-## 5. 운영 리스크 관리
+최종 14열(`통합_결과` 시트, 이 순서 고정): 업체명·업종·새로오픈여부·방문자리뷰수·블로그리뷰수·총리뷰수·주소·대표전화·플레이스 URL·수집일·홈페이지·인스타·블로그·추가 링크
 
-- V1은 무리한 차단 우회보다 모바일 웹 리스트 화면 중심의 최소 수집을 우선한다.
-- 내부 API 우회, 캡차 우회, 대량 요청 자동화는 V1 범위에 포함하지 않는다.
-- 대표자명, 개인 휴대폰 번호, 개인 이메일은 수집하지 않는다.
-- 광고성 문자/이메일 발송 기능은 포함하지 않는다.
-- 수집 결과는 공개 사업장 대표 정보 기반 영업 조사 및 영업 준비용으로만 사용한다.
+시트: `통합_결과`(주 산출물) / `원본_모바일` / `원본_PC`(현재 항상 헤더만 있는 빈 시트).
+
+## 7. 검증 기준
+
+- 마지막 검증일: 2026-08-04
+- 기준 commit: `178d12a`
+- pytest: 206 collected / 206 passed
+- compileall: exit 0
+- imports: OK(`src.ui`/`src.collection.apollo_list_collector`/`src.collection.plan_runner`/`src.exporter`)
+
+이 검증은 자동화된 단위·계약 테스트 기준이다. 앱 실사용 전체 시나리오, EXE 최종 실행, 실제 네이버 환경에서의 동작은 이 결과가 보장하지 않는다.
+
+## 8. 알려진 위험과 현재 결함
+
+- 네이버 UI·GraphQL 구조가 바뀌면 수집이 실패할 수 있다.
+- Edge profile lock 또는 CDP startup 실패가 발생할 수 있다.
+- 신규 오픈 provider 결과가 지역에 따라 제한적일 수 있다.
+- 시도/시군구는 단일 선택만 지원한다(다중 시군구 동시 선택 미지원).
+- Home enrichment에서 예상 밖 예외가 발생하면 목록 결과도 저장되지 않을 수 있다(현재 위험, 개선 미완료).
+- 최종 EXE 환경 검증은 완료되지 않았다.
+
+## 9. 보류된 개선 사항
+
+- 다중 시군구 선택
+- Home enrichment 예상 밖 예외에서도 목록 결과 저장
+- 대형 UI 테스트의 source-inspection 의존도 개선
+
+순위 추적은 이 목록에 포함하지 않는다(현재 제품에서 분리 결정, 별도 프로그램으로 처음부터 설계 예정 — 현 저장소 backlog 아님).
+
+## 10. 남은 공식 단계
+
+1. `LEGAL_NOTICE.md`의 현재 기능 계약 정정
+2. `RELEASE_CHECKLIST.md`를 현재 단일 Apollo 엔진·14열 기준으로 재작성
+3. 앱 최종 시나리오 검증
+4. EXE 재빌드 및 실행 검증
+5. 최종 출시 가능 상태 판정
+
+## 11. 문서 상태
+
+- **현재 최신**: `README.md`, `CODEBASE_MAP.md`, 핵심 module/class docstring
+- **수정 필요**:
+  - `LEGAL_NOTICE.md` — "새로오픈여부는 현재 항상 빈칸"이라는 구형 설명이 현재 O/X/빈칸 tri-state 구현과 모순(MUST_FIX_BEFORE_FINAL_VALIDATION)
+  - `RELEASE_CHECKLIST.md` — Basic/Premium 2엔진, entryIframe, 구형 11열 schema가 현재 Apollo/GraphQL 단일 목록 엔진과 불일치(MUST_FIX_BEFORE_FINAL_VALIDATION)
+
+## 12. 공식 일정
+
+현재 확정된 날짜 기반 출시·배포 일정은 없다. 공식 일정은 사용자가 명시적으로 확정한 경우에만 이 절에 추가한다.
+
+## 13. 업데이트 규칙
+
+- 지원 기능, 제품 범위, 핵심 구조, 검증 기준, 알려진 위험, 남은 공식 단계가 바뀌면 이 상단 canonical snapshot을 즉시 갱신한다.
+- 아래 날짜별 기록은 수정하지 않는다. 새로운 상세 구현 기록이 필요하면 하단에 날짜 기반으로 추가한다.
+- 현재 계약은 이 상단 snapshot → `README.md` → `CODEBASE_MAP.md` → 실제 Production 코드 순서로 확인한다. 과거 기록은 당시 판단을 보여주는 참고 자료다.
+- 문서 경계: README(사용자 설치·실행·기능) / CODEBASE_MAP(코드 구조·실행 흐름·수정 위치) / PROJECT_STATE(현재 상태·위험·남은 단계) / LEGAL_NOTICE(법적·운영 고지) / RELEASE_CHECKLIST(출시 전 검증 절차). 커밋별 세부 작업 로그는 이 상단 영역에 누적하지 않는다.
+
+## 14. 역사 기록 안내
+
+아래 날짜별 기록 전체(최초 역사 기록부터 EOF까지)는 당시 구현 상태와 판단을 보존한 역사 자료이며 내용을 수정하지 않는다. 현재 계약은 이 상단 snapshot, `README.md`, `CODEBASE_MAP.md`, 실제 Production 코드 순서로 확인한다.
 
 ---
 
