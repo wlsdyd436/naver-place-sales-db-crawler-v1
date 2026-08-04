@@ -14,7 +14,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from src.exporter import export_places_to_excel
-from src.diagnostics import DEFAULT_DIAGNOSTICS_ROOT, build_security_diagnostics_log_messages, save_json_artifact
+from src.diagnostics import build_security_diagnostics_log_messages
 from src.collection.home_enrichment import enrich_home_details
 from src.collection.apollo_list_collector import ApolloFirstListCollector
 from src.region.legal_dong_loader import LegalDongSnapshotError, LegalDongSnapshotLoader
@@ -28,6 +28,7 @@ from src.ui_query_plan import (
 )
 from src.ui_status_messages import _format_eta_seconds, _network_stop_message
 from src.ui_export_flow import export_network_result
+from src.ui_home_stage import run_home_enrichment_stage
 
 
 # LEGALDONG-UI-2: 공식 법정동 Snapshot(§_build_region_section)이 시도/시군구/
@@ -1288,83 +1289,16 @@ class SalesDbCrawlerApp(ctk.CTk):
         # 넘기지 않는다. home_enrichment_fn이 같은 persistent profile을
         # 가리키는 새 Native Edge/Chrome에 다시 연결해 실제 BrowserContext의
         # 세션을 그대로 사용한다(PAGE300-6A-FIX1).
-        result["home_stop_reason"] = None
-        result["home_security_blocked"] = False
-        result["home_success_count"] = 0
-        result["home_processed_success_count"] = 0
-        result["home_link_found_count"] = 0
-        result["home_no_link_count"] = 0
-        result["home_retry_count"] = 0
-        result["home_failure_count"] = 0
-        result["home_not_attempted_count"] = 0
-        rows = result.get("rows") or []
-        if collection_mode == "home_sns" and rows and not result.get("security_blocked"):
-            self.set_status(f"홈페이지/SNS 보강 준비 중... (총 {len(rows)}건)")
-            self.log(f"[ui][network][home] 홈페이지/SNS 보강 시작: 대상 {len(rows)}건")
-            home_result = home_enrichment_fn(
-                rows,
-                should_continue=lambda: not self.stop_event.is_set(),
-                on_progress=self._note_home_progress,
-                pause_event=self.pause_event,
-                stop_event=self.stop_event,
-            )
-            result["rows"] = home_result["rows"]
-            result["home_stop_reason"] = home_result["stop_reason"]
-            result["home_security_blocked"] = home_result["security_blocked"]
-            result["home_success_count"] = home_result["home_success_count"]
-            result["home_failure_count"] = home_result["failure_count"]
-            result["home_not_attempted_count"] = home_result["not_attempted_count"]
-            # PAGE300-6H: home_success_count는 "상세 처리가 예외 없이 끝남"만
-            # 뜻하고 링크 존재 여부와 무관하다 - 신규 통계가 없는 기존
-            # home_enrichment_fn fake와도 호환되도록, 없으면 home_success_count로
-            # 안전하게 대체한다(그 fake들은 "링크 발견" 개념 자체가 없으므로
-            # 발견/없음을 나눌 근거가 없어 전부 "발견"으로 보는 것이 기존
-            # 동작과 가장 가깝다 - 실패로 잘못 보이지 않게 함).
-            result["home_processed_success_count"] = home_result.get(
-                "home_processed_success_count", home_result["home_success_count"]
-            )
-            result["home_link_found_count"] = home_result.get(
-                "home_link_found_count", home_result["home_success_count"]
-            )
-            result["home_no_link_count"] = home_result.get("home_no_link_count", 0)
-            result["home_retry_count"] = home_result.get("home_retry_count", 0)
-
-            # PAGE300-6G-R1: first_pass/retry_pass가 없는 fake(구 버전 테스트
-            # fixture 등)와도 호환되도록 .get(..., 기본값)만 사용한다.
-            self.log(
-                "[ui][network][home] 보강 종료: "
-                f"상세 처리 성공 {result['home_processed_success_count']}건 "
-                f"(외부 링크 발견 {result['home_link_found_count']}건 / "
-                f"없음 {result['home_no_link_count']}건), "
-                f"실패 {result['home_failure_count']}건, "
-                f"재시도 {result['home_retry_count']}회, "
-                f"미시도 {result['home_not_attempted_count']}건"
-            )
-
-            final_failures = home_result.get("final_failures") or []
-            total_final_failures = len(final_failures)
-            for index, failure in enumerate(final_failures, start=1):
-                self.log(
-                    f"[ui][network][home][실패 {index}/{total_final_failures}] "
-                    f"업체명={failure.get('name', '')} place_id={failure.get('place_id', '')} "
-                    f"원인={failure.get('status', '')} HTTP={failure.get('http_status')} "
-                    f"시도={failure.get('attempt', '')} 응답시간={failure.get('elapsed_ms', '')}ms"
-                )
-
-            diagnostics_report = home_result.get("diagnostics_report")
-            if diagnostics_report is not None:
-                diagnostics_filename = f"home_enrichment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                try:
-                    DEFAULT_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
-                    artifact = save_json_artifact(
-                        DEFAULT_DIAGNOSTICS_ROOT, diagnostics_filename, diagnostics_report
-                    )
-                    if artifact.success:
-                        self.log(f"[ui][network][home] 실패 진단 저장: {artifact.path}")
-                    else:
-                        self.log(f"[ui][network][home] 진단 저장 실패: {artifact.error_message}")
-                except Exception as exc:
-                    self.log(f"[ui][network][home] 진단 저장 실패: {type(exc).__name__}: {exc}")
+        result = run_home_enrichment_stage(
+            result,
+            collection_mode=collection_mode,
+            home_enrichment_fn=home_enrichment_fn,
+            pause_event=self.pause_event,
+            stop_event=self.stop_event,
+            on_log=self.log,
+            on_status=self.set_status,
+            on_progress=self._note_home_progress,
+        )
 
         self.log(
             f"[ui][network] stop_reason={result.get('stop_reason')}, "

@@ -16,7 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src import ui
+from src import ui, ui_home_stage
 from src.exporter import MERGED_COLUMNS, export_places_to_excel
 from src.diagnostics import DiagnosticArtifact
 
@@ -308,9 +308,10 @@ def check_home_sns_mode_calls_home_enrichment_fn_once(reporter: ValidationReport
 
 def check_home_sns_diagnostics_saved_and_failure_does_not_block_export(reporter: ValidationReporter) -> None:
     """PAGE300-6G-R1: home_result에 diagnostics_report가 있으면
-    ui.save_json_artifact로 저장을 시도하고, 저장 자체가 실패해도(디스크
-    등 이유) Excel 저장 흐름은 막히지 않는다. 최종 실패 업체 로그 라인도
-    함께 남는다."""
+    ui_home_stage.save_json_artifact로 저장을 시도하고(UI-4: Home stage가
+    src.ui_home_stage로 분리되며 저장 호출 지점도 함께 이동함), 저장
+    자체가 실패해도(디스크 등 이유) Excel 저장 흐름은 막히지 않는다.
+    최종 실패 업체 로그 라인도 함께 남는다."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_path = str(Path(tmp_dir) / "out.xlsx")
         app = _make_app()
@@ -343,8 +344,8 @@ def check_home_sns_diagnostics_saved_and_failure_does_not_block_export(reporter:
             save_calls.append((str(run_dir), name, data))
             return DiagnosticArtifact(name=name, path=None, success=False, error_message="disk full")
 
-        original_save = ui.save_json_artifact
-        ui.save_json_artifact = fake_save_json_artifact
+        original_save = ui_home_stage.save_json_artifact
+        ui_home_stage.save_json_artifact = fake_save_json_artifact
         try:
             returned = app._run_network_pipeline(
                 [{"query": "q1"}], 30, 300, output_path,
@@ -353,7 +354,7 @@ def check_home_sns_diagnostics_saved_and_failure_does_not_block_export(reporter:
                 excel_exporter=export_places_to_excel, home_enrichment_fn=fake_home_enrichment_fn,
             )
         finally:
-            ui.save_json_artifact = original_save
+            ui_home_stage.save_json_artifact = original_save
 
         exported = Path(output_path).exists() and returned["exported"] is True
         diagnostics_attempted = len(save_calls) == 1 and save_calls[0][2].get("run_id") == "test-run"

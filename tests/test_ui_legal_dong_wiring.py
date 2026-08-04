@@ -9,7 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src import ui  # noqa: E402
+from src import ui, ui_home_stage  # noqa: E402
 
 
 def _make_app():
@@ -527,13 +527,22 @@ def test_17_both_modes_share_the_same_region_filtered_collect_query():
     -> collect_apollo_first_list_query) 내부에서 적용된다. _run_network_pipeline이
     orchestrator에 넘기는 collect_query=collector.collect_query 배선이
     collection_mode 분기보다 앞(바깥)에 있어야 두 모드가 항상 동일한 필터
-    결과를 쓴다고 보장할 수 있다 - home_sns 전용 분기(if collection_mode ==
-    "home_sns")는 그 뒤(목록 수집이 끝난 후 홈페이지 보강 단계)에만 있어야
-    한다."""
-    source = inspect.getsource(ui.SalesDbCrawlerApp._run_network_pipeline)
-    collect_query_pos = source.index("collect_query=collector.collect_query")
-    home_sns_branch_pos = source.index('if collection_mode == "home_sns"')
-    assert collect_query_pos < home_sns_branch_pos
+    결과를 쓴다고 보장할 수 있다.
+
+    UI-4(홈페이지 보강 stage 분리) 이후 home_sns 전용 분기(if
+    collection_mode == "home_sns")는 _run_network_pipeline 내부가 아니라
+    src.ui_home_stage.run_home_enrichment_stage 안(목록 수집이 끝난 후
+    홈페이지 보강 단계)에만 있어야 한다 - _run_network_pipeline은 그 함수를
+    collect_query 배선 뒤에서 정확히 1회만 호출해야 같은 불변식이
+    유지된다."""
+    pipeline_source = inspect.getsource(ui.SalesDbCrawlerApp._run_network_pipeline)
+    collect_query_pos = pipeline_source.index("collect_query=collector.collect_query")
+    home_stage_call_pos = pipeline_source.index("run_home_enrichment_stage(")
+    assert collect_query_pos < home_stage_call_pos
+    assert 'if collection_mode == "home_sns"' not in pipeline_source
+
+    home_stage_source = inspect.getsource(ui_home_stage.run_home_enrichment_stage)
+    assert 'if collection_mode == "home_sns"' in home_stage_source
 
 
 # --------------------------------------------------------------------------
